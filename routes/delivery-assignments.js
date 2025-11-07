@@ -207,7 +207,7 @@ router.post('/', auth, async (req, res) => {
 // PUT /api/delivery-assignments/:id - Update assignment status
 router.put('/:id', auth, async (req, res) => {
   try {
-    const { status, pickup_date, delivery_date, payment_method, payment_reference, payment_notes } = req.body;
+    const { status, pickup_date, delivery_date, payment_method, payment_reference, payment_notes, driver_name, driver_phone } = req.body;
     
     const updateData = { status };
     
@@ -216,6 +216,43 @@ router.put('/:id', auth, async (req, res) => {
     if (payment_method) updateData.payment_method = payment_method;
     if (payment_reference) updateData.payment_reference = payment_reference;
     if (payment_notes) updateData.payment_notes = payment_notes;
+    
+    // Handle driver information - create or update Driver record
+    if (driver_name && driver_phone) {
+      const { Driver } = require('../models/unified-schema');
+      
+      // Try to find existing driver by phone
+      let driver = await Driver.findOne({ phone: driver_phone });
+      
+      if (driver) {
+        // Update existing driver name if different
+        if (driver.name !== driver_name) {
+          driver.name = driver_name;
+          await driver.save();
+        }
+      } else {
+        // Create new driver record with minimal required fields
+        const driverCount = await Driver.countDocuments();
+        const driverId = `DRV-${String(driverCount + 1).padStart(6, '0')}`;
+        
+        driver = new Driver({
+          driver_id: driverId,
+          name: driver_name,
+          phone: driver_phone,
+          email: `${driver_phone.replace(/\D/g, '')}@temp.driver`, // Temporary email
+          license_number: `TEMP-${Date.now()}`, // Temporary license number
+          vehicle_type: 'CAR', // Default vehicle type
+          vehicle_number: 'TEMP', // Temporary vehicle number
+          is_active: true
+        });
+        
+        await driver.save();
+        console.log('✅ Created new driver record:', driver.driver_id);
+      }
+      
+      // Link driver to assignment
+      updateData.driver_id = driver._id;
+    }
     
     // If status is DELIVERED and payment_method is provided, mark payment as collected
     if (status === 'DELIVERED' && payment_method) {
@@ -348,6 +385,87 @@ router.get('/qr/:qrCode', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch assignment'
+    });
+  }
+});
+
+// PUT /api/delivery-assignments/qr/:qrCode/status - Update assignment status via QR code (no auth required)
+router.put('/qr/:qrCode/status', async (req, res) => {
+  try {
+    const { status, pickup_date, delivery_date, driver_name, driver_phone } = req.body;
+    
+    // Find assignment by QR code
+    const assignment = await DeliveryAssignment.findOne({ 
+      qr_code: req.params.qrCode,
+      qr_expires_at: { $gt: new Date() }
+    });
+    
+    if (!assignment) {
+      return res.status(404).json({
+        success: false,
+        error: 'QR code not found or expired'
+      });
+    }
+    
+    const updateData = { status };
+    
+    if (pickup_date) updateData.pickup_date = pickup_date;
+    if (delivery_date) updateData.delivery_date = delivery_date;
+    
+    // Handle driver information - create or update Driver record
+    if (driver_name && driver_phone) {
+      // Try to find existing driver by phone
+      let driver = await Driver.findOne({ phone: driver_phone });
+      
+      if (driver) {
+        // Update existing driver name if different
+        if (driver.name !== driver_name) {
+          driver.name = driver_name;
+          await driver.save();
+        }
+      } else {
+        // Create new driver record with minimal required fields
+        const driverCount = await Driver.countDocuments();
+        const driverId = `DRV-${String(driverCount + 1).padStart(6, '0')}`;
+        
+        driver = new Driver({
+          driver_id: driverId,
+          name: driver_name,
+          phone: driver_phone,
+          email: `${driver_phone.replace(/\D/g, '')}@temp.driver`, // Temporary email
+          license_number: `TEMP-${Date.now()}`, // Temporary license number
+          vehicle_type: 'CAR', // Default vehicle type
+          vehicle_number: 'TEMP', // Temporary vehicle number
+          is_active: true
+        });
+        
+        await driver.save();
+        console.log('✅ Created new driver record:', driver.driver_id);
+      }
+      
+      // Link driver to assignment
+      updateData.driver_id = driver._id;
+    }
+    
+    const updatedAssignment = await DeliveryAssignment.findByIdAndUpdate(
+      assignment._id,
+      updateData,
+      { new: true, runValidators: true }
+    ).populate('driver_id', 'name phone vehicle_type vehicle_number')
+     .populate('request_id', 'request_id customer receiver')
+     .populate('invoice_id', 'invoice_id total_amount')
+     .populate('client_id', 'company_name contact_name');
+    
+    res.json({
+      success: true,
+      data: updatedAssignment,
+      message: 'Delivery assignment updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating delivery assignment via QR:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update delivery assignment'
     });
   }
 });

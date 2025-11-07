@@ -5,6 +5,7 @@ const { Readable } = require('stream');
 const crypto = require('crypto');
 const { Invoice, Client, DeliveryAssignment } = require('../models/unified-schema');
 const { Report, User } = require('../models');
+const empostAPI = require('../services/empost-api');
 
 const router = express.Router();
 const auth = require('../middleware/auth');
@@ -207,6 +208,45 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         const weight = getColumnValue(row, ['weight_(kg)', 'weight', 'weight_kg']);
         const volume = getColumnValue(row, ['volume_(cbm)', 'volume', 'volume_cbm']);
         
+        // Check if invoice with this invoice_id already exists in database
+        let finalInvoiceId = invoiceNumber;
+        if (invoiceNumber) {
+          // Check if invoice exists in database
+          const existingInvoice = await Invoice.findOne({ invoice_id: invoiceNumber });
+          if (existingInvoice) {
+            // Invoice with this ID already exists - generate a unique one using tracking code
+            if (trackingCode) {
+              // Use tracking code as invoice ID if available
+              const trackingBasedId = trackingCode;
+              const existingWithTracking = await Invoice.findOne({ invoice_id: trackingBasedId });
+              if (!existingWithTracking) {
+                finalInvoiceId = trackingBasedId;
+                console.log(`⚠️  Invoice ID ${invoiceNumber} already exists. Using tracking code as invoice ID: ${finalInvoiceId}`);
+              } else {
+                // Both invoice number and tracking code exist - generate unique ID
+                const timestamp = Date.now().toString().slice(-6);
+                finalInvoiceId = `${invoiceNumber}-${timestamp}`;
+                console.log(`⚠️  Invoice ID ${invoiceNumber} and tracking code ${trackingCode} already exist. Generated unique ID: ${finalInvoiceId}`);
+              }
+            } else {
+              // No tracking code - generate unique ID with timestamp
+              const timestamp = Date.now().toString().slice(-6);
+              finalInvoiceId = `${invoiceNumber}-${timestamp}`;
+              console.log(`⚠️  Invoice ID ${invoiceNumber} already exists. Generated unique ID: ${finalInvoiceId}`);
+            }
+          }
+        } else if (trackingCode) {
+          // No invoice number provided, use tracking code as invoice ID
+          finalInvoiceId = trackingCode;
+          const existingWithTracking = await Invoice.findOne({ invoice_id: trackingCode });
+          if (existingWithTracking) {
+            // Tracking code also exists - generate unique ID
+            const timestamp = Date.now().toString().slice(-6);
+            finalInvoiceId = `INV-${timestamp}`;
+            console.log(`⚠️  Tracking code ${trackingCode} already exists. Generated unique ID: ${finalInvoiceId}`);
+          }
+        }
+        
         // Create invoice
         const invoiceData = {
           client_id: client._id,
@@ -226,7 +266,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           notes: notes || '',
           created_by: req.user.id,
           // Add all fields from CSV
-          invoice_id: invoiceNumber, // Use invoice_number from CSV
+          invoice_id: finalInvoiceId, // Use invoice_number from CSV (if not duplicate)
           awb_number: trackingCode, // Use tracking_code from CSV
           receiver_name: receiverName,
           receiver_address: receiverAddress,
@@ -241,6 +281,34 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         
         console.log('✅ Invoice created:', invoice.invoice_id || invoice._id);
         createdInvoices.push(invoice);
+
+        // Integrate with EMpost API
+        try {
+          // Populate invoice with client data for EMpost
+          const populatedInvoice = await Invoice.findById(invoice._id)
+            .populate('client_id', 'company_name contact_name email phone address city country');
+          
+          console.log('📦 Starting EMpost integration for CSV invoice:', invoice.invoice_id);
+          
+          // Create shipment in EMpost
+          const shipmentResult = await empostAPI.createShipment(populatedInvoice);
+          
+          if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+            // Update invoice with uhawb
+            invoice.empost_uhawb = shipmentResult.data.uhawb;
+            await invoice.save();
+            console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
+          }
+          
+          // Issue invoice in EMpost
+          await empostAPI.issueInvoice(populatedInvoice);
+          console.log('✅ EMpost integration completed successfully for CSV invoice');
+          
+        } catch (empostError) {
+          // Log error but don't block invoice creation
+          console.error('❌ EMpost integration failed for CSV invoice (invoice creation will continue):', empostError.message);
+          console.error('Error details:', empostError.response?.data || empostError.message);
+        }
 
         // Create audit report for CSV-uploaded invoice - This happens immediately after invoice creation
         console.log('📊 Creating audit report for invoice:', invoice.invoice_id || invoice._id);

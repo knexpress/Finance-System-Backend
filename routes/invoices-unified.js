@@ -1,6 +1,7 @@
 const express = require('express');
 const { Invoice, ShipmentRequest, Client, Employee } = require('../models/unified-schema');
 const { InvoiceRequest } = require('../models');
+const empostAPI = require('../services/empost-api');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -203,8 +204,35 @@ router.post('/', async (req, res) => {
     // Populate the created invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)
       .populate('request_id', 'request_id awb_number customer route status')
-      .populate('client_id', 'company_name contact_name email phone')
+      .populate('client_id', 'company_name contact_name email phone address city country')
       .populate('created_by', 'full_name email department_id');
+
+    // Integrate with EMpost API
+    try {
+      console.log('📦 Starting EMpost integration for invoice:', invoice.invoice_id);
+      
+      // Create shipment in EMpost
+      const shipmentResult = await empostAPI.createShipment(populatedInvoice);
+      
+      if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+        // Update invoice with uhawb
+        invoice.empost_uhawb = shipmentResult.data.uhawb;
+        await invoice.save();
+        console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
+      }
+      
+      // Issue invoice in EMpost
+      await empostAPI.issueInvoice(populatedInvoice);
+      console.log('✅ EMpost integration completed successfully');
+      
+    } catch (empostError) {
+      // Log error but don't block invoice creation
+      console.error('❌ EMpost integration failed (invoice creation will continue):', empostError.message);
+      console.error('Error details:', empostError.response?.data || empostError.message);
+      
+      // Optionally, you could store the error in the invoice or a separate error log
+      // For now, we'll just log it and continue
+    }
 
     // Create notifications for all users about the new invoice - DISABLED
     // await createNotificationsForAllUsers('invoice', invoice._id, created_by);

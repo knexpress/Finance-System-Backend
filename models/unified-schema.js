@@ -644,6 +644,11 @@ const invoiceSchema = new mongoose.Schema({
     type: String,
     required: false,
   },
+  empost_uhawb: {
+    type: String,
+    required: false,
+    default: 'N/A',
+  },
 }, {
   timestamps: true,
 });
