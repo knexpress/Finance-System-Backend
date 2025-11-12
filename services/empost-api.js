@@ -220,7 +220,7 @@ class EMpostAPIService {
       quantity: item.quantity || 1,
       hsCode: '8504.40', // Default HS code for electronics/general goods
       customsValue: {
-        currencyCode: 'USD',
+        currencyCode: 'AED',
         amount: Math.max(parseFloat(item.total?.toString() || item.unit_price?.toString() || 0), 0),
       },
       weight: {
@@ -243,7 +243,7 @@ class EMpostAPIService {
         quantity: 1,
         hsCode: '8504.40',
         customsValue: {
-          currencyCode: 'USD',
+          currencyCode: 'AED',
           amount: Math.max(parseFloat(invoice.total_amount?.toString() || 0), 0),
         },
         weight: {
@@ -298,20 +298,20 @@ class EMpostAPIService {
           value: Math.max(invoice.weight_kg || 0.1, 0.1), // Ensure minimum 0.1 KG
         },
         cod: codAmount > 0 ? {
-          currencyCode: 'USD',
+          currencyCode: 'AED',
           amount: codAmount,
         } : undefined,
         customs: undefined,
         deliveryCharges: {
-          currencyCode: 'USD',
-          amount: parseFloat(invoice.total_amount?.toString() || 0),
+          currencyCode: 'AED',
+          amount: parseFloat(invoice.amount?.toString() || 0), // Base amount without tax
         },
         numberOfPieces: invoice.line_items?.length || 1,
         pickupDate: invoice.issue_date ? new Date(invoice.issue_date).toISOString() : new Date().toISOString(),
         deliveryStatus: this.mapDeliveryStatus(invoice.status),
         deliveryDate: invoice.due_date ? new Date(invoice.due_date).toISOString() : undefined,
         deliveryAttempts: 0,
-        shippingType: 'INT', // Default to International
+        shippingType: 'DOM', // Default to Domestic
         productCategory: 'Electronics', // Default category
         productType: 'Parcel', // Default type
         descriptionOfGoods: invoice.line_items?.map(item => item.description).join(', ') || 'General Goods',
@@ -351,7 +351,7 @@ class EMpostAPIService {
         {
           type: 'Base Rate',
           amount: {
-            currencyCode: 'USD',
+            currencyCode: 'AED',
             amount: parseFloat(invoice.amount?.toString() || 0),
           },
         },
@@ -364,7 +364,7 @@ class EMpostAPIService {
         totalDiscountAmount: 0,
         taxAmount: parseFloat(invoice.tax_amount?.toString() || 0),
         totalAmountIncludingTax: parseFloat(invoice.total_amount?.toString() || 0),
-        currencyCode: 'USD',
+        currencyCode: 'AED',
       },
     };
 
@@ -373,7 +373,7 @@ class EMpostAPIService {
       invoiceData.charges.push({
         type: 'Tax',
         amount: {
-          currencyCode: 'USD',
+          currencyCode: 'AED',
           amount: parseFloat(invoice.tax_amount.toString()),
         },
       });

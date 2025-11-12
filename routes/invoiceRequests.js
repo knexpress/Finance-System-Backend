@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { InvoiceRequest, Employee, Collections } = require('../models');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
+const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 
 const router = express.Router();
 
@@ -67,31 +68,75 @@ router.post('/', async (req, res) => {
   try {
     const {
       customer_name,
-      customer_company,
+      customer_phone,
       receiver_name,
       receiver_company,
-      origin_place,
-      destination_place,
+      receiver_phone,
+      sender_address,
+      receiver_address,
+      origin_place, // Keep for backward compatibility
+      destination_place, // Keep for backward compatibility
       shipment_type,
-      is_leviable,
+      service_code,
+      amount_per_kg,
+      total_weight,
       notes,
       created_by_employee_id,
       status
     } = req.body;
     
-    if (!customer_name || !receiver_name || !origin_place || !destination_place || !shipment_type || !created_by_employee_id) {
-      return res.status(400).json({ error: 'Required fields are missing' });
+    // Use new field names if provided, otherwise fall back to old field names
+    const originPlace = sender_address || origin_place;
+    const destinationPlace = receiver_address || destination_place;
+    
+    if (!customer_name || !receiver_name || !originPlace || !destinationPlace || !shipment_type || !created_by_employee_id) {
+      return res.status(400).json({ error: 'Required fields are missing: customer_name, receiver_name, sender_address (or origin_place), receiver_address (or destination_place), shipment_type, and created_by_employee_id are required' });
+    }
+
+    // Auto-generate Invoice ID and AWB number
+    let invoiceNumber;
+    let awbNumber;
+    
+    try {
+      // Generate unique Invoice ID
+      invoiceNumber = await generateUniqueInvoiceID(InvoiceRequest);
+      console.log('✅ Generated Invoice ID:', invoiceNumber);
+      
+      // Generate unique AWB number following pattern PHL2VN3KT28US9H
+      awbNumber = await generateUniqueAWBNumber(InvoiceRequest);
+      console.log('✅ Generated AWB Number:', awbNumber);
+    } catch (error) {
+      console.error('❌ Error generating IDs:', error);
+      return res.status(500).json({ error: 'Failed to generate Invoice ID or AWB number' });
+    }
+
+    // Calculate amount from amount_per_kg and total_weight
+    let calculatedAmount = null;
+    if (amount_per_kg && total_weight) {
+      try {
+        calculatedAmount = parseFloat(amount_per_kg) * parseFloat(total_weight);
+      } catch (error) {
+        console.error('Error calculating amount:', error);
+      }
     }
 
     const invoiceRequest = new InvoiceRequest({
+      invoice_number: invoiceNumber, // Auto-generated Invoice ID
+      tracking_code: awbNumber, // Auto-generated AWB number
+      service_code: service_code || undefined,
       customer_name,
-      customer_company,
+      customer_phone, // Customer phone number instead of company
       receiver_name,
       receiver_company,
-      origin_place,
-      destination_place,
+      receiver_phone,
+      receiver_address: destinationPlace, // Store receiver address separately
+      origin_place: originPlace, // Map sender_address to origin_place
+      destination_place: destinationPlace, // Map receiver_address to destination_place
       shipment_type,
-      is_leviable: is_leviable !== undefined ? is_leviable : true,
+      amount: calculatedAmount ? calculatedAmount : undefined,
+      weight_kg: total_weight ? parseFloat(total_weight) : undefined,
+      weight: total_weight ? parseFloat(total_weight) : undefined, // Also set weight field for backward compatibility
+      // is_leviable will default to true from schema
       notes,
       created_by_employee_id,
       status: status || 'DRAFT'
@@ -176,15 +221,17 @@ router.put('/:id/status', async (req, res) => {
       invoiceRequest.invoice_generated_at = new Date();
       
       // Automatically create collection entry when invoice is generated
-      if (invoiceRequest.invoice_amount) {
-        const invoiceId = `INV-${invoiceRequest._id.toString().slice(-6).toUpperCase()}`;
+      if (invoiceRequest.invoice_amount || invoiceRequest.financial?.invoice_amount) {
+        // Use the auto-generated invoice_number from the invoice request
+        const invoiceId = invoiceRequest.invoice_number || `INV-${invoiceRequest._id.toString().slice(-6).toUpperCase()}`;
+        const invoiceAmount = invoiceRequest.financial?.invoice_amount || invoiceRequest.invoice_amount;
         const dueDate = new Date();
         dueDate.setDate(dueDate.getDate() + 30); // 30 days from now
         
         const collection = new Collections({
           invoice_id: invoiceId,
           client_name: invoiceRequest.customer_name,
-          amount: invoiceRequest.invoice_amount,
+          amount: invoiceAmount,
           due_date: dueDate,
           invoice_request_id: invoiceRequest._id,
           status: 'not_paid'
@@ -293,19 +340,83 @@ router.put('/:id/verification', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
-    // Update verification fields
-    if (invoiceRequest.verification) {
-      Object.keys(verificationData).forEach(key => {
-        if (verificationData[key] !== undefined) {
-          invoiceRequest.verification[key] = verificationData[key];
-        }
-      });
-    } else {
-      invoiceRequest.verification = verificationData;
+    // Initialize verification object if it doesn't exist
+    if (!invoiceRequest.verification) {
+      invoiceRequest.verification = {};
     }
 
-    // Update main weight field if provided
-    if (verificationData.weight !== undefined) {
+    // Handle boxes data - convert to Decimal128 for numeric fields
+    if (verificationData.boxes && Array.isArray(verificationData.boxes)) {
+      invoiceRequest.verification.boxes = verificationData.boxes.map(box => ({
+        items: box.items || '',
+        length: box.length ? new mongoose.Types.Decimal128(box.length.toString()) : undefined,
+        width: box.width ? new mongoose.Types.Decimal128(box.width.toString()) : undefined,
+        height: box.height ? new mongoose.Types.Decimal128(box.height.toString()) : undefined,
+        vm: box.vm ? new mongoose.Types.Decimal128(box.vm.toString()) : undefined,
+      }));
+    }
+
+    // Handle total_vm
+    if (verificationData.total_vm !== undefined) {
+      invoiceRequest.verification.total_vm = new mongoose.Types.Decimal128(verificationData.total_vm.toString());
+    }
+
+    // Handle actual_weight, volumetric_weight, chargeable_weight
+    if (verificationData.actual_weight !== undefined) {
+      invoiceRequest.verification.actual_weight = new mongoose.Types.Decimal128(verificationData.actual_weight.toString());
+    }
+    if (verificationData.volumetric_weight !== undefined) {
+      invoiceRequest.verification.volumetric_weight = new mongoose.Types.Decimal128(verificationData.volumetric_weight.toString());
+    }
+    if (verificationData.chargeable_weight !== undefined) {
+      invoiceRequest.verification.chargeable_weight = new mongoose.Types.Decimal128(verificationData.chargeable_weight.toString());
+    }
+    if (verificationData.rate_bracket !== undefined) {
+      invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
+    }
+    if (verificationData.calculated_rate !== undefined) {
+      invoiceRequest.verification.calculated_rate = new mongoose.Types.Decimal128(verificationData.calculated_rate.toString());
+    }
+
+    // Auto-determine weight_type based on actual_weight and volumetric_weight (always override)
+    // This ensures weight_type cannot be manually changed - it's always determined by the comparison
+    if (verificationData.actual_weight !== undefined && verificationData.volumetric_weight !== undefined) {
+      const actualWt = parseFloat(verificationData.actual_weight.toString());
+      const volumetricWt = parseFloat(verificationData.volumetric_weight.toString());
+      // Always use the auto-determined weight type (cannot be overridden)
+      if (actualWt >= volumetricWt) {
+        invoiceRequest.verification.weight_type = 'ACTUAL';
+      } else {
+        invoiceRequest.verification.weight_type = 'VOLUMETRIC';
+      }
+      console.log(`✅ Auto-determined weight type: ${invoiceRequest.verification.weight_type} (Actual: ${actualWt} kg, Volumetric: ${volumetricWt} kg)`);
+    }
+
+    // Update other verification fields (excluding weight_type, rate_bracket, calculated_rate which are handled separately above)
+    Object.keys(verificationData).forEach(key => {
+      if (verificationData[key] !== undefined && 
+          key !== 'boxes' && 
+          key !== 'total_vm' && 
+          key !== 'weight' && 
+          key !== 'actual_weight' && 
+          key !== 'volumetric_weight' && 
+          key !== 'chargeable_weight' &&
+          key !== 'weight_type' &&
+          key !== 'rate_bracket' &&
+          key !== 'calculated_rate') { // These are handled separately above
+        // Handle Decimal128 fields
+        if (key === 'amount' || key === 'volume_cbm') {
+          invoiceRequest.verification[key] = new mongoose.Types.Decimal128(verificationData[key].toString());
+        } else {
+          invoiceRequest.verification[key] = verificationData[key];
+        }
+      }
+    });
+
+    // Update main weight field with chargeable weight (higher of actual or volumetric)
+    if (verificationData.chargeable_weight !== undefined) {
+      invoiceRequest.weight = new mongoose.Types.Decimal128(verificationData.chargeable_weight.toString());
+    } else if (verificationData.weight !== undefined) {
       invoiceRequest.weight = new mongoose.Types.Decimal128(verificationData.weight.toString());
     }
 
@@ -314,9 +425,39 @@ router.put('/:id/verification', async (req, res) => {
     
     await invoiceRequest.save();
 
+    // Convert Decimal128 fields to numbers for JSON response
+    const responseData = invoiceRequest.toObject();
+    if (responseData.verification?.boxes) {
+      responseData.verification.boxes = responseData.verification.boxes.map((box) => ({
+        ...box,
+        length: box.length ? parseFloat(box.length.toString()) : undefined,
+        width: box.width ? parseFloat(box.width.toString()) : undefined,
+        height: box.height ? parseFloat(box.height.toString()) : undefined,
+        vm: box.vm ? parseFloat(box.vm.toString()) : undefined,
+      }));
+    }
+    if (responseData.verification?.total_vm) {
+      responseData.verification.total_vm = parseFloat(responseData.verification.total_vm.toString());
+    }
+    if (responseData.verification?.actual_weight) {
+      responseData.verification.actual_weight = parseFloat(responseData.verification.actual_weight.toString());
+    }
+    if (responseData.verification?.volumetric_weight) {
+      responseData.verification.volumetric_weight = parseFloat(responseData.verification.volumetric_weight.toString());
+    }
+    if (responseData.verification?.chargeable_weight) {
+      responseData.verification.chargeable_weight = parseFloat(responseData.verification.chargeable_weight.toString());
+    }
+    if (responseData.verification?.calculated_rate) {
+      responseData.verification.calculated_rate = parseFloat(responseData.verification.calculated_rate.toString());
+    }
+    if (responseData.weight) {
+      responseData.weight = parseFloat(responseData.weight.toString());
+    }
+
     res.json({
       success: true,
-      invoiceRequest,
+      invoiceRequest: responseData,
       message: 'Verification details updated successfully'
     });
   } catch (error) {

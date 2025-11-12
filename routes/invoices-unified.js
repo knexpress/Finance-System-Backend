@@ -20,6 +20,8 @@ const transformInvoice = (invoice) => {
     amount: convertDecimal128(invoiceObj.amount),
     tax_amount: convertDecimal128(invoiceObj.tax_amount),
     total_amount: convertDecimal128(invoiceObj.total_amount),
+    weight_kg: convertDecimal128(invoiceObj.weight_kg),
+    volume_cbm: convertDecimal128(invoiceObj.volume_cbm),
   };
 };
 
@@ -41,9 +43,120 @@ router.get('/', async (req, res) => {
       amount: inv.amount
     })));
     
+    // Transform invoices and populate missing fields from InvoiceRequest
+    const transformedInvoices = await Promise.all(invoices.map(async (invoice) => {
+      const transformed = transformInvoice(invoice);
+      const invoiceObj = invoice.toObject ? invoice.toObject() : invoice;
+      
+      // Always try to populate fields from InvoiceRequest if request_id exists
+      // Note: request_id might be an InvoiceRequest ObjectId, not a ShipmentRequest
+      // Also check notes field as fallback (format: "Invoice for request <request_id>")
+      try {
+        // Get the actual request_id value (could be ObjectId or populated object)
+        let requestIdValue = null;
+        if (invoiceObj.request_id) {
+          if (typeof invoiceObj.request_id === 'object' && invoiceObj.request_id._id) {
+            requestIdValue = invoiceObj.request_id._id.toString();
+          } else {
+            requestIdValue = invoiceObj.request_id.toString();
+          }
+        }
+        
+        // Fallback: Extract request_id from notes field if request_id is null
+        // Notes format: "Invoice for request <24-char ObjectId>"
+        if (!requestIdValue && transformed.notes) {
+          // Match ObjectId pattern (24 hex characters) or any word characters
+          const notesMatch = transformed.notes.match(/Invoice for request ([a-fA-F0-9]{24}|\w+)/);
+          if (notesMatch && notesMatch[1]) {
+            requestIdValue = notesMatch[1];
+            console.log(`📝 Extracted request_id from notes: ${requestIdValue}`);
+          }
+        }
+        
+        // Try to find InvoiceRequest by the request_id
+        if (requestIdValue) {
+          const invoiceRequest = await InvoiceRequest.findById(requestIdValue);
+          if (invoiceRequest) {
+            console.log(`✅ Found InvoiceRequest ${requestIdValue} for invoice ${transformed.invoice_id || transformed._id}`);
+            
+            // Populate service_code (check root first, then verification)
+            if (!transformed.service_code && (invoiceRequest.service_code || invoiceRequest.verification?.service_code)) {
+              transformed.service_code = invoiceRequest.service_code || invoiceRequest.verification?.service_code;
+              console.log(`  ✅ Populated service_code: ${transformed.service_code}`);
+            }
+            
+            // Populate weight_kg (check multiple sources: weight_kg, weight, verification.chargeable_weight)
+            if ((transformed.weight_kg == null || transformed.weight_kg === 0 || transformed.weight_kg === '0') && 
+                (invoiceRequest.weight_kg || invoiceRequest.weight || invoiceRequest.verification?.chargeable_weight)) {
+              if (invoiceRequest.weight_kg) {
+                transformed.weight_kg = parseFloat(invoiceRequest.weight_kg.toString());
+              } else if (invoiceRequest.weight) {
+                transformed.weight_kg = parseFloat(invoiceRequest.weight.toString());
+              } else if (invoiceRequest.verification?.chargeable_weight) {
+                transformed.weight_kg = parseFloat(invoiceRequest.verification.chargeable_weight.toString());
+              }
+              console.log(`  ✅ Populated weight_kg: ${transformed.weight_kg}`);
+            }
+            
+            // Populate volume_cbm (check root first, then verification.total_vm)
+            if ((transformed.volume_cbm == null || transformed.volume_cbm === 0 || transformed.volume_cbm === '0') && 
+                (invoiceRequest.volume_cbm || invoiceRequest.verification?.total_vm)) {
+              if (invoiceRequest.volume_cbm) {
+                transformed.volume_cbm = parseFloat(invoiceRequest.volume_cbm.toString());
+              } else if (invoiceRequest.verification?.total_vm) {
+                transformed.volume_cbm = parseFloat(invoiceRequest.verification.total_vm.toString());
+              }
+              console.log(`  ✅ Populated volume_cbm: ${transformed.volume_cbm}`);
+            }
+            
+            // Populate receiver_name
+            if (!transformed.receiver_name && invoiceRequest.receiver_name) {
+              transformed.receiver_name = invoiceRequest.receiver_name;
+              console.log(`  ✅ Populated receiver_name: ${transformed.receiver_name}`);
+            }
+            
+            // Populate receiver_address (check multiple sources)
+            if (!transformed.receiver_address && 
+                (invoiceRequest.receiver_address || invoiceRequest.destination_place || invoiceRequest.verification?.receiver_address)) {
+              transformed.receiver_address = invoiceRequest.receiver_address || 
+                                            invoiceRequest.destination_place || 
+                                            invoiceRequest.verification?.receiver_address;
+              console.log(`  ✅ Populated receiver_address: ${transformed.receiver_address}`);
+            }
+            
+            // Populate receiver_phone (check root first, then verification)
+            if (!transformed.receiver_phone && 
+                (invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone)) {
+              transformed.receiver_phone = invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone;
+              console.log(`  ✅ Populated receiver_phone: ${transformed.receiver_phone}`);
+            }
+            
+            // Also update the invoice's request_id in the database if it was null
+            if (!invoiceObj.request_id && invoiceRequest._id) {
+              try {
+                await Invoice.findByIdAndUpdate(transformed._id, { request_id: invoiceRequest._id });
+                console.log(`  ✅ Updated invoice request_id in database: ${invoiceRequest._id}`);
+              } catch (updateError) {
+                console.error(`  ⚠️ Failed to update invoice request_id:`, updateError.message);
+              }
+            }
+          } else {
+            console.log(`⚠️ No InvoiceRequest found for request_id: ${requestIdValue}`);
+          }
+        } else {
+          console.log(`⚠️ No request_id found for invoice ${transformed.invoice_id || transformed._id} (checked request_id field and notes)`);
+        }
+      } catch (error) {
+        console.error('⚠️ Error populating fields from InvoiceRequest:', error.message);
+        console.error('Error stack:', error.stack);
+      }
+      
+      return transformed;
+    }));
+    
     res.json({
       success: true,
-      data: invoices.map(transformInvoice)
+      data: transformedInvoices
     });
   } catch (error) {
     console.error('❌ Error fetching invoices:', error);
@@ -69,9 +182,115 @@ router.get('/:id', async (req, res) => {
       });
     }
     
+    const transformed = transformInvoice(invoice);
+    const invoiceObj = invoice.toObject ? invoice.toObject() : invoice;
+    
+    // Always try to populate fields from InvoiceRequest if request_id exists
+    // Note: request_id might be an InvoiceRequest ObjectId, not a ShipmentRequest
+    // Also check notes field as fallback (format: "Invoice for request <request_id>")
+    try {
+      // Get the actual request_id value (could be ObjectId or populated object)
+      let requestIdValue = null;
+      if (invoiceObj.request_id) {
+        if (typeof invoiceObj.request_id === 'object' && invoiceObj.request_id._id) {
+          requestIdValue = invoiceObj.request_id._id.toString();
+        } else {
+          requestIdValue = invoiceObj.request_id.toString();
+        }
+      }
+      
+      // Fallback: Extract request_id from notes field if request_id is null
+      // Notes format: "Invoice for request <24-char ObjectId>"
+      if (!requestIdValue && transformed.notes) {
+        // Match ObjectId pattern (24 hex characters) or any word characters
+        const notesMatch = transformed.notes.match(/Invoice for request ([a-fA-F0-9]{24}|\w+)/);
+        if (notesMatch && notesMatch[1]) {
+          requestIdValue = notesMatch[1];
+          console.log(`📝 Extracted request_id from notes: ${requestIdValue}`);
+        }
+      }
+      
+      // Try to find InvoiceRequest by the request_id
+      if (requestIdValue) {
+        const invoiceRequest = await InvoiceRequest.findById(requestIdValue);
+        if (invoiceRequest) {
+          console.log(`✅ Found InvoiceRequest ${requestIdValue} for invoice ${transformed.invoice_id || transformed._id}`);
+          
+          // Populate service_code (check root first, then verification)
+          if (!transformed.service_code && (invoiceRequest.service_code || invoiceRequest.verification?.service_code)) {
+            transformed.service_code = invoiceRequest.service_code || invoiceRequest.verification?.service_code;
+            console.log(`  ✅ Populated service_code: ${transformed.service_code}`);
+          }
+          
+          // Populate weight_kg (check multiple sources: weight_kg, weight, verification.chargeable_weight)
+          if ((transformed.weight_kg == null || transformed.weight_kg === 0 || transformed.weight_kg === '0') && 
+              (invoiceRequest.weight_kg || invoiceRequest.weight || invoiceRequest.verification?.chargeable_weight)) {
+            if (invoiceRequest.weight_kg) {
+              transformed.weight_kg = parseFloat(invoiceRequest.weight_kg.toString());
+            } else if (invoiceRequest.weight) {
+              transformed.weight_kg = parseFloat(invoiceRequest.weight.toString());
+            } else if (invoiceRequest.verification?.chargeable_weight) {
+              transformed.weight_kg = parseFloat(invoiceRequest.verification.chargeable_weight.toString());
+            }
+            console.log(`  ✅ Populated weight_kg: ${transformed.weight_kg}`);
+          }
+          
+          // Populate volume_cbm (check root first, then verification.total_vm)
+          if ((transformed.volume_cbm == null || transformed.volume_cbm === 0 || transformed.volume_cbm === '0') && 
+              (invoiceRequest.volume_cbm || invoiceRequest.verification?.total_vm)) {
+            if (invoiceRequest.volume_cbm) {
+              transformed.volume_cbm = parseFloat(invoiceRequest.volume_cbm.toString());
+            } else if (invoiceRequest.verification?.total_vm) {
+              transformed.volume_cbm = parseFloat(invoiceRequest.verification.total_vm.toString());
+            }
+            console.log(`  ✅ Populated volume_cbm: ${transformed.volume_cbm}`);
+          }
+          
+          // Populate receiver_name
+          if (!transformed.receiver_name && invoiceRequest.receiver_name) {
+            transformed.receiver_name = invoiceRequest.receiver_name;
+            console.log(`  ✅ Populated receiver_name: ${transformed.receiver_name}`);
+          }
+          
+          // Populate receiver_address (check multiple sources)
+          if (!transformed.receiver_address && 
+              (invoiceRequest.receiver_address || invoiceRequest.destination_place || invoiceRequest.verification?.receiver_address)) {
+            transformed.receiver_address = invoiceRequest.receiver_address || 
+                                            invoiceRequest.destination_place || 
+                                            invoiceRequest.verification?.receiver_address;
+            console.log(`  ✅ Populated receiver_address: ${transformed.receiver_address}`);
+          }
+          
+          // Populate receiver_phone (check root first, then verification)
+          if (!transformed.receiver_phone && 
+              (invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone)) {
+            transformed.receiver_phone = invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone;
+            console.log(`  ✅ Populated receiver_phone: ${transformed.receiver_phone}`);
+          }
+          
+          // Also update the invoice's request_id in the database if it was null
+          if (!invoiceObj.request_id && invoiceRequest._id) {
+            try {
+              await Invoice.findByIdAndUpdate(transformed._id, { request_id: invoiceRequest._id });
+              console.log(`  ✅ Updated invoice request_id in database: ${invoiceRequest._id}`);
+            } catch (updateError) {
+              console.error(`  ⚠️ Failed to update invoice request_id:`, updateError.message);
+            }
+          }
+        } else {
+          console.log(`⚠️ No InvoiceRequest found for request_id: ${requestIdValue}`);
+        }
+      } else {
+        console.log(`⚠️ No request_id found for invoice ${transformed.invoice_id || transformed._id} (checked request_id field and notes)`);
+      }
+    } catch (error) {
+      console.error('⚠️ Error populating fields from InvoiceRequest:', error.message);
+      console.error('Error stack:', error.stack);
+    }
+    
     res.json({
       success: true,
-      data: transformInvoice(invoice)
+      data: transformed
     });
   } catch (error) {
     console.error('Error fetching invoice:', error);
@@ -130,11 +349,12 @@ router.post('/', async (req, res) => {
     // Calculate due date if not provided (30 days from now)
     const invoiceDueDate = due_date ? new Date(due_date) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
-    // Extract invoice_id from request_id
+    // Extract invoice_id and awb_number from request_id
     // request_id can be either:
     // 1. A ShipmentRequest ObjectId (needs to be looked up for its request_id)
-    // 2. An InvoiceRequest ObjectId (should be used directly as invoice_id)
+    // 2. An InvoiceRequest ObjectId (should use invoice_number and tracking_code)
     let invoiceIdToUse = null;
+    let awbNumberToUse = null;
     
     try {
       // First, try to find if it's a ShipmentRequest
@@ -149,17 +369,43 @@ router.post('/', async (req, res) => {
         } else {
           console.warn('⚠️ Shipment request has no request_id field');
         }
+        // Use AWB number from shipment request
+        if (shipmentRequest.awb_number) {
+          awbNumberToUse = shipmentRequest.awb_number;
+          console.log('✅ Using shipment awb_number:', awbNumberToUse);
+        }
       } else {
-        // It's not a ShipmentRequest, assume it's an InvoiceRequest ObjectId
-        // Use the ObjectId string as the invoice_id
-        invoiceIdToUse = request_id.toString();
-        console.log('✅ Using invoice request ID as invoice_id:', invoiceIdToUse);
+        // It's not a ShipmentRequest, check if it's an InvoiceRequest
+        const invoiceRequest = await InvoiceRequest.findById(request_id);
+        if (invoiceRequest) {
+          // Use the auto-generated invoice_number from InvoiceRequest
+          invoiceIdToUse = invoiceRequest.invoice_number;
+          // Use the auto-generated tracking_code (AWB) from InvoiceRequest
+          awbNumberToUse = invoiceRequest.tracking_code;
+          console.log('✅ Using invoice request invoice_number as invoice_id:', invoiceIdToUse);
+          console.log('✅ Using invoice request tracking_code as awb_number:', awbNumberToUse);
+        } else {
+          // Fallback: use request_id as invoice_id
+          invoiceIdToUse = request_id.toString();
+          console.log('⚠️ Using request_id as fallback invoice_id:', invoiceIdToUse);
+        }
       }
     } catch (error) {
       console.error('❌ Error checking request type:', error);
       // Fallback: use request_id as invoice_id
       invoiceIdToUse = request_id.toString();
       console.log('📝 Using request_id as fallback invoice_id:', invoiceIdToUse);
+    }
+
+    // Try to get InvoiceRequest to populate additional fields
+    let invoiceRequest = null;
+    try {
+      invoiceRequest = await InvoiceRequest.findById(request_id);
+      if (invoiceRequest) {
+        console.log('📋 Found InvoiceRequest, will populate additional fields');
+      }
+    } catch (error) {
+      console.log('⚠️ Could not fetch InvoiceRequest:', error.message);
     }
 
     const invoiceData = {
@@ -173,15 +419,35 @@ router.post('/', async (req, res) => {
       tax_amount: taxAmount,
       total_amount: totalAmount,
       notes,
-      created_by
+      created_by,
+      // Populate fields from InvoiceRequest if available
+      ...(invoiceRequest && {
+        service_code: invoiceRequest.service_code || invoiceRequest.verification?.service_code || undefined,
+        weight_kg: invoiceRequest.weight_kg ? parseFloat(invoiceRequest.weight_kg.toString()) : 
+                  (invoiceRequest.weight ? parseFloat(invoiceRequest.weight.toString()) : 
+                  (invoiceRequest.verification?.chargeable_weight ? parseFloat(invoiceRequest.verification.chargeable_weight.toString()) :
+                  (invoiceRequest.verification?.weight ? parseFloat(invoiceRequest.verification.weight.toString()) : undefined))),
+        volume_cbm: invoiceRequest.volume_cbm ? parseFloat(invoiceRequest.volume_cbm.toString()) : 
+                   (invoiceRequest.verification?.total_vm ? parseFloat(invoiceRequest.verification.total_vm.toString()) : undefined),
+        receiver_name: invoiceRequest.receiver_name || undefined,
+        receiver_address: invoiceRequest.receiver_address || invoiceRequest.destination_place || 
+                         invoiceRequest.verification?.receiver_address || undefined,
+        receiver_phone: invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone || undefined,
+      })
     };
 
-    // Set invoice_id if we have it from the shipment request
+    // Set invoice_id if we have it from the request
     if (invoiceIdToUse) {
       invoiceData.invoice_id = invoiceIdToUse;
       console.log('✅ Set invoice_id in data:', invoiceIdToUse);
     } else {
       console.warn('⚠️ No invoice_id to set, will use auto-generated');
+    }
+    
+    // Set awb_number if we have it from the request
+    if (awbNumberToUse) {
+      invoiceData.awb_number = awbNumberToUse;
+      console.log('✅ Set awb_number in data:', awbNumberToUse);
     }
     
     console.log('📝 Invoice data to save (with invoice_id):', JSON.stringify(invoiceData, null, 2));
@@ -313,25 +579,25 @@ router.post('/', async (req, res) => {
         if (invoiceRequest) {
           // Found invoice request - use its data
           requestData = {
-            request_id: invoice.invoice_id,
-            awb_number: 'N/A',
+            request_id: invoice.invoice_id || invoiceRequest.invoice_number || 'N/A',
+            awb_number: invoiceRequest.tracking_code || invoice.awb_number || 'N/A',
             customer: {
               name: invoiceRequest.customer_name || 'N/A',
-              company: invoiceRequest.customer_company || 'N/A',
+              company: 'N/A', // Company removed, use customer_name instead
               email: 'N/A',
-              phone: 'N/A'
+              phone: invoiceRequest.customer_phone || 'N/A'
             },
             receiver: {
               name: invoiceRequest.receiver_name || 'N/A',
-              address: 'N/A',
+              address: invoiceRequest.receiver_address || 'N/A',
               city: invoiceRequest.destination_place || 'N/A',
               country: 'N/A',
-              phone: 'N/A'
+              phone: invoiceRequest.receiver_phone || 'N/A'
             },
             shipment: {
               number_of_boxes: invoiceRequest.verification?.number_of_boxes || 0,
-              weight: invoiceRequest.weight?.toString() || '0',
-              weight_type: invoiceRequest.verification?.weight_type || 'N/A',
+              weight: invoiceRequest.weight?.toString() || invoiceRequest.weight_kg?.toString() || '0',
+              weight_type: invoiceRequest.verification?.weight_type || 'KG',
               rate: 'N/A'
             },
             route: `${invoiceRequest.origin_place} → ${invoiceRequest.destination_place}`,

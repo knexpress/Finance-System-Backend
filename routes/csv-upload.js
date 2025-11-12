@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { Invoice, Client, DeliveryAssignment } = require('../models/unified-schema');
 const { Report, User } = require('../models');
 const empostAPI = require('../services/empost-api');
+const { generateUniqueInvoiceID, generateUniqueAWBNumber } = require('../utils/id-generators');
 
 const router = express.Router();
 const auth = require('../middleware/auth');
@@ -27,15 +28,35 @@ const upload = multer({
   }
 });
 
-// Helper function to normalize column names (case-insensitive, handles spaces)
+// Helper function to normalize column names (case-insensitive, handles spaces and parentheses)
 function normalizeColumnName(name) {
-  return name.toLowerCase().trim().replace(/\s+/g, '_');
+  if (!name) return '';
+  // Convert to lowercase, trim, replace spaces and parentheses with underscores
+  return name.toLowerCase().trim()
+    .replace(/\s+/g, '_')
+    .replace(/[()]/g, '')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, ''); // Remove leading/trailing underscores
 }
 
 // Helper function to get a value from row using flexible column matching
+// Checks both normalized and original column names
 function getColumnValue(row, possibleNames) {
+  // First, check normalized names (most common case)
   for (const name of possibleNames) {
+    const normalizedName = normalizeColumnName(name);
+    if (row[normalizedName]) return row[normalizedName];
+    // Also check original name in case it wasn't normalized
     if (row[name]) return row[name];
+  }
+  // Try checking all keys in row (handle case variations)
+  for (const name of possibleNames) {
+    const normalizedName = normalizeColumnName(name);
+    for (const key in row) {
+      if (normalizeColumnName(key) === normalizedName) {
+        return row[key];
+      }
+    }
   }
   return null;
 }
@@ -113,9 +134,12 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         // Find or create client
         let client = null;
         
-        // Try to find client by company_name (flexible column matching)
+        // Handle sender name column (from image: "Sender Name")
+        // Try to find client by sender_name (flexible column matching)
         // Support both standard and shipment data formats
-        const companyName = getColumnValue(row, ['company_name', 'company', 'companyname', 'client_name', 'customer_name', 'sender_name']);
+        const senderName = getColumnValue(row, ['sender_name', 'sender name', 'sendername', 'sender', 'company_name', 'company name', 'company', 'companyname', 'client_name', 'client name', 'customer_name', 'customer name']);
+        const companyName = senderName; // Use sender name as company name
+        
         if (companyName) {
           client = await Client.findOne({ company_name: companyName });
         }
@@ -127,7 +151,8 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         }
 
         // Get contact name for later use (needed for audit reports)
-        const contactName = getColumnValue(row, ['contact_name', 'contactname', 'contact_person', 'contact', 'sender_name']) || companyName;
+        // Use sender_name as contact name if available
+        const contactName = getColumnValue(row, ['contact_name', 'contactname', 'contact_person', 'contact', 'sender_name']) || companyName || senderName;
         
         // If client still not found, create new client
         if (!client) {
@@ -173,26 +198,62 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
 
         // Calculate amounts (flexible column matching)
         // Support both standard invoice fields and shipment data fields
-        const amountValue = getColumnValue(row, ['amount', 'invoice_amount', 'total_amount', 'total', 'amount_(aed)', 'amount_aed']);
-        const amount = parseFloat(amountValue || 0);
-        const taxRateValue = getColumnValue(row, ['tax_rate', 'taxrate', 'tax', 'tax_percent']);
-        const taxRate = parseFloat(taxRateValue || 0);
-        const taxAmount = (amount * taxRate) / 100;
-        const totalAmount = amount + taxAmount;
+        // Handle "Amount (AED)" column from image - this should be the base amount (without tax)
+        const amountValue = getColumnValue(row, ['amount_aed', 'amount aed', 'amount(aed)', 'amount (aed)', 'amount', 'invoice_amount', 'invoice amount', 'base_amount', 'base amount', 'total_amount', 'total amount', 'total']);
+        let amount = parseFloat(amountValue || 0);
+        
+        // If amount is 0 or not provided, try to get from other columns
+        if (amount <= 0) {
+          // Try alternative column names
+          const altAmount = getColumnValue(row, ['invoice_amount', 'base_amount', 'charges', 'subtotal']);
+          amount = parseFloat(altAmount || 0);
+        }
+        
+        // Get tax rate (default to 5% if not provided, or 0 if tax not applicable)
+        const taxRateValue = getColumnValue(row, ['tax_rate', 'taxrate', 'tax', 'tax_percent', 'vat_rate', 'vat']);
+        let taxRate = parseFloat(taxRateValue || 5); // Default 5% VAT in UAE
+        
+        // Check if amount includes tax (if total_amount is provided and different from amount)
+        const totalAmountValue = getColumnValue(row, ['total_amount', 'totalamount', 'total', 'grand_total', 'amount_with_tax']);
+        const totalAmountProvided = totalAmountValue ? parseFloat(totalAmountValue) : null;
+        
+        // Calculate tax and total amounts
+        let taxAmount = 0;
+        let totalAmount = amount;
+        
+        if (totalAmountProvided && totalAmountProvided > amount && amount > 0) {
+          // Total amount is provided and is greater than base amount - calculate tax
+          totalAmount = totalAmountProvided;
+          taxAmount = totalAmount - amount;
+          // Recalculate tax rate based on actual values
+          if (amount > 0) {
+            taxRate = (taxAmount / amount) * 100;
+          }
+        } else if (taxRate > 0 && amount > 0) {
+          // Calculate tax from tax rate
+          taxAmount = (amount * taxRate) / 100;
+          totalAmount = amount + taxAmount;
+        } else {
+          // No tax
+          taxRate = 0;
+          taxAmount = 0;
+          totalAmount = amount;
+        }
 
         if (amount <= 0) {
           errors.push({
             row: rowNumber,
-            error: 'Invalid amount (must be greater than 0)',
+            error: 'Invalid amount (must be greater than 0). Found columns: ' + Object.keys(row).join(', '),
             data: row
           });
           continue;
         }
 
-        // Get receiver and delivery information early (needed for audit reports and delivery assignments)
-        const receiverName = getColumnValue(row, ['receiver_name']);
-        const receiverMobile = getColumnValue(row, ['receiver_mobile']);
-        const receiverAddress = getColumnValue(row, ['receiver_address', 'receiveraddress']);
+        // Get receiver and delivery information (from image columns)
+        // Handle "Receiver Name", "Receiver Address", "Receiver Mobile" columns
+        const receiverName = getColumnValue(row, ['receiver_name', 'receiver name', 'receivername', 'receiver', 'receiver_name']);
+        const receiverMobile = getColumnValue(row, ['receiver_mobile', 'receiver mobile', 'receivermobile', 'receiver_mobile', 'receiver_phone', 'receiver phone', 'receiverphone', 'receiver_contact', 'receiver contact']);
+        const receiverAddress = getColumnValue(row, ['receiver_address', 'receiver address', 'receiveraddress', 'receiver_address', 'delivery_address', 'delivery address', 'deliveryaddress']);
         
         // Get additional fields with flexible matching
         const dueDate = getColumnValue(row, ['due_date', 'duedate', 'due']);
@@ -200,81 +261,119 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         const quantity = getColumnValue(row, ['quantity', 'qty', 'qty']);
         const notes = getColumnValue(row, ['notes', 'remarks', 'remarks_notes']);
         
-        // Get fields from CSV for invoice
-        const invoiceNumber = getColumnValue(row, ['invoice_number', 'invoicenumber', 'invoice_id', 'invoiceid']);
-        const createdAt = getColumnValue(row, ['created_at', 'createdat', 'date', 'created']);
-        const trackingCode = getColumnValue(row, ['tracking_code', 'trackingcode', 'tracking']);
-        const serviceCode = getColumnValue(row, ['service_code', 'servicecode']);
-        const weight = getColumnValue(row, ['weight_(kg)', 'weight', 'weight_kg']);
-        const volume = getColumnValue(row, ['volume_(cbm)', 'volume', 'volume_cbm']);
+        // Get fields from CSV for invoice (matching columns from image)
+        // Invoice Number - handles "Invoice Number" column
+        const invoiceNumber = getColumnValue(row, ['invoice_number', 'invoice number', 'invoicenumber', 'invoice_id', 'invoice id', 'invoiceid', 'invoice']);
+        // Created At - handles "Created At" column
+        const createdAt = getColumnValue(row, ['created_at', 'created at', 'createdat', 'date', 'created', 'invoice_date', 'invoice date', 'invoicedate']);
+        // Tracking Code - handles "Tracking Code" column
+        const trackingCode = getColumnValue(row, ['tracking_code', 'tracking code', 'trackingcode', 'tracking', 'awb_number', 'awb number', 'awbnumber', 'awb']);
+        // Service Code - handles "Service Code" column
+        const serviceCode = getColumnValue(row, ['service_code', 'service code', 'servicecode', 'service']);
+        // Weight (KG) - handles "Weight (KG)" column with parentheses
+        const weight = getColumnValue(row, ['weight_kg', 'weight kg', 'weightkg', 'weight(kg)', 'weight (kg)', 'weight', 'kg', 'weight_in_kg', 'weight in kg']);
+        // Volume (CBM) - handles "Volume (CBM)" column with parentheses
+        const volume = getColumnValue(row, ['volume_cbm', 'volume cbm', 'volumecbm', 'volume(cbm)', 'volume (cbm)', 'volume', 'cbm', 'volume_in_cbm', 'volume in cbm']);
         
-        // Check if invoice with this invoice_id already exists in database
+        // Generate Invoice ID and AWB number if not provided in CSV
         let finalInvoiceId = invoiceNumber;
-        if (invoiceNumber) {
-          // Check if invoice exists in database
-          const existingInvoice = await Invoice.findOne({ invoice_id: invoiceNumber });
+        let finalTrackingCode = trackingCode;
+        
+        // If invoice number not provided, generate one
+        if (!finalInvoiceId) {
+          try {
+            finalInvoiceId = await generateUniqueInvoiceID(Invoice);
+            console.log('✅ Auto-generated Invoice ID:', finalInvoiceId);
+          } catch (error) {
+            console.error('❌ Error generating Invoice ID:', error);
+            // Fallback to timestamp-based ID
+            finalInvoiceId = `INV-${Date.now().toString().slice(-8)}`;
+          }
+        } else {
+          // Check if invoice number already exists
+          const existingInvoice = await Invoice.findOne({ invoice_id: finalInvoiceId });
           if (existingInvoice) {
-            // Invoice with this ID already exists - generate a unique one using tracking code
-            if (trackingCode) {
-              // Use tracking code as invoice ID if available
-              const trackingBasedId = trackingCode;
-              const existingWithTracking = await Invoice.findOne({ invoice_id: trackingBasedId });
-              if (!existingWithTracking) {
-                finalInvoiceId = trackingBasedId;
-                console.log(`⚠️  Invoice ID ${invoiceNumber} already exists. Using tracking code as invoice ID: ${finalInvoiceId}`);
-              } else {
-                // Both invoice number and tracking code exist - generate unique ID
-                const timestamp = Date.now().toString().slice(-6);
-                finalInvoiceId = `${invoiceNumber}-${timestamp}`;
-                console.log(`⚠️  Invoice ID ${invoiceNumber} and tracking code ${trackingCode} already exist. Generated unique ID: ${finalInvoiceId}`);
-              }
-            } else {
-              // No tracking code - generate unique ID with timestamp
+            // Invoice ID already exists - generate a unique one
+            try {
+              finalInvoiceId = await generateUniqueInvoiceID(Invoice);
+              console.log(`⚠️  Invoice ID ${invoiceNumber} already exists. Generated unique ID: ${finalInvoiceId}`);
+            } catch (error) {
+              console.error('❌ Error generating unique Invoice ID:', error);
+              // Fallback to timestamp-based ID
               const timestamp = Date.now().toString().slice(-6);
               finalInvoiceId = `${invoiceNumber}-${timestamp}`;
-              console.log(`⚠️  Invoice ID ${invoiceNumber} already exists. Generated unique ID: ${finalInvoiceId}`);
             }
-          }
-        } else if (trackingCode) {
-          // No invoice number provided, use tracking code as invoice ID
-          finalInvoiceId = trackingCode;
-          const existingWithTracking = await Invoice.findOne({ invoice_id: trackingCode });
-          if (existingWithTracking) {
-            // Tracking code also exists - generate unique ID
-            const timestamp = Date.now().toString().slice(-6);
-            finalInvoiceId = `INV-${timestamp}`;
-            console.log(`⚠️  Tracking code ${trackingCode} already exists. Generated unique ID: ${finalInvoiceId}`);
           }
         }
         
-        // Create invoice
+        // If tracking code (AWB) not provided, generate one
+        if (!finalTrackingCode) {
+          try {
+            finalTrackingCode = await generateUniqueAWBNumber(Invoice);
+            console.log('✅ Auto-generated AWB Number:', finalTrackingCode);
+          } catch (error) {
+            console.error('❌ Error generating AWB Number:', error);
+            // Fallback: use invoice ID as tracking code
+            finalTrackingCode = finalInvoiceId;
+          }
+        } else {
+          // Check if tracking code already exists
+          const existingWithTracking = await Invoice.findOne({ 
+            $or: [
+              { awb_number: finalTrackingCode },
+              { invoice_id: finalTrackingCode }
+            ]
+          });
+          if (existingWithTracking) {
+            // Tracking code already exists - generate a unique one
+            try {
+              finalTrackingCode = await generateUniqueAWBNumber(Invoice);
+              console.log(`⚠️  Tracking code ${trackingCode} already exists. Generated unique AWB: ${finalTrackingCode}`);
+            } catch (error) {
+              console.error('❌ Error generating unique AWB Number:', error);
+              // Fallback: use invoice ID as tracking code
+              finalTrackingCode = finalInvoiceId;
+            }
+          }
+        }
+        
+        // Create invoice with all data from CSV
+        // Ensure amount is base amount (without tax) for invoice.amount
         const invoiceData = {
           client_id: client._id,
-          amount: amount,
+          amount: amount, // Base amount without tax - this is critical for EMpost integration
           issue_date: createdAt ? new Date(createdAt) : new Date(), // Use created_at from CSV
           due_date: dueDate ? new Date(dueDate) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // Default 30 days
           status: 'UNPAID',
           line_items: [{
-            description: description || 'Service',
+            description: description || serviceCode || 'Shipping Service',
             quantity: parseFloat(quantity || 1),
-            unit_price: amount,
-            total: amount
+            unit_price: amount, // Base unit price without tax
+            total: amount // Base total without tax
           }],
           tax_rate: taxRate,
-          tax_amount: taxAmount,
-          total_amount: totalAmount,
-          notes: notes || '',
+          tax_amount: taxAmount, // Tax amount calculated
+          total_amount: totalAmount, // Total amount (base + tax)
+          notes: notes || (serviceCode ? `Service Code: ${serviceCode}` : ''),
           created_by: req.user.id,
-          // Add all fields from CSV
-          invoice_id: finalInvoiceId, // Use invoice_number from CSV (if not duplicate)
-          awb_number: trackingCode, // Use tracking_code from CSV
-          receiver_name: receiverName,
-          receiver_address: receiverAddress,
-          receiver_phone: receiverMobile,
-          service_code: serviceCode,
-          weight_kg: weight ? parseFloat(weight) : null,
-          volume_cbm: volume ? parseFloat(volume) : null
+          // Add all fields from CSV columns
+          invoice_id: finalInvoiceId, // Use invoice_number from CSV or auto-generated
+          awb_number: finalTrackingCode, // Use tracking_code from CSV or auto-generated
+          receiver_name: receiverName || 'N/A',
+          receiver_address: receiverAddress || 'N/A',
+          receiver_phone: receiverMobile || 'N/A',
+          service_code: serviceCode || 'N/A',
+          weight_kg: weight ? parseFloat(weight) : null, // Weight (KG)
+          volume_cbm: volume ? parseFloat(volume) : null // Volume (CBM)
         };
+        
+        // Log invoice data for debugging
+        console.log('💰 Invoice amounts:', {
+          base_amount: amount,
+          tax_rate: taxRate,
+          tax_amount: taxAmount,
+          total_amount: totalAmount
+        });
 
         const invoice = new Invoice(invoiceData);
         await invoice.save();
@@ -411,57 +510,97 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           });
         }
 
-        // Get delivery information with flexible matching
-        // Support both standard and shipment data formats
+        // Create delivery assignment with all data from CSV
+        // Intelligently map all required fields to delivery assignment
         const deliveryAddress = getColumnValue(row, ['delivery_address', 'deliveryaddress', 'address', 'delivery_location']) || receiverAddress;
-        const deliveryInstructions = getColumnValue(row, ['delivery_instructions', 'deliveryinstructions', 'delivery_notes', 'deliverynotes', 'special_instructions']);
+        const deliveryInstructions = getColumnValue(row, ['delivery_instructions', 'deliveryinstructions', 'delivery_notes', 'deliverynotes', 'special_instructions', 'notes']);
+        const deliveryType = getColumnValue(row, ['delivery_type', 'deliverytype', 'payment_type', 'paymenttype']) || 'COD';
         
-        // Create delivery assignment if delivery_address is provided or receiver information exists
-        if (deliveryAddress || receiverName) {
-          console.log('🚚 Creating delivery assignment...');
-          
-          // Build delivery address from receiver information if not directly provided
-          let finalDeliveryAddress = deliveryAddress;
-          if (!finalDeliveryAddress && receiverName) {
-            finalDeliveryAddress = `Deliver to: ${receiverName}`;
-            if (receiverMobile) {
-              finalDeliveryAddress += ` (${receiverMobile})`;
-            }
-            if (deliveryAddress) {
-              finalDeliveryAddress += ` at ${deliveryAddress}`;
-            }
-          } else if (!finalDeliveryAddress) {
-            finalDeliveryAddress = 'Address to be confirmed';
+        // Always create delivery assignment if we have invoice data
+        // This ensures all invoices have delivery assignments for tracking
+        console.log('🚚 Creating delivery assignment with CSV data...');
+        
+        // Build delivery address intelligently
+        let finalDeliveryAddress = deliveryAddress || receiverAddress || 'Address to be confirmed';
+        
+        // If we have receiver name and mobile, add to delivery address
+        if (receiverName && !finalDeliveryAddress.includes(receiverName)) {
+          if (receiverMobile) {
+            finalDeliveryAddress = `${receiverName} (${receiverMobile})\n${finalDeliveryAddress}`;
+          } else {
+            finalDeliveryAddress = `${receiverName}\n${finalDeliveryAddress}`;
           }
-          
-          // Generate unique QR code for delivery
-          const qrCode = crypto.randomBytes(16).toString('hex');
-          const qrUrl = `${process.env.FRONTEND_URL || 'http://localhost:9002'}/qr-payment/${qrCode}`;
-          const qrExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours from now
-          
-          const assignmentData = {
-            invoice_id: invoice._id,
-            client_id: client._id,
-            amount: totalAmount,
-            delivery_type: 'COD', // Default to COD for CSV uploads
-            delivery_address: finalDeliveryAddress,
-            receiver_name: receiverName,
-            receiver_phone: receiverMobile,
-            delivery_instructions: deliveryInstructions || receiverName 
-              ? `Contact receiver: ${receiverName}${receiverMobile ? ` (${receiverMobile})` : ''}` 
-              : 'Please contact customer for delivery details',
-            qr_code: qrCode,
-            qr_url: qrUrl,
-            qr_expires_at: qrExpiresAt,
-            created_by: req.user.id
-          };
-
-          const assignment = new DeliveryAssignment(assignmentData);
-          await assignment.save();
-          
-          console.log('✅ Delivery assignment created:', assignment.assignment_id);
-          createdAssignments.push(assignment);
         }
+        
+        // Build delivery instructions intelligently
+        let finalDeliveryInstructions = deliveryInstructions || '';
+        if (receiverName || receiverMobile) {
+          const contactInfo = `Contact: ${receiverName || 'Receiver'}${receiverMobile ? ` (${receiverMobile})` : ''}`;
+          if (finalDeliveryInstructions) {
+            finalDeliveryInstructions = `${contactInfo}\n${finalDeliveryInstructions}`;
+          } else {
+            finalDeliveryInstructions = contactInfo;
+          }
+        }
+        
+        // Add service code and tracking info to instructions if available
+        if (serviceCode || trackingCode) {
+          const trackingInfo = [];
+          if (serviceCode) trackingInfo.push(`Service: ${serviceCode}`);
+          if (trackingCode) trackingInfo.push(`Tracking: ${trackingCode}`);
+          if (trackingInfo.length > 0) {
+            finalDeliveryInstructions = `${finalDeliveryInstructions}\n${trackingInfo.join(', ')}`;
+          }
+        }
+        
+        // Generate unique QR code for delivery
+        const qrCode = crypto.randomBytes(16).toString('hex');
+        const qrUrl = `${process.env.FRONTEND_URL || 'http://localhost:9002'}/qr-payment/${qrCode}`;
+        const qrExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours from now
+        
+        // Map delivery type (normalize to valid enum values)
+        let normalizedDeliveryType = 'COD';
+        if (deliveryType) {
+          const deliveryTypeUpper = deliveryType.toUpperCase();
+          if (['COD', 'PREPAID', 'BANK_TRANSFER', 'WAREHOUSE_PICKUP'].includes(deliveryTypeUpper)) {
+            normalizedDeliveryType = deliveryTypeUpper;
+          } else if (deliveryTypeUpper.includes('PREPAID') || deliveryTypeUpper.includes('PAID')) {
+            normalizedDeliveryType = 'PREPAID';
+          } else if (deliveryTypeUpper.includes('BANK')) {
+            normalizedDeliveryType = 'BANK_TRANSFER';
+          } else if (deliveryTypeUpper.includes('WAREHOUSE') || deliveryTypeUpper.includes('PICKUP')) {
+            normalizedDeliveryType = 'WAREHOUSE_PICKUP';
+          }
+        }
+        
+        // Create delivery assignment with all mapped data
+        const assignmentData = {
+          invoice_id: invoice._id,
+          client_id: client._id,
+          amount: totalAmount, // Use total amount (with tax) for delivery assignment
+          delivery_type: normalizedDeliveryType,
+          delivery_address: finalDeliveryAddress.trim(),
+          receiver_name: receiverName || 'N/A',
+          receiver_phone: receiverMobile || 'N/A',
+          delivery_instructions: finalDeliveryInstructions.trim() || 'Please contact customer for delivery details',
+          qr_code: qrCode,
+          qr_url: qrUrl,
+          qr_expires_at: qrExpiresAt,
+          status: 'ASSIGNED', // Default status
+          created_by: req.user.id
+        };
+
+        const assignment = new DeliveryAssignment(assignmentData);
+        await assignment.save();
+        
+        console.log('✅ Delivery assignment created:', {
+          assignment_id: assignment.assignment_id,
+          invoice_id: invoice.invoice_id,
+          receiver: receiverName,
+          address: finalDeliveryAddress.substring(0, 50) + '...',
+          amount: totalAmount
+        });
+        createdAssignments.push(assignment);
 
       } catch (rowError) {
         console.error(`❌ Error processing row ${rowNumber}:`, rowError);
@@ -524,10 +663,11 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
 });
 
 // Template download endpoint - provides CSV template
+// Template matches the required columns: Invoice Number, Created At, Tracking Code, Service Code, Weight (KG), Volume (CBM), Amount (AED), Sender Name, Receiver Name, Receiver Address, Receiver Mobile
 router.get('/template', (req, res) => {
-  const csvTemplate = `company_name,contact_name,email,phone,address,city,country,amount,tax_rate,due_date,description,quantity,delivery_type,delivery_address,delivery_instructions,notes
-ABC Company,John Doe,john@abc.com,+971501234567,123 Business St,Dubai,UAE,500,5,2024-12-31,Freight Service,1,COD,456 Customer Ave Dubai UAE,Call before delivery,Dispatch immediately
-XYZ Corp,Jane Smith,jane@xyz.com,+971509876543,456 Main Rd,Abu Dhabi,UAE,1200,5,2024-12-31,Shipping Service,1,PREPAID,789 Warehouse St Abu Dhabi UAE,Signature required,Handle with care`;
+  const csvTemplate = `Invoice Number,Created At,Tracking Code,Service Code,Weight (KG),Volume (CBM),Amount (AED),Sender Name,Receiver Name,Receiver Address,Receiver Mobile,Tax Rate,Description,Notes,Delivery Type
+INV-001,2024-12-01,TRK123456789,SVC-EXPRESS,10.5,0.5,500,ABC Company,John Doe,"123 Main Street, Dubai, UAE",+971501234567,5,Shipping Service,Sample invoice,COD
+INV-002,2024-12-02,TRK987654321,SVC-STANDARD,5.2,0.3,750,XYZ Corp,Jane Smith,"456 Business Ave, Abu Dhabi, UAE",+971509876543,5,Freight Service,Handle with care,PREPAID`;
 
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="invoice_bulk_upload_template.csv"');

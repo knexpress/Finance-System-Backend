@@ -30,6 +30,7 @@ const qrPaymentSessionRoutes = require('./routes/qr-payment-sessions');
 const paymentRemittanceRoutes = require('./routes/payment-remittances');
 const csvUploadRoutes = require('./routes/csv-upload');
 const bookingsRoutes = require('./routes/bookings');
+const chatRoutes = require('./routes/chat');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -102,6 +103,9 @@ app.use('/api/csv-upload', csvUploadRoutes);
 
 // Bookings routes
 app.use('/api/bookings', bookingsRoutes);
+
+// Inter-Department Chat routes
+app.use('/api/chat', chatRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
