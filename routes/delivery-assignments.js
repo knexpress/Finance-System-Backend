@@ -45,12 +45,13 @@ router.get('/', auth, async (req, res) => {
                                          'N/A';
       }
       
-      // If assignment_id is not AWB number but invoice has AWB, suggest update
+      // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
       if (assignmentData.invoice_id?.awb_number && 
           assignmentData.assignment_id && 
-          !assignmentData.assignment_id.startsWith('DA-') &&
-          assignmentData.assignment_id !== assignmentData.invoice_id.awb_number) {
-        // This is fine - assignment_id might be different
+          assignmentData.assignment_id.startsWith('DA-')) {
+        // Replace old DA- format with AWB number (tracking ID)
+        assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+        console.log(`🔄 Updated assignment_id from DA- format to AWB: ${assignmentData.invoice_id.awb_number}`);
       }
       
       return assignmentData;
@@ -98,6 +99,13 @@ router.get('/by-invoice/:invoiceId', auth, async (req, res) => {
       assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
     }
     
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+    
     res.json({
       success: true,
       data: assignmentData
@@ -138,6 +146,13 @@ router.get('/:id', auth, async (req, res) => {
     }
     if (!assignmentData.receiver_address && assignmentData.invoice_id) {
       assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
     }
     
     res.json({
@@ -400,6 +415,13 @@ router.put('/:id', auth, async (req, res) => {
       assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
     }
     
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+    
     // If status is DELIVERED, update the invoice request delivery_status
     if (status === 'DELIVERED') {
       try {
@@ -511,6 +533,13 @@ router.get('/qr/:qrCode', async (req, res) => {
       assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
     }
     
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+    }
+    
     res.json({
       success: true,
       data: assignmentData
@@ -602,6 +631,13 @@ router.put('/qr/:qrCode/status', async (req, res) => {
     }
     if (!assignmentData.receiver_address && assignmentData.invoice_id) {
       assignmentData.receiver_address = assignmentData.invoice_id.receiver_address || assignmentData.delivery_address || 'N/A';
+    }
+    
+    // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+    if (assignmentData.invoice_id?.awb_number && 
+        assignmentData.assignment_id && 
+        assignmentData.assignment_id.startsWith('DA-')) {
+      assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
     }
     
     res.json({
@@ -707,9 +743,30 @@ router.get('/driver/:driverId', auth, async (req, res) => {
       .populate('client_id', 'company_name')
       .sort({ createdAt: -1 });
     
+    // Convert and enrich assignments
+    const formattedAssignments = assignments.map(assignment => {
+      const assignmentData = assignment.toObject();
+      
+      // Convert amount from Decimal128 to number
+      if (assignmentData.amount) {
+        assignmentData.amount = typeof assignmentData.amount === 'object'
+          ? parseFloat(assignmentData.amount.toString())
+          : parseFloat(assignmentData.amount);
+      }
+      
+      // If assignment_id is in old format (DA-000001) but invoice has AWB number, use AWB as assignment_id
+      if (assignmentData.invoice_id?.awb_number && 
+          assignmentData.assignment_id && 
+          assignmentData.assignment_id.startsWith('DA-')) {
+        assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
+      }
+      
+      return assignmentData;
+    });
+    
     res.json({
       success: true,
-      data: assignments
+      data: formattedAssignments
     });
   } catch (error) {
     console.error('Error fetching driver assignments:', error);
