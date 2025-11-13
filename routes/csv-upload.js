@@ -573,6 +573,9 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           }
         }
         
+        // Get AWB number from invoice (use as assignment_id/tracking ID)
+        const awbNumber = invoice.awb_number || trackingCode || null;
+        
         // Create delivery assignment with all mapped data
         const assignmentData = {
           invoice_id: invoice._id,
@@ -582,6 +585,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           delivery_address: finalDeliveryAddress.trim(),
           receiver_name: receiverName || 'N/A',
           receiver_phone: receiverMobile || 'N/A',
+          receiver_address: receiverAddress || finalDeliveryAddress.trim(),
           delivery_instructions: finalDeliveryInstructions.trim() || 'Please contact customer for delivery details',
           qr_code: qrCode,
           qr_url: qrUrl,
@@ -589,6 +593,12 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           status: 'ASSIGNED', // Default status
           created_by: req.user.id
         };
+        
+        // Set assignment_id to AWB number if available (tracking ID)
+        if (awbNumber) {
+          assignmentData.assignment_id = awbNumber;
+          console.log('📦 Using AWB number as assignment_id (tracking ID):', awbNumber);
+        }
 
         const assignment = new DeliveryAssignment(assignmentData);
         await assignment.save();

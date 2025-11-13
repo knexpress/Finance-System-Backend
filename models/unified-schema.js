@@ -895,6 +895,10 @@ const deliveryAssignmentSchema = new mongoose.Schema({
     type: String,
     required: false,
   },
+  receiver_address: {
+    type: String,
+    required: false,
+  },
   delivery_instructions: {
     type: String,
     required: false,
@@ -1190,11 +1194,14 @@ cashFlowTransactionSchema.pre('save', async function(next) {
 // Delivery Assignment ID generation
 deliveryAssignmentSchema.pre('save', async function(next) {
   try {
+    // Only generate assignment_id if it's not already set (e.g., when using AWB number as tracking ID)
     if (!this.assignment_id) {
       const DeliveryAssignmentModel = this.constructor;
       const count = await DeliveryAssignmentModel.countDocuments();
       this.assignment_id = `DA-${String(count + 1).padStart(6, '0')}`;
       console.log('Generated assignment_id:', this.assignment_id);
+    } else {
+      console.log('Using provided assignment_id (AWB/Tracking ID):', this.assignment_id);
     }
     next();
   } catch (error) {
@@ -1240,27 +1247,27 @@ paymentRemittanceSchema.pre('save', async function(next) {
 // ========================================
 // INDEXES
 // ========================================
+// Note: Fields with 'unique: true' in schema definition automatically create indexes
+// Only non-unique indexes are explicitly defined here
 
 // Department indexes
-departmentSchema.index({ name: 1 }, { unique: true });
+// name index is automatically created by unique: true
 
 // Employee indexes
-employeeSchema.index({ email: 1 }, { unique: true });
-employeeSchema.index({ employee_id: 1 }, { unique: true });
+// email and employee_id indexes are automatically created by unique: true
 employeeSchema.index({ department_id: 1 });
 
 // User indexes
-userSchema.index({ email: 1 }, { unique: true });
+// email index is automatically created by unique: true
 userSchema.index({ department_id: 1 });
 userSchema.index({ role: 1 });
 
 // Client indexes
-clientSchema.index({ client_id: 1 }, { unique: true });
+// client_id index is automatically created by unique: true
 clientSchema.index({ company_name: 1 });
 
 // Shipment Request indexes
-shipmentRequestSchema.index({ request_id: 1 }, { unique: true });
-shipmentRequestSchema.index({ awb_number: 1 }, { unique: true, sparse: true });
+// request_id and awb_number indexes are automatically created by unique: true
 shipmentRequestSchema.index({ 'status.request_status': 1 });
 shipmentRequestSchema.index({ 'status.delivery_status': 1 });
 shipmentRequestSchema.index({ 'status.invoice_status': 1 });
@@ -1272,7 +1279,7 @@ shipmentRequestSchema.index({ 'customer.name': 1 });
 shipmentRequestSchema.index({ createdAt: -1 });
 
 // Internal Request indexes
-internalRequestSchema.index({ ticket_id: 1 }, { unique: true });
+// ticket_id index is automatically created by unique: true
 internalRequestSchema.index({ status: 1 });
 internalRequestSchema.index({ priority: 1 });
 internalRequestSchema.index({ department_id: 1 });
@@ -1280,7 +1287,7 @@ internalRequestSchema.index({ reported_by: 1 });
 internalRequestSchema.index({ assigned_to: 1 });
 
 // Invoice indexes
-invoiceSchema.index({ invoice_id: 1 }, { unique: true });
+// invoice_id index is automatically created by unique: true
 invoiceSchema.index({ request_id: 1 });
 invoiceSchema.index({ client_id: 1 });
 invoiceSchema.index({ status: 1 });
@@ -1289,7 +1296,7 @@ invoiceSchema.index({ due_date: 1 });
 invoiceSchema.index({ created_by: 1 });
 
 // Cash Flow indexes
-cashFlowTransactionSchema.index({ transaction_id: 1 }, { unique: true });
+// transaction_id index is automatically created by unique: true
 cashFlowTransactionSchema.index({ category: 1 });
 cashFlowTransactionSchema.index({ direction: 1 });
 cashFlowTransactionSchema.index({ transaction_date: -1 });
@@ -1303,32 +1310,31 @@ cashFlowTransactionSchema.index({ transaction_date: -1 });
 performanceMetricsSchema.index({ department_id: 1, period: 1, period_start: 1 });
 
 // Driver indexes
-driverSchema.index({ driver_id: 1 }, { unique: true });
+// driver_id index is automatically created by unique: true
 driverSchema.index({ phone: 1 });
 driverSchema.index({ license_number: 1 });
 driverSchema.index({ is_active: 1 });
 
 // Delivery Assignment indexes
-deliveryAssignmentSchema.index({ assignment_id: 1 }, { unique: true });
+// assignment_id and qr_code indexes are automatically created by unique: true
 deliveryAssignmentSchema.index({ request_id: 1 });
 deliveryAssignmentSchema.index({ driver_id: 1 });
 deliveryAssignmentSchema.index({ invoice_id: 1 });
 deliveryAssignmentSchema.index({ client_id: 1 });
 deliveryAssignmentSchema.index({ status: 1 });
-deliveryAssignmentSchema.index({ qr_code: 1 }, { unique: true });
 deliveryAssignmentSchema.index({ qr_expires_at: 1 });
 deliveryAssignmentSchema.index({ payment_collected: 1 });
 deliveryAssignmentSchema.index({ remitted_to_warehouse: 1 });
 
 // QR Payment Session indexes
-qrPaymentSessionSchema.index({ session_id: 1 }, { unique: true });
+// session_id index is automatically created by unique: true
 qrPaymentSessionSchema.index({ assignment_id: 1 });
 qrPaymentSessionSchema.index({ qr_code: 1 });
 qrPaymentSessionSchema.index({ status: 1 });
 qrPaymentSessionSchema.index({ expires_at: 1 });
 
 // Payment Remittance indexes
-paymentRemittanceSchema.index({ remittance_id: 1 }, { unique: true });
+// remittance_id index is automatically created by unique: true
 paymentRemittanceSchema.index({ driver_id: 1 });
 paymentRemittanceSchema.index({ status: 1 });
 paymentRemittanceSchema.index({ remitted_at: 1 });

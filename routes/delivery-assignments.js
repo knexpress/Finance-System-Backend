@@ -121,10 +121,36 @@ router.post('/', auth, async (req, res) => {
       });
     }
     
-    if (!amount) {
+    // Fetch invoice to get receiver information and AWB number
+    const invoice = await Invoice.findById(invoice_id);
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invoice not found'
+      });
+    }
+    
+    // Extract receiver information from invoice
+    const receiverName = invoice.receiver_name || invoice.request_id?.receiver?.name || 'N/A';
+    const receiverPhone = invoice.receiver_phone || invoice.request_id?.receiver?.phone || 'N/A';
+    const receiverAddress = invoice.receiver_address || invoice.request_id?.receiver?.address || delivery_address || 'N/A';
+    
+    // Get AWB number from invoice (this will be used as tracking ID)
+    const awbNumber = invoice.awb_number || invoice.request_id?.awb_number || null;
+    
+    // Use AWB number as assignment_id (tracking ID) if available, otherwise generate one
+    let assignmentId = null;
+    if (awbNumber) {
+      assignmentId = awbNumber; // Use AWB number as assignment_id/tracking ID
+    }
+    
+    // Get amount from invoice if not provided
+    const invoiceAmount = amount || (invoice.total_amount ? parseFloat(invoice.total_amount.toString()) : 0);
+    
+    if (!invoiceAmount || invoiceAmount <= 0) {
       return res.status(400).json({
         success: false,
-        error: 'amount is required'
+        error: 'Invoice amount is required and must be greater than 0'
       });
     }
     
@@ -135,7 +161,10 @@ router.post('/', auth, async (req, res) => {
       });
     }
     
-    if (!delivery_address) {
+    // Use receiver address from invoice if delivery_address not provided
+    const finalDeliveryAddress = delivery_address || receiverAddress;
+    
+    if (!finalDeliveryAddress || finalDeliveryAddress === 'N/A') {
       return res.status(400).json({
         success: false,
         error: 'delivery_address is required'
@@ -152,9 +181,12 @@ router.post('/', auth, async (req, res) => {
     const assignmentData = {
       invoice_id,
       client_id,
-      amount: parseFloat(amount), // Ensure amount is a number
+      amount: invoiceAmount,
       delivery_type,
-      delivery_address,
+      delivery_address: finalDeliveryAddress,
+      receiver_name: receiverName,
+      receiver_phone: receiverPhone,
+      receiver_address: receiverAddress,
       delivery_instructions: delivery_instructions || 'Please contact customer for delivery details',
       qr_code: qrCode,
       qr_url: qrUrl,
@@ -162,9 +194,17 @@ router.post('/', auth, async (req, res) => {
       created_by: req.user.id
     };
     
+    // Set assignment_id to AWB number if available (before save, so pre-save hook won't override)
+    if (assignmentId) {
+      assignmentData.assignment_id = assignmentId;
+    }
+    
     // Only add request_id if it's provided
     if (request_id) {
       assignmentData.request_id = request_id;
+    } else if (invoice.request_id) {
+      // Use invoice's request_id if available
+      assignmentData.request_id = invoice.request_id;
     }
     
     // Only add driver_id if it's provided and not empty
