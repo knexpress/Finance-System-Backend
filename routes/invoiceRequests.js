@@ -148,8 +148,8 @@ router.post('/', async (req, res) => {
     await invoiceRequest.save();
 
     await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: `Invoice request status update (${status || delivery_status || 'no status'})`,
+      requestId: invoiceRequest._id,
+      reason: `Invoice request status update (${status || 'no status'})`,
     });
 
     // Create notifications for relevant departments (Sales, Operations, Finance)
