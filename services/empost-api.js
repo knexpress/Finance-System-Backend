@@ -152,6 +152,36 @@ class EMpostAPIService {
   }
 
   /**
+   * Create a shipment in EMpost from raw shipment data
+   * @param {Object} shipmentData - Raw shipment data object
+   * @returns {Promise<Object>} EMpost shipment response
+   */
+  async createShipmentFromData(shipmentData) {
+    try {
+      console.log('📦 Creating shipment in EMpost from raw data:', shipmentData.trackingNumber);
+      
+      const headers = await this.getAuthHeaders();
+      
+      const createShipment = async () => {
+        const response = await this.apiClient.post(
+          '/api/v1/shipment/create',
+          shipmentData,
+          { headers }
+        );
+        return response.data;
+      };
+      
+      const result = await this.retryWithBackoff(createShipment, 3, 1000);
+      
+      console.log('✅ Shipment created in EMpost:', result.data?.uhawb);
+      return result;
+    } catch (error) {
+      console.error('❌ Failed to create shipment in EMpost:', error.response?.data || error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Issue an invoice in EMpost
    * @param {Object} invoice - Invoice object
    * @returns {Promise<Object>} EMpost invoice response

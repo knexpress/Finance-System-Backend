@@ -448,33 +448,34 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         console.log('✅ Invoice created:', invoice.invoice_id || invoice._id);
         createdInvoices.push(invoice);
 
-        // Integrate with EMpost API
-        try {
-          // Populate invoice with client data for EMpost
-          const populatedInvoice = await Invoice.findById(invoice._id)
-            .populate('client_id', 'company_name contact_name email phone address city country');
-          
-          console.log('📦 Starting EMpost integration for CSV invoice:', invoice.invoice_id);
-          
-          // Create shipment in EMpost
-          const shipmentResult = await empostAPI.createShipment(populatedInvoice);
-          
-          if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-            // Update invoice with uhawb
-            invoice.empost_uhawb = shipmentResult.data.uhawb;
-            await invoice.save();
-            console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
-          }
-          
-          // Issue invoice in EMpost
-          await empostAPI.issueInvoice(populatedInvoice);
-          console.log('✅ EMpost integration completed successfully for CSV invoice');
-          
-        } catch (empostError) {
-          // Log error but don't block invoice creation
-          console.error('❌ EMpost integration failed for CSV invoice (invoice creation will continue):', empostError.message);
-          console.error('Error details:', empostError.response?.data || empostError.message);
-        }
+        // EMpost integration disabled - no longer sending requests to EMpost for CSV invoices
+        // // Integrate with EMpost API
+        // try {
+        //   // Populate invoice with client data for EMpost
+        //   const populatedInvoice = await Invoice.findById(invoice._id)
+        //     .populate('client_id', 'company_name contact_name email phone address city country');
+        //   
+        //   console.log('📦 Starting EMpost integration for CSV invoice:', invoice.invoice_id);
+        //   
+        //   // Create shipment in EMpost
+        //   const shipmentResult = await empostAPI.createShipment(populatedInvoice);
+        //   
+        //   if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+        //     // Update invoice with uhawb
+        //     invoice.empost_uhawb = shipmentResult.data.uhawb;
+        //     await invoice.save();
+        //     console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
+        //   }
+        //   
+        //   // Issue invoice in EMpost
+        //   await empostAPI.issueInvoice(populatedInvoice);
+        //   console.log('✅ EMpost integration completed successfully for CSV invoice');
+        //   
+        // } catch (empostError) {
+        //   // Log error but don't block invoice creation
+        //   console.error('❌ EMpost integration failed for CSV invoice (invoice creation will continue):', empostError.message);
+        //   console.error('Error details:', empostError.response?.data || empostError.message);
+        // }
 
         // Create audit report for CSV-uploaded invoice - This happens immediately after invoice creation
         console.log('📊 Creating audit report for invoice:', invoice.invoice_id || invoice._id);
@@ -745,6 +746,466 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
       details: error.message
     });
   }
+});
+
+// Helper function to convert country name to ISO country code
+function convertCountryToISO(countryName) {
+  if (!countryName) return 'AE'; // Default to UAE
+  
+  const countryMap = {
+    'uae': 'AE',
+    'united arab emirates': 'AE',
+    'philippines': 'PH',
+    'ph': 'PH',
+    'usa': 'US',
+    'united states': 'US',
+    'united states of america': 'US',
+    'uk': 'GB',
+    'united kingdom': 'GB',
+    'india': 'IN',
+    'pakistan': 'PK',
+    'bangladesh': 'BD',
+    'sri lanka': 'LK',
+    'nepal': 'NP',
+    'china': 'CN',
+    'japan': 'JP',
+    'south korea': 'KR',
+    'singapore': 'SG',
+    'malaysia': 'MY',
+    'thailand': 'TH',
+    'indonesia': 'ID',
+    'vietnam': 'VN',
+    'saudi arabia': 'SA',
+    'kuwait': 'KW',
+    'qatar': 'QA',
+    'bahrain': 'BH',
+    'oman': 'OM',
+    'egypt': 'EG',
+    'jordan': 'JO',
+    'lebanon': 'LB',
+    'turkey': 'TR',
+    'australia': 'AU',
+    'new zealand': 'NZ',
+    'canada': 'CA',
+    'mexico': 'MX',
+    'brazil': 'BR',
+    'argentina': 'AR',
+    'south africa': 'ZA',
+    'nigeria': 'NG',
+    'kenya': 'KE',
+    'france': 'FR',
+    'germany': 'DE',
+    'italy': 'IT',
+    'spain': 'ES',
+    'netherlands': 'NL',
+    'belgium': 'BE',
+    'switzerland': 'CH',
+    'austria': 'AT',
+    'sweden': 'SE',
+    'norway': 'NO',
+    'denmark': 'DK',
+    'finland': 'FI',
+    'poland': 'PL',
+    'russia': 'RU',
+  };
+  
+  const normalized = countryName.trim().toLowerCase();
+  return countryMap[normalized] || 'AE'; // Default to UAE if not found
+}
+
+// Helper function to parse date and check if it's within historical range
+function isDateInHistoricalRange(dateString) {
+  if (!dateString) return { valid: false, error: 'Date is missing' };
+  
+  try {
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) {
+      return { valid: false, error: 'Invalid date format' };
+    }
+    
+    const year = date.getFullYear();
+    const month = date.getMonth() + 1; // getMonth() returns 0-11
+    const day = date.getDate();
+    
+    // Check if date is between January 1st and September 29th of the same year
+    const jan1 = new Date(year, 0, 1); // Month 0 = January
+    const sep29 = new Date(year, 8, 29); // Month 8 = September
+    
+    if (date >= jan1 && date <= sep29) {
+      return { valid: true, date };
+    } else {
+      return { 
+        valid: false, 
+        error: `Date ${dateString} is outside historical range (must be between Jan 1 and Sep 29, ${year})`,
+        date 
+      };
+    }
+  } catch (error) {
+    return { valid: false, error: `Error parsing date: ${error.message}` };
+  }
+}
+
+// Helper function to calculate dimensions from weight
+function calculateDimensions(weightKg) {
+  if (!weightKg || weightKg <= 0) {
+    // Return minimum defaults
+    return { length: 1, width: 1, height: 1 };
+  }
+  
+  // Calculate cube root of weight in kg * 1000 cm³
+  // Assuming 1 kg = 1000 cm³ for volumetric calculation
+  const volumeCm3 = weightKg * 1000;
+  const dimension = Math.cbrt(volumeCm3);
+  
+  // Ensure minimum dimension of 1 cm
+  const finalDimension = Math.max(dimension, 1);
+  
+  return {
+    length: Math.round(finalDimension * 100) / 100, // Round to 2 decimal places
+    width: Math.round(finalDimension * 100) / 100,
+    height: Math.round(finalDimension * 100) / 100
+  };
+}
+
+// Helper function to map CSV row to EMPOST shipment format
+async function mapCSVToEMPOSTShipment(row, client = null) {
+  const awbNo = getColumnValue(row, ['awbno', 'awb_no', 'awb number', 'awb']);
+  const customerName = getColumnValue(row, ['customername', 'customer_name', 'customer name']);
+  const transactionDate = getColumnValue(row, ['transactiondate', 'transaction_date', 'transaction date']);
+  const originCountry = getColumnValue(row, ['origincountry', 'origin_country', 'origin country']);
+  const originCity = getColumnValue(row, ['origincity', 'origin_city', 'origin city']);
+  const destinationCountry = getColumnValue(row, ['destinationcountry', 'destination_country', 'destination country']);
+  const destinationCity = getColumnValue(row, ['destinationcity', 'destination_city', 'destination city']);
+  const shipmentType = getColumnValue(row, ['shipmenttype', 'shipment_type', 'shipment type']);
+  const shipmentStatus = getColumnValue(row, ['shipmentstatus', 'shipment_status', 'shipment status']);
+  const weight = getColumnValue(row, ['weight']);
+  const deliveryCharge = getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']);
+  const dispatcher = getColumnValue(row, ['dispatcher']);
+  const additionalInfo1 = getColumnValue(row, ['additionalinfo1', 'additional_info1', 'additional info1']);
+  const additionalInfo2 = getColumnValue(row, ['additionalinfo2', 'additional_info2', 'additional info2']);
+  
+  // Get sender information (try client lookup first, then defaults)
+  let senderEmail = 'noreply@company.com';
+  let senderPhone = '+971500000000';
+  let senderAddress = originCity || 'N/A';
+  
+  if (client) {
+    senderEmail = client.email || senderEmail;
+    senderPhone = client.phone || senderPhone;
+    senderAddress = client.address || senderAddress;
+  }
+  
+  // Get receiver information (try parsing from AdditionalInfo fields)
+  let receiverName = 'Unknown Receiver';
+  let receiverPhone = '+971500000000';
+  
+  // Try to parse receiver info from AdditionalInfo1 or AdditionalInfo2
+  if (additionalInfo1) {
+    // Simple parsing - look for phone numbers and names
+    const phoneRegex = /(\+?\d{10,15})/g;
+    const phoneMatch = additionalInfo1.match(phoneRegex);
+    if (phoneMatch) {
+      receiverPhone = phoneMatch[0];
+    }
+    // If AdditionalInfo1 doesn't look like a phone, treat it as name
+    if (!phoneMatch && additionalInfo1.length < 50) {
+      receiverName = additionalInfo1;
+    }
+  }
+  
+  if (additionalInfo2) {
+    const phoneRegex = /(\+?\d{10,15})/g;
+    const phoneMatch = additionalInfo2.match(phoneRegex);
+    if (phoneMatch && receiverPhone === '+971500000000') {
+      receiverPhone = phoneMatch[0];
+    }
+    // If AdditionalInfo2 doesn't look like a phone, treat it as name
+    if (!phoneMatch && additionalInfo2.length < 50 && receiverName === 'Unknown Receiver') {
+      receiverName = additionalInfo2;
+    }
+  }
+  
+  // Determine shipping type (DOM or INT)
+  const shippingType = (originCountry && destinationCountry && 
+    originCountry.toLowerCase().trim() === destinationCountry.toLowerCase().trim()) 
+    ? 'DOM' 
+    : 'INT';
+  
+  // Map product category from shipment type
+  const productCategory = shipmentType || 'Electronics';
+  
+  // Calculate dimensions
+  const weightValue = parseFloat(weight || 0);
+  const dimensions = calculateDimensions(weightValue);
+  
+  // Parse transaction date
+  const parsedDate = transactionDate ? new Date(transactionDate) : new Date();
+  
+  // Build EMPOST shipment payload
+  const shipmentData = {
+    trackingNumber: awbNo || '',
+    uhawb: '',
+    sender: {
+      name: customerName || 'N/A',
+      email: senderEmail,
+      phone: senderPhone,
+      countryCode: convertCountryToISO(originCountry),
+      city: originCity || 'Dubai',
+      line1: senderAddress
+    },
+    receiver: {
+      name: receiverName,
+      phone: receiverPhone,
+      email: '',
+      countryCode: convertCountryToISO(destinationCountry),
+      city: destinationCity || 'Dubai',
+      line1: destinationCity || 'N/A'
+    },
+    details: {
+      weight: {
+        unit: 'KG',
+        value: Math.max(weightValue, 0.1) // Minimum 0.1 KG
+      },
+      deliveryCharges: {
+        currencyCode: 'AED',
+        amount: parseFloat(deliveryCharge || 0)
+      },
+      pickupDate: parsedDate.toISOString(),
+      shippingType: shippingType,
+      productCategory: productCategory,
+      productType: 'Parcel',
+      dimensions: {
+        length: dimensions.length,
+        width: dimensions.width,
+        height: dimensions.height,
+        unit: 'CM'
+      },
+      numberOfPieces: 1
+    },
+    items: [{
+      description: shipmentType || 'General Goods',
+      countryOfOrigin: 'AE',
+      quantity: 1,
+      hsCode: '8504.40'
+    }]
+  };
+  
+  return shipmentData;
+}
+
+// Historical Upload endpoint - uploads historical shipment data to EMPOST
+router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No CSV file provided'
+      });
+    }
+
+    console.log('📄 Processing historical CSV file:', req.file.originalname);
+    console.log('📊 File size:', req.file.size, 'bytes');
+
+    // Parse CSV file
+    const csvData = await parseCSV(req.file.buffer);
+    
+    if (!csvData || csvData.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'CSV file is empty'
+      });
+    }
+
+    console.log('✅ Parsed CSV rows:', csvData.length);
+
+    const summary = {
+      total_rows: csvData.length,
+      rows_processed: 0,
+      rows_filtered_by_date: 0,
+      shipments_created: 0,
+      audit_entries_created: 0,
+      errors: 0
+    };
+    
+    const errors = [];
+    const processedRows = [];
+
+    // Get user/employee information for audit reports
+    const user = await User.findById(req.user.id);
+    let employeeId = user?.employee_id;
+    let employeeName = user?.full_name || 'System';
+    
+    if (!employeeId) {
+      const { Employee } = require('../models/unified-schema');
+      if (user?.email) {
+        const employee = await Employee.findOne({ email: user.email });
+        if (employee) {
+          employeeId = employee._id;
+          employeeName = employee.full_name || employeeName;
+        }
+      }
+    }
+
+    // Process each row
+    for (let i = 0; i < csvData.length; i++) {
+      const row = csvData[i];
+      const rowNumber = i + 2; // +2 because first row is header, and arrays are 0-indexed
+
+      try {
+        console.log(`\n📝 Processing row ${rowNumber}`);
+
+        // Get required CSV columns
+        const transactionDate = getColumnValue(row, ['transactiondate', 'transaction_date', 'transaction date']);
+        const awbNo = getColumnValue(row, ['awbno', 'awb_no', 'awb number', 'awb']);
+        
+        // Filter by date - only process rows within historical range
+        const dateCheck = isDateInHistoricalRange(transactionDate);
+        if (!dateCheck.valid) {
+          summary.rows_filtered_by_date++;
+          errors.push({
+            row: rowNumber,
+            error: dateCheck.error,
+            awb: awbNo || 'N/A'
+          });
+          console.log(`⚠️ Row ${rowNumber} filtered by date: ${dateCheck.error}`);
+          continue;
+        }
+
+        summary.rows_processed++;
+
+        // Try to find client by customer name
+        const customerName = getColumnValue(row, ['customername', 'customer_name', 'customer name']);
+        let client = null;
+        if (customerName) {
+          client = await Client.findOne({ company_name: customerName });
+        }
+
+        // EMpost integration disabled - no longer sending requests to EMpost for historical uploads
+        // // Map CSV data to EMPOST shipment format
+        // const shipmentData = await mapCSVToEMPOSTShipment(row, client);
+
+        // // Call EMPOST API to create shipment
+        let uhawb = null; // Set to null since EMpost is disabled
+        // try {
+        //   console.log(`📦 Creating shipment in EMPOST for AWB: ${shipmentData.trackingNumber}`);
+        //   
+        //   const shipmentResult = await empostAPI.createShipmentFromData(shipmentData);
+        //   
+        //   if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+        //     uhawb = shipmentResult.data.uhawb;
+        //     summary.shipments_created++;
+        //     console.log(`✅ Shipment created in EMPOST with UHAWB: ${uhawb}`);
+        //   } else {
+        //     throw new Error('EMPOST API did not return UHAWB');
+        //   }
+        // } catch (empostError) {
+        //   console.error(`❌ EMPOST API error for row ${rowNumber}:`, empostError.message);
+        //   errors.push({
+        //     row: rowNumber,
+        //     error: `EMPOST API error: ${empostError.response?.data?.message || empostError.message}`,
+        //     awb: awbNo || 'N/A'
+        //   });
+        //   summary.errors++;
+        //   continue; // Skip audit report creation if EMPOST fails
+        // }
+
+        // Create audit report entry
+        try {
+          const reportData = {
+            awb_number: awbNo || 'N/A',
+            transaction_date: transactionDate || 'N/A',
+            customer_name: customerName || 'N/A',
+            origin_country: getColumnValue(row, ['origincountry', 'origin_country', 'origin country']) || 'N/A',
+            origin_city: getColumnValue(row, ['origincity', 'origin_city', 'origin city']) || 'N/A',
+            destination_country: getColumnValue(row, ['destinationcountry', 'destination_country', 'destination country']) || 'N/A',
+            destination_city: getColumnValue(row, ['destinationcity', 'destination_city', 'destination city']) || 'N/A',
+            shipment_type: getColumnValue(row, ['shipmenttype', 'shipment_type', 'shipment type']) || 'N/A',
+            shipment_status: getColumnValue(row, ['shipmentstatus', 'shipment_status', 'shipment status']) || 'N/A',
+            weight: getColumnValue(row, ['weight']) || 'N/A',
+            delivery_charge: getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']) || 'N/A',
+            dispatcher: getColumnValue(row, ['dispatcher']) || 'N/A',
+            additional_info1: getColumnValue(row, ['additionalinfo1', 'additional_info1', 'additional info1']) || 'N/A',
+            additional_info2: getColumnValue(row, ['additionalinfo2', 'additional_info2', 'additional info2']) || 'N/A',
+            empost_uhawb: uhawb || 'N/A',
+            upload_type: 'historical',
+            uploaded_at: new Date()
+          };
+
+          const auditReport = new Report({
+            title: 'Historical Upload',
+            generated_by_employee_id: employeeId,
+            generated_by_employee_name: employeeName,
+            report_data: reportData,
+            generatedAt: new Date()
+          });
+
+          await auditReport.save();
+          summary.audit_entries_created++;
+          console.log(`✅ Audit report created for row ${rowNumber}`);
+          
+          processedRows.push({
+            row: rowNumber,
+            awb: awbNo,
+            uhawb: uhawb
+          });
+        } catch (auditError) {
+          console.error(`❌ Error creating audit report for row ${rowNumber}:`, auditError.message);
+          errors.push({
+            row: rowNumber,
+            error: `Audit report creation failed: ${auditError.message}`,
+            awb: awbNo || 'N/A'
+          });
+          summary.errors++;
+        }
+
+      } catch (rowError) {
+        console.error(`❌ Error processing row ${rowNumber}:`, rowError);
+        errors.push({
+          row: rowNumber,
+          error: rowError.message,
+          awb: getColumnValue(row, ['awbno', 'awb_no', 'awb number', 'awb']) || 'N/A'
+        });
+        summary.errors++;
+      }
+    }
+
+    // Log summary
+    console.log('\n===============================');
+    console.log('📊 Historical CSV Processing Summary:');
+    console.log(`  Total rows: ${summary.total_rows}`);
+    console.log(`  Rows processed: ${summary.rows_processed}`);
+    console.log(`  Rows filtered by date: ${summary.rows_filtered_by_date}`);
+    console.log(`  Shipments created: ${summary.shipments_created}`);
+    console.log(`  Audit entries created: ${summary.audit_entries_created}`);
+    console.log(`  Errors: ${summary.errors}`);
+    console.log('===============================\n');
+
+    // Return results
+    res.json({
+      success: true,
+      summary: summary,
+      errors: errors
+    });
+
+  } catch (error) {
+    console.error('❌ Error processing historical CSV upload:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process historical CSV file',
+      details: error.message
+    });
+  }
+});
+
+// Historical Template endpoint - returns CSV template for historical upload
+router.get('/historical-template', (req, res) => {
+  const csvTemplate = `CustomerName,AWBNo,TransactionDate,OriginCountry,OriginCity,DestinationCountry,DestinationCity,ShipmentType,ShipmentStatus,Weight,Delivery Charge,Dispatcher,AdditionalInfo1,AdditionalInfo2
+ABC Company,AWB123456,2024-01-15,UAE,Dubai,Philippines,Manila,Electronics,In Transit,10.5,50,John Doe,Receiver Name,+971501234567
+XYZ Corp,AWB789012,2024-03-20,Philippines,Manila,UAE,Abu Dhabi,Documents,Delivered,5.2,30,Jane Smith,Contact Info,+971509876543`;
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="historical_upload_template.csv"');
+  res.send(csvTemplate);
 });
 
 // Template download endpoint - provides CSV template
