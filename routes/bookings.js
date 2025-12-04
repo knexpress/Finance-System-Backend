@@ -10,18 +10,48 @@ const router = express.Router();
 // Get all bookings
 router.get('/', async (req, res) => {
   try {
-    // Use lean() to get plain JavaScript objects with all fields
+    // Use lean() to get plain JavaScript objects with all fields including OTP
     const bookings = await Booking.find()
       .lean()
       .sort({ createdAt: -1 });
     
+    // Ensure OTP is included in response (it should be in otpVerification.otp)
+    // Format bookings to explicitly include OTP information for manager dashboard
+    const formattedBookings = bookings.map(booking => {
+      // Extract OTP from otpVerification object for easy access
+      const otpInfo = {
+        otp: booking.otpVerification?.otp || booking.otp || null,
+        verified: booking.otpVerification?.verified || booking.verified || false,
+        verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
+        phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
+      };
+      
+      // Extract agentName from sender object for easy access
+      const agentName = booking.sender?.agentName || booking.agentName || null;
+      
+      return {
+        ...booking,
+        // Include OTP info at top level for easy access in manager dashboard
+        otpInfo: otpInfo,
+        // Include agentName at top level for easy access
+        agentName: agentName,
+        // Ensure sender object includes agentName
+        sender: booking.sender ? {
+          ...booking.sender,
+          agentName: booking.sender.agentName || null
+        } : null,
+        // Keep original otpVerification object intact
+        otpVerification: booking.otpVerification || null
+      };
+    });
+    
     // Debug: Log first booking structure
-    if (bookings.length > 0) {
-      console.log('📦 Backend - First booking structure:', JSON.stringify(bookings[0], null, 2));
-      console.log('📦 Backend - First booking keys:', Object.keys(bookings[0]));
+    if (formattedBookings.length > 0) {
+      console.log('📦 Backend - First booking structure:', JSON.stringify(formattedBookings[0], null, 2));
+      console.log('📦 Backend - OTP Info:', formattedBookings[0].otpInfo);
     }
     
-    res.json({ success: true, data: bookings });
+    res.json({ success: true, data: formattedBookings });
   } catch (error) {
     console.error('Error fetching bookings:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
@@ -32,12 +62,39 @@ router.get('/', async (req, res) => {
 router.get('/status/:reviewStatus', async (req, res) => {
   try {
     const { reviewStatus } = req.params;
-    // Use lean() to get plain JavaScript objects with all fields
+    // Use lean() to get plain JavaScript objects with all fields including OTP
     const bookings = await Booking.find({ review_status: reviewStatus })
       .lean()
       .sort({ createdAt: -1 });
     
-    res.json({ success: true, data: bookings });
+    // Format bookings to explicitly include OTP information
+    const formattedBookings = bookings.map(booking => {
+      // Extract OTP from otpVerification object for easy access
+      const otpInfo = {
+        otp: booking.otpVerification?.otp || booking.otp || null,
+        verified: booking.otpVerification?.verified || booking.verified || false,
+        verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
+        phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
+      };
+      
+      // Extract agentName from sender object for easy access
+      const agentName = booking.sender?.agentName || booking.agentName || null;
+      
+      return {
+        ...booking,
+        otpInfo: otpInfo,
+        // Include agentName at top level for easy access
+        agentName: agentName,
+        // Ensure sender object includes agentName
+        sender: booking.sender ? {
+          ...booking.sender,
+          agentName: booking.sender.agentName || null
+        } : null,
+        otpVerification: booking.otpVerification || null
+      };
+    });
+    
+    res.json({ success: true, data: formattedBookings });
   } catch (error) {
     console.error('Error fetching bookings by status:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
@@ -47,14 +104,40 @@ router.get('/status/:reviewStatus', async (req, res) => {
 // Get booking by ID
 router.get('/:id', async (req, res) => {
   try {
-    // Use lean() to get plain JavaScript object with all fields
+    // Use lean() to get plain JavaScript object with all fields including OTP
     const booking = await Booking.findById(req.params.id).lean();
     
     if (!booking) {
       return res.status(404).json({ success: false, error: 'Booking not found' });
     }
     
-    res.json({ success: true, data: booking });
+    // Extract OTP from otpVerification object for easy access in manager dashboard
+    const otpInfo = {
+      otp: booking.otpVerification?.otp || booking.otp || null,
+      verified: booking.otpVerification?.verified || booking.verified || false,
+      verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
+      phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
+    };
+    
+    // Extract agentName from sender object for easy access
+    const agentName = booking.sender?.agentName || booking.agentName || null;
+    
+    const formattedBooking = {
+      ...booking,
+      // Include OTP info at top level for easy access
+      otpInfo: otpInfo,
+      // Include agentName at top level for easy access
+      agentName: agentName,
+      // Ensure sender object includes agentName
+      sender: booking.sender ? {
+        ...booking.sender,
+        agentName: booking.sender.agentName || null
+      } : null,
+      // Keep original otpVerification object intact
+      otpVerification: booking.otpVerification || null
+    };
+    
+    res.json({ success: true, data: formattedBooking });
   } catch (error) {
     console.error('Error fetching booking:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch booking' });

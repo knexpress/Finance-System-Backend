@@ -1,6 +1,7 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const { User } = require('../models');
 
 const router = express.Router();
@@ -36,8 +37,15 @@ router.post('/login', [
     const isPasswordValid = await user.comparePassword(password);
     
     if (!isPasswordValid) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json({ 
+        success: false,
+        error: 'Invalid credentials' 
+      });
     }
+
+    // Check if password is the default "password123"
+    const isDefaultPassword = await bcrypt.compare('password123', user.password);
+    const requiresPasswordChange = isDefaultPassword;
 
     // Update last login
     user.lastLogin = new Date();
@@ -64,14 +72,20 @@ router.post('/login', [
 
     res.json({ 
       success: true, 
-      user: userData,
-      token: token,
+      data: {
+        user: userData,
+        token: token,
+        requiresPasswordChange: requiresPasswordChange
+      },
       message: 'Login successful' 
     });
 
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Internal server error' 
+    });
   }
 });
 

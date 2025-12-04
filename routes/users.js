@@ -1,26 +1,35 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
+const bcrypt = require('bcryptjs');
 const { User, Employee } = require('../models');
+const auth = require('../middleware/auth');
+const requireAdmin = require('../middleware/roleAuth');
 
 const router = express.Router();
 
-// Get all users
-router.get('/', async (req, res) => {
+// Get all users - Requires authentication and admin role
+router.get('/', auth, requireAdmin, async (req, res) => {
   try {
     const users = await User.find()
       .populate('department_id')
       .populate('employee_id')
       .sort({ createdAt: -1 });
     
-    res.json(users);
+    res.json({
+      success: true,
+      data: users
+    });
   } catch (error) {
     console.error('Error fetching users:', error);
-    res.status(500).json({ error: 'Failed to fetch users' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch users' 
+    });
   }
 });
 
-// Create new user (only from existing employees)
-router.post('/', [
+// Create new user (only from existing employees) - Requires authentication and admin role
+router.post('/', auth, requireAdmin, [
   body('email').isEmail().normalizeEmail(),
   body('password').isLength({ min: 4 }),
   body('employee_id').isMongoId(),
@@ -95,8 +104,8 @@ router.post('/', [
   }
 });
 
-// Update user
-router.put('/:id', [
+// Update user - Requires authentication and admin role
+router.put('/:id', auth, requireAdmin, [
   body('email').optional().isEmail().normalizeEmail(),
   body('role').optional().isIn(['SUPERADMIN', 'ADMIN', 'USER']),
   body('isActive').optional().isBoolean(),
@@ -150,19 +159,23 @@ router.put('/:id', [
   }
 });
 
-// Delete user
-router.delete('/:id', async (req, res) => {
+// Delete user - Requires authentication and admin role
+router.delete('/:id', auth, requireAdmin, async (req, res) => {
   try {
     const userId = req.params.id;
 
     const user = await User.findById(userId);
     if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ 
+        success: false,
+        error: 'User not found' 
+      });
     }
 
     // Prevent deletion of superadmin
     if (user.role === 'SUPERADMIN') {
       return res.status(400).json({ 
+        success: false,
         error: 'Cannot delete superadmin user' 
       });
     }
@@ -176,7 +189,60 @@ router.delete('/:id', async (req, res) => {
 
   } catch (error) {
     console.error('Error deleting user:', error);
-    res.status(500).json({ error: 'Failed to delete user' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to delete user' 
+    });
+  }
+});
+
+// Change password endpoint - Requires authentication (any logged-in user)
+router.post('/change-password', auth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    const userId = req.user.id; // From JWT token (set by auth middleware)
+
+    // Validation
+    if (!password || password.length < 4) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password must be at least 4 characters long'
+      });
+    }
+
+    if (password === 'password123') {
+      return res.status(400).json({
+        success: false,
+        error: 'Please choose a different password. This is the default password.'
+      });
+    }
+
+    // Get user
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // Hash new password (will be hashed by pre-save hook, but we can also do it explicitly)
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Update user password
+    user.password = hashedPassword;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+  } catch (error) {
+    console.error('Error changing password:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to change password'
+    });
   }
 });
 
