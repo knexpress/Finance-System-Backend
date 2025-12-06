@@ -347,6 +347,14 @@ router.post('/:id/review', async (req, res) => {
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
       
+      // Delivery options (from booking sender and receiver)
+      sender_delivery_option: sender.deliveryOption || booking.sender?.deliveryOption || undefined,
+      receiver_delivery_option: receiver.deliveryOption || booking.receiver?.deliveryOption || undefined,
+      
+      // Insurance information (from booking)
+      insured: booking.insured !== undefined ? booking.insured : false,
+      declaredAmount: booking.declaredAmount ? new mongoose.Types.Decimal128(parseFloat(booking.declaredAmount).toFixed(2)) : undefined,
+      
       // Status (same as sales - defaults to DRAFT or can be SUBMITTED)
       status: 'SUBMITTED', // Ready for Operations to process
       delivery_status: 'PENDING',

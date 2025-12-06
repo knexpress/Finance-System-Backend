@@ -184,6 +184,10 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
+    // Store old values for comparison
+    const oldStatus = invoiceRequest.status;
+    const oldDeliveryStatus = invoiceRequest.delivery_status;
+    
     // Update fields
     Object.keys(updateData).forEach(key => {
       if (updateData[key] !== undefined) {
@@ -193,10 +197,30 @@ router.put('/:id', async (req, res) => {
 
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: `Invoice request delivery status update (${delivery_status})`,
-    });
+    // Update EMPOST shipment status if status or delivery_status changed
+    const statusChanged = updateData.status && updateData.status !== oldStatus;
+    const deliveryStatusChanged = updateData.delivery_status && updateData.delivery_status !== oldDeliveryStatus;
+    
+    if (statusChanged || deliveryStatusChanged) {
+      try {
+        const empostAPI = require('../services/empost-api');
+        const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
+        
+        if (trackingNumber && trackingNumber !== 'N/A') {
+          const statusToUpdate = updateData.delivery_status || updateData.status;
+          console.log(`🔄 Updating EMPOST shipment status via general update: ${trackingNumber} -> ${statusToUpdate}`);
+          
+          await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
+            deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+          });
+          
+          console.log('✅ EMPOST shipment status updated successfully');
+        }
+      } catch (empostError) {
+        console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
+        // Don't fail the update if EMPOST fails
+      }
+    }
 
     res.json({
       success: true,
@@ -220,6 +244,10 @@ router.put('/:id/status', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
+    // Store old status for comparison
+    const oldStatus = invoiceRequest.status;
+    const oldDeliveryStatus = invoiceRequest.delivery_status;
+    
     // Update status if provided
     if (status) {
       invoiceRequest.status = status;
@@ -262,6 +290,28 @@ router.put('/:id/status', async (req, res) => {
 
     await invoiceRequest.save();
 
+    // Update EMPOST shipment status if status or delivery_status changed
+    if ((status && status !== oldStatus) || (delivery_status && delivery_status !== oldDeliveryStatus)) {
+      try {
+        const empostAPI = require('../services/empost-api');
+        const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
+        
+        if (trackingNumber && trackingNumber !== 'N/A') {
+          const statusToUpdate = delivery_status || status;
+          console.log(`🔄 Updating EMPOST shipment status: ${trackingNumber} -> ${statusToUpdate}`);
+          
+          await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
+            deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+          });
+          
+          console.log('✅ EMPOST shipment status updated successfully');
+        }
+      } catch (empostError) {
+        console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
+        // Don't fail the status update if EMPOST fails
+      }
+    }
+
     res.json({
       success: true,
       invoiceRequest,
@@ -284,6 +334,9 @@ router.put('/:id/delivery-status', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
+    // Store old delivery status for comparison
+    const oldDeliveryStatus = invoiceRequest.delivery_status;
+    
     // Update delivery status
     invoiceRequest.delivery_status = delivery_status;
     
@@ -296,6 +349,28 @@ router.put('/:id/delivery-status', async (req, res) => {
     invoiceRequest.updatedAt = new Date();
     
     await invoiceRequest.save();
+
+    // Update EMPOST shipment status if delivery_status changed
+    if (delivery_status && delivery_status !== oldDeliveryStatus) {
+      try {
+        const empostAPI = require('../services/empost-api');
+        const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
+        
+        if (trackingNumber && trackingNumber !== 'N/A') {
+          console.log(`🔄 Updating EMPOST shipment delivery status: ${trackingNumber} -> ${delivery_status}`);
+          
+          await empostAPI.updateShipmentStatus(trackingNumber, delivery_status, {
+            deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
+            notes: notes
+          });
+          
+          console.log('✅ EMPOST shipment delivery status updated successfully');
+        }
+      } catch (empostError) {
+        console.error('❌ Failed to update EMPOST shipment delivery status (non-critical):', empostError.message);
+        // Don't fail the status update if EMPOST fails
+      }
+    }
 
     // Convert Decimal128 fields to numbers for proper JSON serialization
     const responseData = invoiceRequest.toObject();
@@ -387,13 +462,27 @@ router.put('/:id/verification', async (req, res) => {
 
     // Handle boxes data - convert to Decimal128 for numeric fields
     if (verificationData.boxes && Array.isArray(verificationData.boxes)) {
-      invoiceRequest.verification.boxes = verificationData.boxes.map(box => ({
-        items: box.items || '',
-        length: toDecimal128(box.length),
-        width: toDecimal128(box.width),
-        height: toDecimal128(box.height),
-        vm: toDecimal128(box.vm),
-      }));
+      invoiceRequest.verification.boxes = verificationData.boxes.map(box => {
+        // Normalize classification to proper case (COMMERCIAL -> Commercial, FLOWMIC -> Flowmic)
+        let normalizedClassification = box.classification || undefined;
+        if (normalizedClassification) {
+          const upper = normalizedClassification.toUpperCase();
+          if (upper === 'COMMERCIAL') {
+            normalizedClassification = 'Commercial';
+          } else if (upper === 'FLOWMIC') {
+            normalizedClassification = 'Flowmic';
+          }
+        }
+        
+        return {
+          items: box.items || '',
+          length: toDecimal128(box.length),
+          width: toDecimal128(box.width),
+          height: toDecimal128(box.height),
+          vm: toDecimal128(box.vm),
+          classification: normalizedClassification, // Normalized to 'Flowmic' or 'Commercial'
+        };
+      });
     }
 
     // Handle total_vm
@@ -466,10 +555,29 @@ router.put('/:id/verification', async (req, res) => {
     
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: 'Invoice request verification details update',
-    });
+    // Create EMPOST shipment when verification is updated (only shipment, NOT invoice)
+    // This happens automatically when Operations verifies the booking
+    // Only create if UHAWB doesn't already exist (avoid duplicates)
+    if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
+      try {
+        const empostAPI = require('../services/empost-api');
+        console.log('📦 Creating EMPOST shipment from verified InvoiceRequest...');
+        
+        const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
+        
+        if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+          // Store UHAWB in invoiceRequest for future reference
+          invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
+          await invoiceRequest.save();
+          console.log('✅ EMPOST shipment created with UHAWB:', shipmentResult.data.uhawb);
+        }
+      } catch (empostError) {
+        console.error('❌ Failed to create EMPOST shipment (non-critical, will retry later):', empostError.message);
+        // Don't fail the verification update if EMPOST fails
+      }
+    } else {
+      console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
+    }
 
     // Convert Decimal128 fields to numbers for JSON response
     const responseData = invoiceRequest.toObject();
@@ -539,10 +647,29 @@ router.put('/:id/complete-verification', async (req, res) => {
     
     await invoiceRequest.save();
 
-    await syncInvoiceWithEMPost({
-      requestId: invoiceRequestId,
-      reason: 'Invoice request verification completed',
-    });
+    // Create EMPOST shipment automatically when verification is completed
+    // This creates ONLY the shipment, NOT the invoice (invoice will be generated later by Finance)
+    // Only create if UHAWB doesn't already exist (avoid duplicates)
+    if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
+      try {
+        const empostAPI = require('../services/empost-api');
+        console.log('📦 Automatically creating EMPOST shipment from verified InvoiceRequest...');
+        
+        const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
+        
+        if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+          // Store UHAWB in invoiceRequest for future reference
+          invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
+          await invoiceRequest.save();
+          console.log('✅ EMPOST shipment created automatically with UHAWB:', shipmentResult.data.uhawb);
+        }
+      } catch (empostError) {
+        console.error('❌ Failed to create EMPOST shipment automatically (non-critical):', empostError.message);
+        // Don't fail verification completion if EMPOST fails - can be retried later
+      }
+    } else {
+      console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
+    }
 
     res.json({
       success: true,

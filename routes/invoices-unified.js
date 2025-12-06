@@ -864,10 +864,8 @@ router.put('/:id/status', async (req, res) => {
 
     await invoice.save();
 
-    await syncInvoiceWithEMPost({
-      invoiceId: invoice._id,
-      reason: 'Invoice remitted status update',
-    });
+    // Note: EMPOST shipment status is NOT updated when invoice status changes
+    // EMPOST is only updated when invoice is created, not on remitted/collected status changes
 
     // Sync invoice status to shipment request if they share the same ID
     try {
@@ -1067,10 +1065,8 @@ router.put('/:id', async (req, res) => {
     Object.assign(invoice, updateData);
     await invoice.save();
 
-    await syncInvoiceWithEMPost({
-      invoiceId: invoice._id,
-      reason: 'Invoice update',
-    });
+    // Note: EMPOST shipment is NOT updated on invoice updates
+    // EMPOST is only updated when invoice is created
 
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)

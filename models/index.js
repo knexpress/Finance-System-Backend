@@ -482,6 +482,18 @@ const invoiceRequestSchema = new mongoose.Schema({
     required: false,
   },
   
+  // Delivery Options (from booking)
+  sender_delivery_option: {
+    type: String,
+    required: false,
+    enum: ['pickup', 'delivery', 'warehouse'],
+  },
+  receiver_delivery_option: {
+    type: String,
+    required: false,
+    enum: ['pickup', 'delivery', 'warehouse'],
+  },
+  
   // Location Information
   origin_place: {
     type: String,
@@ -503,7 +515,7 @@ const invoiceRequestSchema = new mongoose.Schema({
   delivery_status: {
     type: String,
     required: true,
-    enum: ['PENDING', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED', 'FAILED'],
+    enum: ['PENDING', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED', 'FAILED', 'CANCELLED'],
     default: 'PENDING',
   },
   
@@ -518,6 +530,17 @@ const invoiceRequestSchema = new mongoose.Schema({
     type: Boolean,
     required: true,
     default: true,
+  },
+  
+  // Insurance Information (from booking)
+  insured: {
+    type: Boolean,
+    required: false,
+    default: false,
+  },
+  declaredAmount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
   },
   
   // Request Management
@@ -610,6 +633,11 @@ const invoiceRequestSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.Decimal128,
         required: false,
       },
+      classification: {
+        type: String,
+        enum: ['Flowmic', 'Commercial', 'FLOWMIC', 'COMMERCIAL', 'flowmic', 'commercial'],
+        required: false,
+      },
     }],
     total_vm: {
       type: mongoose.Schema.Types.Decimal128,
@@ -686,6 +714,13 @@ const invoiceRequestSchema = new mongoose.Schema({
   invoice_generated_at: {
     type: Date,
     required: false,
+  },
+  
+  // EMPOST Integration
+  empost_uhawb: {
+    type: String,
+    required: false,
+    default: 'N/A',
   },
 }, {
   timestamps: true,
