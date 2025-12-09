@@ -810,38 +810,6 @@ collectionsSchema.index({ status: 1 });
 collectionsSchema.index({ due_date: 1 });
 collectionsSchema.index({ client_name: 1 });
 
-// Notification Tracking Schema
-const notificationTrackingSchema = new mongoose.Schema({
-  user_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true,
-  },
-  item_type: {
-    type: String,
-    required: true,
-    enum: ['invoice', 'chat_message', 'ticket', 'invoice_request', 'collection', 'request'],
-  },
-  item_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    required: true,
-  },
-  is_viewed: {
-    type: Boolean,
-    default: false,
-  },
-  viewed_at: {
-    type: Date,
-    required: false,
-  },
-}, {
-  timestamps: true,
-});
-
-notificationTrackingSchema.index({ user_id: 1, item_type: 1 });
-notificationTrackingSchema.index({ user_id: 1, item_id: 1 }, { unique: true });
-notificationTrackingSchema.index({ is_viewed: 1 });
-
 // Export models
 const Department = mongoose.models.Department || mongoose.model('Department', departmentSchema);
 const Employee = mongoose.models.Employee || mongoose.model('Employee', employeeSchema);
@@ -853,7 +821,6 @@ const Report = mongoose.models.Report || mongoose.model('Report', reportSchema);
 const CashTracker = mongoose.models.CashTracker || mongoose.model('CashTracker', cashTrackerSchema);
 const InvoiceRequest = mongoose.models.InvoiceRequest || mongoose.model('InvoiceRequest', invoiceRequestSchema);
 const Collections = mongoose.models.Collections || mongoose.model('Collections', collectionsSchema);
-const NotificationTracking = mongoose.models.NotificationTracking || mongoose.model('NotificationTracking', notificationTrackingSchema);
 
 // Performance Metrics Schema
 const performanceMetricsSchema = new mongoose.Schema({
@@ -997,7 +964,6 @@ module.exports = {
   CashTracker,
   InvoiceRequest,
   Collections,
-  NotificationTracking,
   PerformanceMetrics,
   Booking,
   ChatRoom,

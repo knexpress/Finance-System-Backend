@@ -610,23 +610,50 @@ router.post('/', async (req, res) => {
     // Calculate delivery charge
     // IMPORTANT: 
     // - For UAE_TO_PINAS: Delivery charge is MANUAL (use provided value or 0)
-    // - For PH_TO_UAE: Delivery charge is AUTO-CALCULATED using box-based formula with base amount
+    // - For PH_TO_UAE: Delivery charge is AUTO-CALCULATED using box-based formula with base amount (customizable)
     let deliveryCharge = 0;
-    let deliveryBaseAmount = 20; // Default base amount
-    
-    // Check if delivery_base_amount is provided in request body or invoiceRequest
-    const providedDeliveryBaseAmount = req.body.delivery_base_amount !== undefined 
-      ? parseFloat(req.body.delivery_base_amount) 
-      : (invoiceRequest?.delivery_base_amount ? parseFloat(invoiceRequest.delivery_base_amount.toString()) : null);
-    
-    if (providedDeliveryBaseAmount !== null && providedDeliveryBaseAmount > 0) {
-      deliveryBaseAmount = providedDeliveryBaseAmount;
-    }
+    let deliveryBaseAmount = null; // determine below for PH_TO_UAE
     
     const isUaeToPinas = isUaeToPinasService(serviceCode);
     const isPhToUae = isPhToUaeService(serviceCode);
+
+    // If a delivery charge exists via items or provided, treat as delivery enabled
+    const hasDeliveryComputed =
+      !!has_delivery ||
+      (providedDeliveryCharge !== undefined && providedDeliveryCharge !== null && !isNaN(parseFloat(providedDeliveryCharge))) ||
+      deliveryChargeFromItems > 0;
     
-    if (has_delivery) {
+    // Preferred base: request body -> stored on invoiceRequest -> derived from deliveryChargeFromItems -> fallback 20
+    if (isPhToUae) {
+      const providedDeliveryBaseAmount = req.body.delivery_base_amount !== undefined 
+        ? parseFloat(req.body.delivery_base_amount) 
+        : (invoiceRequest?.delivery_base_amount ? parseFloat(invoiceRequest.delivery_base_amount.toString()) : null);
+      
+      let derivedBase = null;
+      if (deliveryChargeFromItems > 0) {
+        if (numberOfBoxes <= 1) {
+          derivedBase = deliveryChargeFromItems;
+        } else {
+          derivedBase = deliveryChargeFromItems - ((numberOfBoxes - 1) * 5);
+        }
+        if (derivedBase <= 0 || !Number.isFinite(derivedBase)) derivedBase = null;
+      }
+      
+      if (providedDeliveryBaseAmount !== null && providedDeliveryBaseAmount > 0) {
+        deliveryBaseAmount = providedDeliveryBaseAmount;
+      } else if (derivedBase !== null) {
+        deliveryBaseAmount = derivedBase;
+      } else {
+        deliveryBaseAmount = 20; // final fallback
+      }
+    }
+    
+    if (!isPhToUae) {
+      // keep previous default for non PH_TO_UAE flows
+      deliveryBaseAmount = 20;
+    }
+    
+    if (hasDeliveryComputed) {
       if (isUaeToPinas) {
         // UAE_TO_PINAS: Use manual delivery charge from request body
         if (providedDeliveryCharge !== undefined && providedDeliveryCharge !== null) {
@@ -667,7 +694,7 @@ router.post('/', async (req, res) => {
     }
     
     // For PH_TO_UAE tax invoices, always use box-based formula (override line_items if present)
-    if (isPhToUae && has_delivery && weight <= 30) {
+    if (isPhToUae && hasDeliveryComputed && weight <= 30) {
       // Recalculate using box-based formula for tax invoices
       if (numberOfBoxes <= 1) {
         deliveryCharge = deliveryBaseAmount;
@@ -892,7 +919,7 @@ router.post('/', async (req, res) => {
       total_amount: mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2)), // Final total (base_amount + tax_amount)
       notes,
       created_by,
-      has_delivery: has_delivery, // Store delivery flag
+      has_delivery: hasDeliveryComputed, // Store delivery flag (computed)
       ...(customer_trn ? { customer_trn } : {}),
       batch_number: batch_number.toString().trim(),
       // Populate fields from InvoiceRequest if available
@@ -1357,7 +1384,8 @@ router.put('/:id', async (req, res) => {
                                 updateData.delivery_charge !== undefined || 
                                 updateData.tax_rate !== undefined ||
                                 updateData.pickup_charge !== undefined ||
-                                updateData.insurance_charge !== undefined;
+                                updateData.insurance_charge !== undefined ||
+                                updateData.delivery_base_amount !== undefined;
     
     if (needsRecalculation) {
       // Get base_amount (subtotal) - handle both Decimal128 and number types
@@ -1407,6 +1435,29 @@ router.put('/:id', async (req, res) => {
         const deliveryCharge = updateData.delivery_charge !== undefined
           ? (typeof updateData.delivery_charge === 'object' && updateData.delivery_charge.toString ? parseFloat(updateData.delivery_charge.toString()) : parseFloat(updateData.delivery_charge))
           : (invoice.delivery_charge ? parseFloat(invoice.delivery_charge.toString()) : 0);
+        // Persist/derive delivery_base_amount for PH_TO_UAE
+        if (isPhToUae) {
+          let deliveryBaseAmount = updateData.delivery_base_amount !== undefined
+            ? parseFloat(updateData.delivery_base_amount)
+            : (invoice.delivery_base_amount ? parseFloat(invoice.delivery_base_amount.toString()) : null);
+          if ((deliveryBaseAmount === null || deliveryBaseAmount <= 0) && deliveryCharge > 0) {
+            // derive from deliveryCharge if boxes known
+            const boxes = invoice.number_of_boxes || invoice.request_id?.number_of_boxes || 1;
+            const nBoxes = (!Number.isFinite(boxes) || boxes < 1) ? 1 : boxes;
+            let derived = null;
+            if (nBoxes <= 1) {
+              derived = deliveryCharge;
+            } else {
+              derived = deliveryCharge - ((nBoxes - 1) * 5);
+            }
+            if (derived && derived > 0) {
+              deliveryBaseAmount = derived;
+            }
+          }
+          if (deliveryBaseAmount && deliveryBaseAmount > 0) {
+            updateData.delivery_base_amount = mongoose.Types.Decimal128.fromString(deliveryBaseAmount.toFixed(2));
+          }
+        }
         
         // Try to get invoiceRequest for Flowmic/Personal check
         let isFlowmicOrPersonal = false;

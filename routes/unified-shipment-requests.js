@@ -4,8 +4,7 @@ const {
   ShipmentRequest, 
   Employee, 
   User, 
-  Department,
-  NotificationTracking 
+  Department
 } = require('../models/unified-schema');
 
 const router = express.Router();
@@ -496,13 +495,11 @@ async function createNotificationsForShipmentRequest(shipmentRequest, createdBy)
           is_viewed: false
         }));
 
-        if (notifications.length > 0) {
-          await NotificationTracking.insertMany(notifications);
-        }
+        // Notifications removed/no-op
       }
     }
   } catch (error) {
-    console.error('Error creating notifications:', error);
+    console.error('Error creating notifications (disabled):', error);
   }
 }
 
