@@ -311,6 +311,7 @@ class EMpostAPIService {
    * @returns {Object} EMpost shipment payload
    */
   mapInvoiceToShipment(invoice) {
+    const isPhToUae = (invoice.service_code || '').toUpperCase().includes('PH_TO_UAE');
     const client = invoice.client_id;
     const clientAddress = this.parseAddress(client.address || '');
     
@@ -425,7 +426,10 @@ class EMpostAPIService {
         customs: undefined,
         deliveryCharges: {
           currencyCode: 'AED',
-          amount: parseFloat(invoice.amount?.toString() || 0), // Base amount without tax
+          // For PH_TO_UAE we must not send shipping/base charge, only delivery charge
+          amount: isPhToUae
+            ? parseFloat(invoice.delivery_charge?.toString() || 0)
+            : parseFloat(invoice.amount?.toString() || 0), // Base amount without tax
         },
         numberOfPieces: invoice.line_items?.length || 1,
         pickupDate: invoice.issue_date ? new Date(invoice.issue_date).toISOString() : new Date().toISOString(),
@@ -462,6 +466,15 @@ class EMpostAPIService {
    * @returns {Object} EMpost invoice payload
    */
   mapInvoiceToEMpostInvoice(invoice) {
+    const isPhToUae = (invoice.service_code || '').toUpperCase().includes('PH_TO_UAE');
+    const baseCharge = isPhToUae
+      ? parseFloat(invoice.delivery_charge?.toString() || 0)
+      : parseFloat(invoice.amount?.toString() || 0);
+    const taxAmount = parseFloat(invoice.tax_amount?.toString() || 0);
+    const totalAmountIncludingTax = isPhToUae
+      ? baseCharge + taxAmount
+      : parseFloat(invoice.total_amount?.toString() || 0);
+
     const invoiceData = {
       trackingNumber: invoice.awb_number || invoice.invoice_id,
       chargeableWeight: {
@@ -473,7 +486,8 @@ class EMpostAPIService {
           type: 'Base Rate',
           amount: {
             currencyCode: 'AED',
-            amount: parseFloat(invoice.amount?.toString() || 0),
+            // For PH_TO_UAE send only delivery charge (no shipping/base)
+            amount: baseCharge,
           },
         },
       ],
@@ -483,8 +497,8 @@ class EMpostAPIService {
         billingAccountNumber: invoice.client_id?.company_name || 'N/A',
         billingAccountName: invoice.client_id?.contact_name || invoice.client_id?.company_name || 'N/A',
         totalDiscountAmount: 0,
-        taxAmount: parseFloat(invoice.tax_amount?.toString() || 0),
-        totalAmountIncludingTax: parseFloat(invoice.total_amount?.toString() || 0),
+        taxAmount,
+        totalAmountIncludingTax,
         currencyCode: 'AED',
       },
     };
