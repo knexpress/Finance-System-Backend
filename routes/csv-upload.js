@@ -32,8 +32,11 @@ const upload = multer({
 // Helper function to normalize column names (case-insensitive, handles spaces and parentheses)
 function normalizeColumnName(name) {
   if (!name) return '';
-  // Convert to lowercase, trim, replace spaces and parentheses with underscores
-  return name.toLowerCase().trim()
+  // Remove BOM (Byte Order Mark) characters and normalize
+  return name.trim()
+    .replace(/^\uFEFF/, '') // Remove BOM
+    .replace(/[\u200B-\u200D\uFEFF]/g, '') // Remove zero-width characters
+    .toLowerCase()
     .replace(/\s+/g, '_')
     .replace(/[()]/g, '')
     .replace(/_+/g, '_')
@@ -749,8 +752,9 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
 });
 
 // Helper function to convert country name to ISO country code
-function convertCountryToISO(countryName) {
-  if (!countryName) return 'AE'; // Default to UAE
+// Returns 2-character ISO code (required by Empost API)
+function convertCountryToISO(countryName, defaultCode = 'PH') {
+  if (!countryName || countryName === 'N/A' || countryName.trim() === '') return defaultCode;
   
   const countryMap = {
     'uae': 'AE',
@@ -810,7 +814,7 @@ function convertCountryToISO(countryName) {
   };
   
   const normalized = countryName.trim().toLowerCase();
-  return countryMap[normalized] || 'AE'; // Default to UAE if not found
+  return countryMap[normalized] || defaultCode; // Return default code if not found
 }
 
 // Helper function to parse date and check if it's within historical range
@@ -869,20 +873,35 @@ function calculateDimensions(weightKg) {
 
 // Helper function to map CSV row to EMPOST shipment format
 async function mapCSVToEMPOSTShipment(row, client = null) {
-  const awbNo = getColumnValue(row, ['awbno', 'awb_no', 'awb number', 'awb']);
-  const customerName = getColumnValue(row, ['customername', 'customer_name', 'customer name']);
-  const transactionDate = getColumnValue(row, ['transactiondate', 'transaction_date', 'transaction date']);
-  const originCountry = getColumnValue(row, ['origincountry', 'origin_country', 'origin country']);
-  const originCity = getColumnValue(row, ['origincity', 'origin_city', 'origin city']);
-  const destinationCountry = getColumnValue(row, ['destinationcountry', 'destination_country', 'destination country']);
-  const destinationCity = getColumnValue(row, ['destinationcity', 'destination_city', 'destination city']);
-  const shipmentType = getColumnValue(row, ['shipmenttype', 'shipment_type', 'shipment type']);
-  const shipmentStatus = getColumnValue(row, ['shipmentstatus', 'shipment_status', 'shipment status']);
-  const weight = getColumnValue(row, ['weight']);
-  const deliveryCharge = getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']);
+  // Support both old and new CSV formats (handle BOM in column name)
+  const awbNo = getColumnValue(row, ['awb number', 'awbno', 'awb_no', 'awb', 'awbnumber']);
+  const customerName = getColumnValue(row, ['sender name', 'customername', 'customer_name', 'customer name']);
+  const transactionDate = getColumnValue(row, ['invoice date', 'transactiondate', 'transaction_date', 'transaction date']);
+  const originCity = getColumnValue(row, ['origin', 'origincity', 'origin_city', 'origin city']);
+  const destinationCity = getColumnValue(row, ['destination', 'destinationcity', 'destination_city', 'destination city']);
+  const destinationCountry = getColumnValue(row, ['country of destination', 'destinationcountry', 'destination_country', 'destination country']);
+  const shipmentType = getColumnValue(row, ['shipment type', 'shipmenttype', 'shipment_type', 'shipment type']);
+  const shipmentStatus = getColumnValue(row, ['delivery status', 'shipmentstatus', 'shipment_status', 'shipment status']);
+  const weight = getColumnValue(row, ['weight', ' weight ']);
+  const deliveryCharge = getColumnValue(row, ['delivery charge rate before discount', 'delivery charge', 'delivery_charge', 'deliverycharge', ' delivery charge rate before discount ']);
   const dispatcher = getColumnValue(row, ['dispatcher']);
   const additionalInfo1 = getColumnValue(row, ['additionalinfo1', 'additional_info1', 'additional info1']);
   const additionalInfo2 = getColumnValue(row, ['additionalinfo2', 'additional_info2', 'additional info2']);
+  
+  // Determine origin country based on origin city
+  // If origin is DUBAI or any UAE city, origin country is UAE
+  // Otherwise, default to PHILIPPINES
+  let originCountry = 'PHILIPPINES'; // Default
+  if (originCity) {
+    const originUpper = originCity.toUpperCase().trim();
+    if (originUpper.includes('DUBAI') || originUpper.includes('ABU DHABI') || 
+        originUpper.includes('SHARJAH') || originUpper.includes('AJMAN') ||
+        originUpper.includes('RAK') || originUpper.includes('FUJAIRAH') ||
+        originUpper.includes('UMM') || originUpper.includes('AL-AIN') ||
+        originUpper.includes('AL AIN')) {
+      originCountry = 'UNITED ARAB EMIRATES';
+    }
+  }
   
   // Get sender information (try client lookup first, then defaults to "N/A")
   let senderEmail = 'N/A';
@@ -895,12 +914,12 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
     senderAddress = client.address || senderAddress;
   }
   
-  // Get receiver information (try parsing from AdditionalInfo fields, default to "N/A")
-  let receiverName = 'N/A';
+  // Get receiver information (try new CSV format first, then fallback to AdditionalInfo fields)
+  let receiverName = getColumnValue(row, ['receiver name', 'receivername', 'receiver_name']) || 'N/A';
   let receiverPhone = 'N/A';
   
-  // Try to parse receiver info from AdditionalInfo1 or AdditionalInfo2
-  if (additionalInfo1) {
+  // Try to parse receiver info from AdditionalInfo1 or AdditionalInfo2 (for old CSV format)
+  if (receiverName === 'N/A' && additionalInfo1) {
     // Simple parsing - look for phone numbers and names
     const phoneRegex = /(\+?\d{10,15})/g;
     const phoneMatch = additionalInfo1.match(phoneRegex);
@@ -913,10 +932,10 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
     }
   }
   
-  if (additionalInfo2) {
+  if (receiverPhone === 'N/A' && additionalInfo2) {
     const phoneRegex = /(\+?\d{10,15})/g;
     const phoneMatch = additionalInfo2.match(phoneRegex);
-    if (phoneMatch && receiverPhone === 'N/A') {
+    if (phoneMatch) {
       receiverPhone = phoneMatch[0];
     }
     // If AdditionalInfo2 doesn't look like a phone, treat it as name
@@ -927,12 +946,13 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
   
   // Determine shipping type (DOM or INT)
   const shippingType = (originCountry && destinationCountry && 
+    originCountry !== 'N/A' && destinationCountry !== 'N/A' &&
     originCountry.toLowerCase().trim() === destinationCountry.toLowerCase().trim()) 
     ? 'DOM' 
-    : 'INT';
+    : (originCountry && destinationCountry && originCountry !== 'N/A' && destinationCountry !== 'N/A') ? 'INT' : 'N/A';
   
   // Map product category from shipment type
-  const productCategory = shipmentType || 'Electronics';
+  const productCategory = shipmentType || 'N/A';
   
   // Calculate dimensions
   const weightValue = parseFloat(weight || 0);
@@ -944,12 +964,12 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
   // Build EMPOST shipment payload (use "N/A" for all missing required fields)
   const shipmentData = {
     trackingNumber: awbNo || 'N/A',
-    uhawb: '',
+    uhawb: 'N/A',
     sender: {
       name: customerName || 'N/A',
       email: senderEmail || 'N/A',
       phone: senderPhone || 'N/A',
-      countryCode: convertCountryToISO(originCountry || 'N/A'),
+      countryCode: convertCountryToISO(originCountry, 'PH') || 'PH', // Default to PH for origin
       city: originCity || 'N/A',
       line1: senderAddress || 'N/A'
     },
@@ -957,7 +977,7 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
       name: receiverName || 'N/A',
       phone: receiverPhone || 'N/A',
       email: 'N/A',
-      countryCode: convertCountryToISO(destinationCountry || 'N/A'),
+      countryCode: convertCountryToISO(destinationCountry, 'AE') || 'AE', // Default to AE for destination
       city: destinationCity || 'N/A',
       line1: destinationCity || 'N/A'
     },
@@ -966,27 +986,32 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
         unit: 'KG',
         value: Math.max(weightValue, 0.1) // Minimum 0.1 KG
       },
+      declaredWeight: {
+        unit: 'KG',
+        value: Math.max(weightValue, 0.1) // Required by Empost - same as weight
+      },
       deliveryCharges: {
         currencyCode: 'AED',
         amount: parseFloat(deliveryCharge || 0)
       },
       pickupDate: parsedDate.toISOString(),
-      shippingType: shippingType,
-      productCategory: productCategory,
-      productType: 'Parcel',
+      shippingType: shippingType || 'N/A',
+      productCategory: productCategory || 'N/A',
+      productType: 'N/A',
+      descriptionOfGoods: shipmentType || 'N/A', // Required by Empost
       dimensions: {
         length: dimensions.length,
         width: dimensions.width,
         height: dimensions.height,
         unit: 'CM'
       },
-      numberOfPieces: 1
+      numberOfPieces: 'N/A'
     },
     items: [{
       description: shipmentType || 'N/A',
-      countryOfOrigin: 'AE',
-      quantity: 1,
-      hsCode: '8504.40'
+      countryOfOrigin: convertCountryToISO(originCountry, 'PH'), // Use origin country code (2 characters required, default PH)
+      quantity: 'N/A',
+      hsCode: 'N/A' // HS Code (Harmonized System Code) - customs classification code
     }]
   };
   
@@ -994,20 +1019,24 @@ async function mapCSVToEMPOSTShipment(row, client = null) {
 }
 
 // Historical Upload endpoint - uploads historical shipment data to EMPOST
-router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
+// Accept both 'csvFile' and 'file' field names for flexibility
+router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }, { name: 'file', maxCount: 1 }]), async (req, res) => {
   try {
-    if (!req.file) {
+    // Get file from either field name
+    const uploadedFile = req.files?.csvFile?.[0] || req.files?.file?.[0] || req.file;
+    
+    if (!uploadedFile) {
       return res.status(400).json({
         success: false,
-        error: 'No CSV file provided'
+        error: 'No CSV file provided. Please use field name "csvFile" or "file"'
       });
     }
 
-    console.log('📄 Processing historical CSV file:', req.file.originalname);
-    console.log('📊 File size:', req.file.size, 'bytes');
+    console.log('📄 Processing historical CSV file:', uploadedFile.originalname);
+    console.log('📊 File size:', uploadedFile.size, 'bytes');
 
     // Parse CSV file
-    const csvData = await parseCSV(req.file.buffer);
+    const csvData = await parseCSV(uploadedFile.buffer);
     
     if (!csvData || csvData.length === 0) {
       return res.status(400).json({
@@ -1055,9 +1084,10 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
       try {
         console.log(`\n📝 Processing row ${rowNumber}`);
 
-        // Get required CSV columns
-        const transactionDate = getColumnValue(row, ['transactiondate', 'transaction_date', 'transaction date']);
-        const awbNo = getColumnValue(row, ['awbno', 'awb_no', 'awb number', 'awb']);
+        // Get required CSV columns - support multiple date column names
+        const transactionDate = getColumnValue(row, ['invoice date', 'invoice_date', 'invoicedate', 'transactiondate', 'transaction_date', 'transaction date', 'delivery date', 'delivery_date', 'deliverydate']);
+        // Support both old and new CSV formats (handle BOM in column name)
+        const awbNo = getColumnValue(row, ['awb number', 'awbno', 'awb_no', 'awb', 'awbnumber']);
         
         // Filter by date - only process rows within historical range
         const dateCheck = isDateInHistoricalRange(transactionDate);
@@ -1075,10 +1105,24 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
         summary.rows_processed++;
 
         // Try to find client by customer name
-        const customerName = getColumnValue(row, ['customername', 'customer_name', 'customer name']);
+        const customerName = getColumnValue(row, ['sender name', 'customername', 'customer_name', 'customer name']);
         let client = null;
         if (customerName) {
           client = await Client.findOne({ company_name: customerName });
+        }
+
+        // Determine origin country based on origin city (needed for audit report)
+        const originCity = getColumnValue(row, ['origin', 'origincity', 'origin_city', 'origin city']);
+        let originCountry = 'PHILIPPINES'; // Default
+        if (originCity) {
+          const originUpper = originCity.toUpperCase().trim();
+          if (originUpper.includes('DUBAI') || originUpper.includes('ABU DHABI') || 
+              originUpper.includes('SHARJAH') || originUpper.includes('AJMAN') ||
+              originUpper.includes('RAK') || originUpper.includes('FUJAIRAH') ||
+              originUpper.includes('UMM') || originUpper.includes('AL-AIN') ||
+              originUpper.includes('AL AIN')) {
+            originCountry = 'UNITED ARAB EMIRATES';
+          }
         }
 
         // Map CSV data to EMPOST shipment format
@@ -1111,17 +1155,22 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
         // Extract invoice data from CSV and call invoice API
         // IMPORTANT: For historical data, we ONLY send to EMPOST API and store in audit report
         // We do NOT create Invoice documents in the database collection
+        // NOTE: For historical uploads, we use ONLY data from CSV - NO automatic tax calculation
         try {
-          // Extract invoice-related fields from CSV (use "N/A" for missing data)
+          // Extract invoice-related fields from CSV (use 0 for missing data - no business rules applied)
           const invoiceAmount = parseFloat(getColumnValue(row, ['invoice_amount', 'invoiceamount', 'amount', 'total_amount', 'totalamount']) || 0);
-          const deliveryChargeValue = parseFloat(getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']) || 0);
-          const taxAmount = parseFloat(getColumnValue(row, ['tax_amount', 'taxamount', 'tax', 'vat']) || 0);
-          const weight = parseFloat(getColumnValue(row, ['weight']) || 0.1);
-          const invoiceNumber = getColumnValue(row, ['invoice_number', 'invoicenumber', 'invoice_id', 'invoiceid']) || awbNo || 'N/A';
+          const deliveryChargeValue = parseFloat(getColumnValue(row, ['delivery charge rate before discount', 'delivery charge', 'delivery_charge', 'deliverycharge', ' delivery charge rate before discount ']) || 0);
+          // For historical data: use tax from CSV only, NO automatic calculation
+          // Support new CSV format: EPG LEVY AMOUNT
+          const taxAmount = parseFloat(getColumnValue(row, ['epg levy amount', 'tax_amount', 'taxamount', 'tax', 'vat']) || 0);
+          const weight = parseFloat(getColumnValue(row, ['weight', ' weight ']) || 0.1);
+          const invoiceNumber = getColumnValue(row, ['invoice number', 'invoice_number', 'invoicenumber', 'invoice_id', 'invoiceid']) || awbNo || 'N/A';
           
-          // Calculate amounts (use "N/A" defaults if missing)
-          const baseAmount = invoiceAmount > 0 ? invoiceAmount : (deliveryChargeValue > 0 ? deliveryChargeValue : 0);
-          const totalAmount = baseAmount + deliveryChargeValue + taxAmount;
+          // Calculate amounts (use only CSV data - no business rules for historical uploads)
+          // For PH_TO_UAE historical: baseAmount = 0 (no shipping charge), only delivery charge is sent
+          const baseAmount = 0; // Historical PH_TO_UAE does not charge shipping/base
+          // Total = delivery charge + tax (if tax exists in CSV)
+          const totalAmount = deliveryChargeValue + taxAmount;
           
           // Create invoice-like object for EMPOST invoice API (matching the expected structure)
           // NOTE: This is only used for EMPOST API call, NOT saved to database
@@ -1134,7 +1183,16 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
             tax_amount: taxAmount,
             total_amount: totalAmount,
             weight_kg: weight > 0 ? weight : 0.1,
-            service_code: getColumnValue(row, ['service_code', 'servicecode']) || 'N/A',
+            // Map SERVICE TYPE to service_code: OUTBOUND -> PH_TO_UAE, DOMESTIC -> DOMESTIC
+            service_code: (() => {
+              const serviceType = getColumnValue(row, ['service type', 'service_code', 'servicecode', 'service_type']);
+              if (serviceType && serviceType.toUpperCase().includes('OUTBOUND')) {
+                return 'PH_TO_UAE';
+              } else if (serviceType && serviceType.toUpperCase().includes('DOMESTIC')) {
+                return 'DOMESTIC';
+              }
+              return 'N/A';
+            })(),
             client_id: client ? {
               company_name: client.company_name || 'N/A',
               contact_name: client.contact_name || 'N/A'
@@ -1169,9 +1227,9 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
         try {
           // Extract invoice data for audit report (from the invoice API call above)
           const invoiceAmount = parseFloat(getColumnValue(row, ['invoice_amount', 'invoiceamount', 'amount', 'total_amount', 'totalamount']) || 0);
-          const deliveryChargeValue = parseFloat(getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']) || 0);
-          const taxAmount = parseFloat(getColumnValue(row, ['tax_amount', 'taxamount', 'tax', 'vat']) || 0);
-          const invoiceNumber = getColumnValue(row, ['invoice_number', 'invoicenumber', 'invoice_id', 'invoiceid']) || awbNo || 'N/A';
+          const deliveryChargeValue = parseFloat(getColumnValue(row, ['delivery charge rate before discount', 'delivery charge', 'delivery_charge', 'deliverycharge', ' delivery charge rate before discount ']) || 0);
+          const taxAmount = parseFloat(getColumnValue(row, ['epg levy amount', 'tax_amount', 'taxamount', 'tax', 'vat']) || 0);
+          const invoiceNumber = getColumnValue(row, ['invoice number', 'invoice_number', 'invoicenumber', 'invoice_id', 'invoiceid']) || awbNo || 'N/A';
           const baseAmount = invoiceAmount > 0 ? invoiceAmount : (deliveryChargeValue > 0 ? deliveryChargeValue : 0);
           const totalAmount = baseAmount + deliveryChargeValue + taxAmount;
           
@@ -1179,14 +1237,14 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
             awb_number: awbNo || 'N/A',
             transaction_date: transactionDate || 'N/A',
             customer_name: customerName || 'N/A',
-            origin_country: getColumnValue(row, ['origincountry', 'origin_country', 'origin country']) || 'N/A',
-            origin_city: getColumnValue(row, ['origincity', 'origin_city', 'origin city']) || 'N/A',
-            destination_country: getColumnValue(row, ['destinationcountry', 'destination_country', 'destination country']) || 'N/A',
-            destination_city: getColumnValue(row, ['destinationcity', 'destination_city', 'destination city']) || 'N/A',
-            shipment_type: getColumnValue(row, ['shipmenttype', 'shipment_type', 'shipment type']) || 'N/A',
-            shipment_status: getColumnValue(row, ['shipmentstatus', 'shipment_status', 'shipment status']) || 'N/A',
-            weight: getColumnValue(row, ['weight']) || 'N/A',
-            delivery_charge: getColumnValue(row, ['delivery charge', 'delivery_charge', 'deliverycharge']) || 'N/A',
+            origin_country: originCountry || 'N/A',
+            origin_city: getColumnValue(row, ['origin', 'origincity', 'origin_city', 'origin city']) || 'N/A',
+            destination_country: getColumnValue(row, ['country of destination', 'destinationcountry', 'destination_country', 'destination country']) || 'N/A',
+            destination_city: getColumnValue(row, ['destination', 'destinationcity', 'destination_city', 'destination city']) || 'N/A',
+            shipment_type: getColumnValue(row, ['shipment type', 'shipmenttype', 'shipment_type', 'shipment type']) || 'N/A',
+            shipment_status: getColumnValue(row, ['delivery status', 'shipmentstatus', 'shipment_status', 'shipment status']) || 'N/A',
+            weight: getColumnValue(row, ['weight', ' weight ']) || 'N/A',
+            delivery_charge: getColumnValue(row, ['delivery charge rate before discount', 'delivery charge', 'delivery_charge', 'deliverycharge', ' delivery charge rate before discount ']) || 'N/A',
             dispatcher: getColumnValue(row, ['dispatcher']) || 'N/A',
             additional_info1: getColumnValue(row, ['additionalinfo1', 'additional_info1', 'additional info1']) || 'N/A',
             additional_info2: getColumnValue(row, ['additionalinfo2', 'additional_info2', 'additional info2']) || 'N/A',
@@ -1235,7 +1293,7 @@ router.post('/historical', auth, upload.single('csvFile'), async (req, res) => {
         errors.push({
           row: rowNumber,
           error: rowError.message,
-          awb: getColumnValue(row, ['awbno', 'awb_no', 'awb number', 'awb']) || 'N/A'
+          awb: getColumnValue(row, ['awb number', 'awbno', 'awb_no', 'awb', 'awbnumber']) || 'N/A'
         });
         summary.errors++;
       }
