@@ -4,12 +4,13 @@ const { Booking, Employee, InvoiceRequest } = require('../models');
 const { createNotificationsForDepartment } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
-const HEAVY_FIELDS_PROJECTION = '-identityDocuments -attachments -documents -images -files -selfie';
+const HEAVY_FIELDS_PROJECTION = '-identityDocuments -attachments -documents -files';
 
 // Get all bookings (paginated, light payload)
 router.get('/', async (req, res) => {
@@ -57,10 +58,49 @@ router.get('/', async (req, res) => {
       };
     });
     
-    // Debug: Log first booking structure
+    // Debug: Log first booking structure and check for image fields
     if (formattedBookings.length > 0) {
-      console.log('📦 Backend - First booking structure:', JSON.stringify(formattedBookings[0], null, 2));
-      console.log('📦 Backend - OTP Info:', formattedBookings[0].otpInfo);
+      const firstBooking = formattedBookings[0];
+      console.log('📦 Backend - First booking structure:', JSON.stringify(firstBooking, null, 2));
+      console.log('📦 Backend - OTP Info:', firstBooking.otpInfo);
+      
+      // Debug: Check for image fields in booking and nested objects
+      const imageFields = ['images', 'selfie', 'customerImage', 'customerImages', 'customer_image', 'customer_images', 'image', 'photos', 'attachments'];
+      const foundImageFields = imageFields.filter(field => firstBooking[field] !== undefined);
+      
+      // Also check in sender and receiver objects
+      const senderImageFields = firstBooking.sender ? imageFields.filter(field => firstBooking.sender[field] !== undefined) : [];
+      const receiverImageFields = firstBooking.receiver ? imageFields.filter(field => firstBooking.receiver[field] !== undefined) : [];
+      
+      if (foundImageFields.length > 0 || senderImageFields.length > 0 || receiverImageFields.length > 0) {
+        console.log('🖼️ Found image fields:');
+        foundImageFields.forEach(field => {
+          console.log(`  - booking.${field}:`, Array.isArray(firstBooking[field]) ? `Array(${firstBooking[field].length})` : typeof firstBooking[field]);
+        });
+        senderImageFields.forEach(field => {
+          console.log(`  - booking.sender.${field}:`, Array.isArray(firstBooking.sender[field]) ? `Array(${firstBooking.sender[field].length})` : typeof firstBooking.sender[field]);
+        });
+        receiverImageFields.forEach(field => {
+          console.log(`  - booking.receiver.${field}:`, Array.isArray(firstBooking.receiver[field]) ? `Array(${firstBooking.receiver[field].length})` : typeof firstBooking.receiver[field]);
+        });
+      } else {
+        console.log('⚠️ No image fields found in booking response. Checking raw document without projection...');
+        // Fetch the same booking without projection to see if fields exist
+        const rawBooking = await Booking.findById(firstBooking._id).lean();
+        const rawImageFields = imageFields.filter(field => rawBooking[field] !== undefined);
+        const rawSenderImageFields = rawBooking.sender ? imageFields.filter(field => rawBooking.sender[field] !== undefined) : [];
+        const rawReceiverImageFields = rawBooking.receiver ? imageFields.filter(field => rawBooking.receiver[field] !== undefined) : [];
+        
+        if (rawImageFields.length > 0 || rawSenderImageFields.length > 0 || rawReceiverImageFields.length > 0) {
+          console.log('🖼️ Image fields found in raw document (may be excluded by projection):');
+          rawImageFields.forEach(field => console.log(`  - ${field}`));
+          rawSenderImageFields.forEach(field => console.log(`  - sender.${field}`));
+          rawReceiverImageFields.forEach(field => console.log(`  - receiver.${field}`));
+        } else {
+          console.log('❌ No image fields found in raw document. Booking may not have images stored.');
+          console.log('📋 All booking keys:', Object.keys(rawBooking));
+        }
+      }
     }
     
     res.json({ success: true, data: formattedBookings, pagination: { page, limit, total } });
@@ -118,6 +158,80 @@ router.get('/status/:reviewStatus', async (req, res) => {
   } catch (error) {
     console.error('Error fetching bookings by status:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
+  }
+});
+
+// Get booking by ID for review (includes all identityDocuments images)
+// This endpoint must be defined BEFORE /:id to ensure proper route matching
+router.get('/:id/review', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Find booking with ALL fields, especially identityDocuments
+    // Do NOT use any projection that excludes fields
+    const booking = await Booking.findById(id).lean();
+    
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+
+    // Ensure identityDocuments is included and not filtered
+    // The booking should already have identityDocuments from the query
+    // But explicitly verify it exists
+    if (!booking.identityDocuments) {
+      console.warn(`Booking ${id} has no identityDocuments`);
+    }
+
+    // Extract OTP from otpVerification object for easy access in manager dashboard
+    const otpInfo = {
+      otp: booking.otpVerification?.otp || booking.otp || null,
+      verified: booking.otpVerification?.verified || booking.verified || false,
+      verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
+      phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
+    };
+    
+    // Extract agentName from sender object for easy access
+    const agentName = booking.sender?.agentName || booking.agentName || null;
+    
+    // Format booking with all data including identityDocuments
+    const formattedBooking = {
+      ...booking,
+      // Include OTP info at top level for easy access
+      otpInfo: otpInfo,
+      // Include agentName at top level for easy access
+      agentName: agentName,
+      // Ensure sender object includes agentName
+      sender: booking.sender ? {
+        ...booking.sender,
+        agentName: booking.sender.agentName || null
+      } : null,
+      // Keep original otpVerification object intact
+      otpVerification: booking.otpVerification || null,
+      // Ensure identityDocuments is explicitly included (should already be there)
+      identityDocuments: booking.identityDocuments || {}
+    };
+
+    // Debug: Log identityDocuments structure for verification
+    if (formattedBooking.identityDocuments && Object.keys(formattedBooking.identityDocuments).length > 0) {
+      console.log(`✅ Booking ${id} review - identityDocuments keys:`, Object.keys(formattedBooking.identityDocuments));
+    } else {
+      console.log(`⚠️ Booking ${id} review - No identityDocuments found`);
+    }
+
+    res.json({
+      success: true,
+      data: formattedBooking
+    });
+    
+  } catch (error) {
+    console.error('Error fetching booking for review:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch booking details'
+    });
   }
 });
 
