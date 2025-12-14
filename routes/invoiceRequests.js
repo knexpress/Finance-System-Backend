@@ -2,8 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { InvoiceRequest, Employee, Collections } = require('../models');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
-// EMPOST API DISABLED
-// const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
+const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 
 const router = express.Router();
@@ -210,11 +209,11 @@ router.post('/', async (req, res) => {
 
     await invoiceRequest.save();
 
-    // EMPOST API DISABLED
-    // await syncInvoiceWithEMPost({
-    //   requestId: invoiceRequest._id,
-    //   reason: `Invoice request status update (${status || 'no status'})`,
-    // });
+    // Sync invoice request to EMPOST
+    await syncInvoiceWithEMPost({
+      requestId: invoiceRequest._id,
+      reason: `Invoice request status update (${status || 'no status'})`,
+    });
 
     // Create notifications for relevant departments (Sales, Operations, Finance)
     const relevantDepartments = ['Sales', 'Operations', 'Finance'];
@@ -261,31 +260,23 @@ router.put('/:id', async (req, res) => {
 
     await invoiceRequest.save();
 
-    // EMPOST API DISABLED
-    // Update EMPOST shipment status if status or delivery_status changed
-    // const statusChanged = updateData.status && updateData.status !== oldStatus;
-    // const deliveryStatusChanged = updateData.delivery_status && updateData.delivery_status !== oldDeliveryStatus;
+    // Sync status to EMPOST if status or delivery_status changed
+    const statusChanged = updateData.status && updateData.status !== oldStatus;
+    const deliveryStatusChanged = updateData.delivery_status && updateData.delivery_status !== oldDeliveryStatus;
     
-    // if (statusChanged || deliveryStatusChanged) {
-    //   try {
-    //     const empostAPI = require('../services/empost-api');
-    //     const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
-    //     
-    //     if (trackingNumber && trackingNumber !== 'N/A') {
-    //       const statusToUpdate = updateData.delivery_status || updateData.status;
-    //       console.log(`🔄 Updating EMPOST shipment status via general update: ${trackingNumber} -> ${statusToUpdate}`);
-    //       
-    //       await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
-    //         deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
-    //       });
-    //       
-    //       console.log('✅ EMPOST shipment status updated successfully');
-    //     }
-    //   } catch (empostError) {
-    //     console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
-    //     // Don't fail the update if EMPOST fails
-    //   }
-    // }
+    if (statusChanged || deliveryStatusChanged) {
+      const { syncStatusToEMPost, getTrackingNumberFromInvoiceRequest } = require('../utils/empost-status-sync');
+      const trackingNumber = getTrackingNumberFromInvoiceRequest(invoiceRequest);
+      const statusToUpdate = updateData.delivery_status || updateData.status;
+      
+      await syncStatusToEMPost({
+        trackingNumber,
+        status: statusToUpdate,
+        additionalData: {
+          deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+        }
+      });
+    }
 
     res.json({
       success: true,
@@ -355,28 +346,20 @@ router.put('/:id/status', async (req, res) => {
 
     await invoiceRequest.save();
 
-    // EMPOST API DISABLED
-    // Update EMPOST shipment status if status or delivery_status changed
-    // if ((status && status !== oldStatus) || (delivery_status && delivery_status !== oldDeliveryStatus)) {
-    //   try {
-    //     const empostAPI = require('../services/empost-api');
-    //     const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
-    //     
-    //     if (trackingNumber && trackingNumber !== 'N/A') {
-    //       const statusToUpdate = delivery_status || status;
-    //       console.log(`🔄 Updating EMPOST shipment status: ${trackingNumber} -> ${statusToUpdate}`);
-    //       
-    //       await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
-    //         deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
-    //       });
-    //       
-    //       console.log('✅ EMPOST shipment status updated successfully');
-    //     }
-    //   } catch (empostError) {
-    //     console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
-    //     // Don't fail the status update if EMPOST fails
-    //   }
-    // }
+    // Sync status to EMPOST if status or delivery_status changed
+    if ((status && status !== oldStatus) || (delivery_status && delivery_status !== oldDeliveryStatus)) {
+      const { syncStatusToEMPost, getTrackingNumberFromInvoiceRequest } = require('../utils/empost-status-sync');
+      const trackingNumber = getTrackingNumberFromInvoiceRequest(invoiceRequest);
+      const statusToUpdate = delivery_status || status;
+      
+      await syncStatusToEMPost({
+        trackingNumber,
+        status: statusToUpdate,
+        additionalData: {
+          deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+        }
+      });
+    }
 
     res.json({
       success: true,
@@ -416,28 +399,20 @@ router.put('/:id/delivery-status', async (req, res) => {
     
     await invoiceRequest.save();
 
-    // EMPOST API DISABLED
-    // Update EMPOST shipment status if delivery_status changed
-    // if (delivery_status && delivery_status !== oldDeliveryStatus) {
-    //   try {
-    //     const empostAPI = require('../services/empost-api');
-    //     const trackingNumber = invoiceRequest.tracking_code || invoiceRequest.invoice_number || invoiceRequest.empost_uhawb;
-    //     
-    //     if (trackingNumber && trackingNumber !== 'N/A') {
-    //       console.log(`🔄 Updating EMPOST shipment delivery status: ${trackingNumber} -> ${delivery_status}`);
-    //       
-    //       await empostAPI.updateShipmentStatus(trackingNumber, delivery_status, {
-    //         deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
-    //         notes: notes
-    //       });
-    //       
-    //       console.log('✅ EMPOST shipment delivery status updated successfully');
-    //     }
-    //   } catch (empostError) {
-    //     console.error('❌ Failed to update EMPOST shipment delivery status (non-critical):', empostError.message);
-    //     // Don't fail the status update if EMPOST fails
-    //   }
-    // }
+    // Sync delivery status to EMPOST if changed
+    if (delivery_status && delivery_status !== oldDeliveryStatus) {
+      const { syncStatusToEMPost, getTrackingNumberFromInvoiceRequest } = require('../utils/empost-status-sync');
+      const trackingNumber = getTrackingNumberFromInvoiceRequest(invoiceRequest);
+      
+      await syncStatusToEMPost({
+        trackingNumber,
+        status: delivery_status,
+        additionalData: {
+          deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
+          notes: notes
+        }
+      });
+    }
 
     res.json({
       success: true,
@@ -464,11 +439,11 @@ router.put('/:id/weight', async (req, res) => {
     invoiceRequest.weight = weight;
     await invoiceRequest.save();
 
-    // EMPOST API DISABLED
-    // await syncInvoiceWithEMPost({
-    //   requestId: invoiceRequestId,
-    //   reason: 'Invoice request weight update',
-    // });
+    // Sync invoice request to EMPOST after weight update
+    await syncInvoiceWithEMPost({
+      requestId: invoiceRequestId,
+      reason: 'Invoice request weight update',
+    });
 
     res.json({
       success: true,
@@ -497,9 +472,10 @@ router.put('/:id/verification', async (req, res) => {
       return res.status(404).json({ error: 'Invoice request not found' });
     }
 
-    // If PH_TO_UAE, force classification to GENERAL regardless of incoming data
-    const serviceCode = (invoiceRequest.service_code || invoiceRequest.verification?.service_code || '').toUpperCase();
+    // Determine service route for classification logic
+    const serviceCode = (invoiceRequest.service_code || invoiceRequest.verification?.service_code || verificationData.service_code || '').toUpperCase();
     const isPhToUae = serviceCode.includes('PH_TO_UAE');
+    const isUaeToPh = serviceCode.includes('UAE_TO_PH') || serviceCode.includes('UAE_TO_PINAS');
 
     // Initialize verification object if it doesn't exist
     if (!invoiceRequest.verification) {
@@ -529,49 +505,126 @@ router.put('/:id/verification', async (req, res) => {
       return value.toString().trim().toUpperCase();
     };
 
-    // Handle boxes data - convert to Decimal128 for numeric fields
-    if (verificationData.boxes && Array.isArray(verificationData.boxes)) {
-      invoiceRequest.verification.boxes = verificationData.boxes.map(box => {
-        // Force GENERAL for PH_TO_UAE, otherwise normalize provided classification
-        const normalizedClassification = isPhToUae ? 'GENERAL' : normalizeClass(box.classification);
-        
-        return {
-          items: box.items || '',
-          quantity: box.quantity,
-          length: toDecimal128(box.length),
-          width: toDecimal128(box.width),
-          height: toDecimal128(box.height),
-          vm: toDecimal128(box.vm),
-          classification: normalizedClassification, // Stored uppercase
-          shipment_classification: isPhToUae ? 'GENERAL' : normalizedClassification
-        };
+    // Handle boxes data - accept empty array (Box List removed from frontend)
+    // For backward compatibility, still process boxes if provided, but allow empty array
+    if (verificationData.boxes !== undefined) {
+      if (Array.isArray(verificationData.boxes) && verificationData.boxes.length > 0) {
+        // Process boxes if provided (for backward compatibility)
+        invoiceRequest.verification.boxes = verificationData.boxes.map(box => {
+          // Force GENERAL for PH_TO_UAE, otherwise normalize provided classification
+          const normalizedClassification = isPhToUae ? 'GENERAL' : normalizeClass(box.classification);
+          
+          return {
+            items: box.items || '',
+            quantity: box.quantity,
+            length: toDecimal128(box.length),
+            width: toDecimal128(box.width),
+            height: toDecimal128(box.height),
+            vm: toDecimal128(box.vm),
+            classification: normalizedClassification,
+            shipment_classification: isPhToUae ? 'GENERAL' : normalizedClassification
+          };
+        });
+      } else {
+        // Empty array - set to empty array
+        invoiceRequest.verification.boxes = [];
+      }
+    }
+
+    // Handle listed_commodities - accept empty string (Box List removed)
+    if (verificationData.listed_commodities !== undefined) {
+      invoiceRequest.verification.listed_commodities = verificationData.listed_commodities || '';
+    }
+
+    // Shipment classification handling
+    // PH_TO_UAE: Always GENERAL (enforce)
+    // UAE_TO_PH: Must be FLOWMIC or COMMERCIAL (validate)
+    if (isPhToUae) {
+      // PH_TO_UAE: Force to GENERAL regardless of input
+      invoiceRequest.verification.shipment_classification = 'GENERAL';
+      console.log('✅ PH_TO_UAE route detected - classification set to GENERAL');
+    } else if (isUaeToPh) {
+      // UAE_TO_PH: Must be FLOWMIC or COMMERCIAL
+      if (verificationData.shipment_classification !== undefined) {
+        const normalizedClass = normalizeClass(verificationData.shipment_classification);
+        if (normalizedClass === 'FLOWMIC' || normalizedClass === 'COMMERCIAL') {
+          invoiceRequest.verification.shipment_classification = normalizedClass;
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: 'For UAE_TO_PH shipments, shipment_classification must be either FLOWMIC or COMMERCIAL'
+          });
+        }
+      } else {
+        return res.status(400).json({
+          success: false,
+          error: 'shipment_classification is required for UAE_TO_PH shipments (must be FLOWMIC or COMMERCIAL)'
+        });
+      }
+    } else if (verificationData.shipment_classification !== undefined) {
+      // Other routes: accept provided classification
+      invoiceRequest.verification.shipment_classification = normalizeClass(verificationData.shipment_classification);
+    }
+
+    // Validate and handle actual_weight (required)
+    if (verificationData.actual_weight === undefined || verificationData.actual_weight === null || verificationData.actual_weight === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'actual_weight is required'
       });
     }
-
-    // Shipment classification (top-level marker)
-    if (verificationData.shipment_classification !== undefined) {
-      invoiceRequest.verification.shipment_classification = isPhToUae
-        ? 'GENERAL'
-        : normalizeClass(verificationData.shipment_classification);
-    } else if (isPhToUae) {
-      invoiceRequest.verification.shipment_classification = 'GENERAL';
+    const actualWeight = parseFloat(verificationData.actual_weight);
+    if (isNaN(actualWeight) || actualWeight < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'actual_weight must be a positive number'
+      });
     }
+    invoiceRequest.verification.actual_weight = toDecimal128(actualWeight);
 
-    // Handle total_vm
+    // Validate and handle volumetric_weight (required - now direct input)
+    if (verificationData.volumetric_weight === undefined || verificationData.volumetric_weight === null || verificationData.volumetric_weight === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'volumetric_weight is required'
+      });
+    }
+    const volumetricWeight = parseFloat(verificationData.volumetric_weight);
+    if (isNaN(volumetricWeight) || volumetricWeight < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'volumetric_weight must be a positive number'
+      });
+    }
+    invoiceRequest.verification.volumetric_weight = toDecimal128(volumetricWeight);
+
+    // Calculate chargeable_weight = max(actual_weight, volumetric_weight)
+    // Use provided chargeable_weight if available, otherwise calculate
+    let chargeableWeight;
+    if (verificationData.chargeable_weight !== undefined && verificationData.chargeable_weight !== null && verificationData.chargeable_weight !== '') {
+      chargeableWeight = parseFloat(verificationData.chargeable_weight);
+      if (isNaN(chargeableWeight) || chargeableWeight <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'chargeable_weight must be a positive number greater than 0'
+        });
+      }
+    } else {
+      // Auto-calculate: chargeable_weight = max(actual_weight, volumetric_weight)
+      chargeableWeight = Math.max(actualWeight, volumetricWeight);
+      console.log(`✅ Auto-calculated chargeable_weight: ${chargeableWeight} kg (Actual: ${actualWeight} kg, Volumetric: ${volumetricWeight} kg)`);
+    }
+    invoiceRequest.verification.chargeable_weight = toDecimal128(chargeableWeight);
+
+    // Handle total_vm (for backward compatibility - same as volumetric_weight)
+    // Set after volumetric_weight is validated
     if (verificationData.total_vm !== undefined && verificationData.total_vm !== null && verificationData.total_vm !== '') {
       invoiceRequest.verification.total_vm = toDecimal128(verificationData.total_vm);
+    } else {
+      // Set total_vm to volumetric_weight if not provided (for backward compatibility)
+      invoiceRequest.verification.total_vm = invoiceRequest.verification.volumetric_weight;
     }
 
-    // Handle actual_weight, volumetric_weight, chargeable_weight
-    if (verificationData.actual_weight !== undefined && verificationData.actual_weight !== null && verificationData.actual_weight !== '') {
-      invoiceRequest.verification.actual_weight = toDecimal128(verificationData.actual_weight);
-    }
-    if (verificationData.volumetric_weight !== undefined && verificationData.volumetric_weight !== null && verificationData.volumetric_weight !== '') {
-      invoiceRequest.verification.volumetric_weight = toDecimal128(verificationData.volumetric_weight);
-    }
-    if (verificationData.chargeable_weight !== undefined && verificationData.chargeable_weight !== null && verificationData.chargeable_weight !== '') {
-      invoiceRequest.verification.chargeable_weight = toDecimal128(verificationData.chargeable_weight);
-    }
     if (verificationData.rate_bracket !== undefined) {
       invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
     }
@@ -579,25 +632,43 @@ router.put('/:id/verification', async (req, res) => {
       invoiceRequest.verification.calculated_rate = toDecimal128(verificationData.calculated_rate);
     }
 
-    // Auto-determine weight_type based on actual_weight and volumetric_weight (always override)
-    // This ensures weight_type cannot be manually changed - it's always determined by the comparison
-    if (verificationData.actual_weight !== undefined && verificationData.volumetric_weight !== undefined) {
-      const actualWt = parseFloat(verificationData.actual_weight.toString());
-      const volumetricWt = parseFloat(verificationData.volumetric_weight.toString());
-      // Always use the auto-determined weight type (cannot be overridden)
-      if (actualWt >= volumetricWt) {
-        invoiceRequest.verification.weight_type = 'ACTUAL';
-      } else {
-        invoiceRequest.verification.weight_type = 'VOLUMETRIC';
+    // Auto-determine weight_type based on actual_weight and volumetric_weight comparison
+    // weight_type = 'ACTUAL' if actual_weight >= volumetric_weight, else 'VOLUMETRIC'
+    if (actualWeight >= volumetricWeight) {
+      invoiceRequest.verification.weight_type = 'ACTUAL';
+    } else {
+      invoiceRequest.verification.weight_type = 'VOLUMETRIC';
+    }
+    console.log(`✅ Auto-determined weight type: ${invoiceRequest.verification.weight_type} (Actual: ${actualWeight} kg, Volumetric: ${volumetricWeight} kg, Chargeable: ${chargeableWeight} kg)`);
+
+    // Handle number_of_boxes (simple input, default 1, must be >= 1)
+    if (verificationData.number_of_boxes !== undefined) {
+      const numBoxes = parseInt(verificationData.number_of_boxes);
+      if (isNaN(numBoxes) || numBoxes < 1) {
+        return res.status(400).json({
+          success: false,
+          error: 'number_of_boxes must be a number greater than or equal to 1'
+        });
       }
-      console.log(`✅ Auto-determined weight type: ${invoiceRequest.verification.weight_type} (Actual: ${actualWt} kg, Volumetric: ${volumetricWt} kg)`);
+      invoiceRequest.verification.number_of_boxes = numBoxes;
+    } else {
+      // Default to 1 if not provided
+      invoiceRequest.verification.number_of_boxes = 1;
     }
 
-    // Update other verification fields (excluding weight_type, rate_bracket, calculated_rate which are handled separately above)
+    // Update service_code from verification data if provided (this is the source of truth)
+    if (verificationData.service_code !== undefined && verificationData.service_code !== null && verificationData.service_code !== '') {
+      invoiceRequest.service_code = verificationData.service_code;
+      invoiceRequest.verification.service_code = verificationData.service_code;
+      console.log(`✅ Updated service_code from verification: ${verificationData.service_code}`);
+    }
+
+    // Update other verification fields (excluding fields handled separately above)
     Object.keys(verificationData).forEach(key => {
       if (verificationData[key] !== undefined && 
           verificationData[key] !== null &&
           key !== 'boxes' && 
+          key !== 'listed_commodities' &&
           key !== 'total_vm' && 
           key !== 'weight' && 
           key !== 'actual_weight' && 
@@ -605,7 +676,10 @@ router.put('/:id/verification', async (req, res) => {
           key !== 'chargeable_weight' &&
           key !== 'weight_type' &&
           key !== 'rate_bracket' &&
-          key !== 'calculated_rate') { // These are handled separately above
+          key !== 'calculated_rate' &&
+          key !== 'shipment_classification' &&
+          key !== 'number_of_boxes' &&
+          key !== 'service_code') { // service_code is handled separately above
         // Handle Decimal128 fields
         if (key === 'amount' || key === 'volume_cbm') {
           invoiceRequest.verification[key] = toDecimal128(verificationData[key]);
@@ -693,30 +767,29 @@ router.put('/:id/complete-verification', async (req, res) => {
     
     await invoiceRequest.save();
 
-    // EMPOST API DISABLED
     // Create EMPOST shipment automatically when verification is completed
     // This creates ONLY the shipment, NOT the invoice (invoice will be generated later by Finance)
     // Only create if UHAWB doesn't already exist (avoid duplicates)
-    // if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
-    //   try {
-    //     const empostAPI = require('../services/empost-api');
-    //     console.log('📦 Automatically creating EMPOST shipment from verified InvoiceRequest...');
-    //     
-    //     const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
-    //     
-    //     if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-    //       // Store UHAWB in invoiceRequest for future reference
-    //       invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
-    //       await invoiceRequest.save();
-    //       console.log('✅ EMPOST shipment created automatically with UHAWB:', shipmentResult.data.uhawb);
-    //     }
-    //   } catch (empostError) {
-    //     console.error('❌ Failed to create EMPOST shipment automatically (non-critical):', empostError.message);
-    //     // Don't fail verification completion if EMPOST fails - can be retried later
-    //   }
-    // } else {
-    //   console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
-    // }
+    if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
+      try {
+        const empostAPI = require('../services/empost-api');
+        console.log('📦 Automatically creating EMPOST shipment from verified InvoiceRequest...');
+        
+        const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
+        
+        if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+          // Store UHAWB in invoiceRequest for future reference
+          invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
+          await invoiceRequest.save();
+          console.log('✅ EMPOST shipment created automatically with UHAWB:', shipmentResult.data.uhawb);
+        }
+      } catch (empostError) {
+        console.error('❌ Failed to create EMPOST shipment automatically (non-critical):', empostError.message);
+        // Don't fail verification completion if EMPOST fails - can be retried later
+      }
+    } else {
+      console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
+    }
 
     res.json({
       success: true,

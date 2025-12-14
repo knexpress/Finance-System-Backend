@@ -551,13 +551,42 @@ class EMpostAPIService {
 
   /**
    * Map InvoiceRequest data to EMpost shipment format
-   * @param {Object} invoiceRequest - InvoiceRequest object
+   * 
+   * Data Priority Order:
+   * 1. Verification data (from operations team) - highest priority
+   * 2. Booking data (from booking_data field) - medium priority
+   * 3. Invoice request fields - fallback
+   * 
+   * Verification fields used:
+   * - chargeable_weight, actual_weight, volumetric_weight (weights)
+   * - receiver_address, receiver_phone, receiver_name (receiver details)
+   * - volume_cbm, total_vm (dimensions)
+   * - boxes, listed_commodities (items/commodities)
+   * - number_of_boxes (quantity)
+   * - calculated_rate (charges)
+   * - cargo_service (AIR/SEA)
+   * - agents_name (agent information)
+   * 
+   * @param {Object} invoiceRequest - InvoiceRequest object with verification and booking_data
    * @returns {Object} EMpost shipment payload
    */
   mapInvoiceRequestToShipment(invoiceRequest) {
+    // Use booking_data if available (contains all booking details except identityDocuments)
+    const bookingData = invoiceRequest.booking_data || {};
+    const sender = bookingData.sender || {};
+    const receiver = bookingData.receiver || {};
+    const items = bookingData.items || [];
+    
     // Parse origin and destination addresses
-    const originAddress = this.parseAddress(invoiceRequest.origin_place || '');
-    const destinationAddress = this.parseAddress(invoiceRequest.receiver_address || invoiceRequest.destination_place || '');
+    // Priority: verification data > booking data > invoice request fields
+    const originPlace = sender.completeAddress || sender.addressLine1 || sender.address || invoiceRequest.origin_place || '';
+    // Use verification receiver_address if available (operations may have updated it)
+    const destinationPlace = invoiceRequest.verification?.receiver_address || 
+                             receiver.completeAddress || receiver.addressLine1 || receiver.address || 
+                             invoiceRequest.receiver_address || invoiceRequest.destination_place || '';
+    
+    const originAddress = this.parseAddress(originPlace);
+    const destinationAddress = this.parseAddress(destinationPlace);
     
     // Get weight from verification or main weight field
     const chargeableWeight = invoiceRequest.verification?.chargeable_weight 
@@ -572,24 +601,30 @@ class EMpostAPIService {
     // Use chargeable weight (higher of actual or volumetric)
     const weightToUse = Math.max(chargeableWeight, 0.1);
     
-    // Calculate dimensions from boxes or volume
+    // Calculate dimensions from verification data, boxes, or volume
+    // Priority: verification.volume_cbm > verification.total_vm > verification.boxes > invoiceRequest.volume_cbm
     let dimensionValue = 10; // Default 10cm
-    if (invoiceRequest.verification?.boxes && invoiceRequest.verification.boxes.length > 0) {
-      // Calculate average dimension from boxes
-      const totalVm = invoiceRequest.verification.total_vm 
-        ? parseFloat(invoiceRequest.verification.total_vm.toString())
-        : 0;
-      if (totalVm > 0) {
-        dimensionValue = Math.cbrt(totalVm * 1000000); // Convert CBM to cubic cm, then get cube root
-      } else {
-        // Calculate from first box
-        const firstBox = invoiceRequest.verification.boxes[0];
-        if (firstBox.length && firstBox.width && firstBox.height) {
-          const length = parseFloat(firstBox.length.toString());
-          const width = parseFloat(firstBox.width.toString());
-          const height = parseFloat(firstBox.height.toString());
-          dimensionValue = Math.max(length, width, height, 1);
-        }
+    const verificationVolumeCbm = invoiceRequest.verification?.volume_cbm 
+      ? parseFloat(invoiceRequest.verification.volume_cbm.toString())
+      : null;
+    const verificationTotalVm = invoiceRequest.verification?.total_vm 
+      ? parseFloat(invoiceRequest.verification.total_vm.toString())
+      : null;
+    
+    if (verificationVolumeCbm && verificationVolumeCbm > 0) {
+      // Use verification volume_cbm if available
+      dimensionValue = Math.cbrt(verificationVolumeCbm * 1000000);
+    } else if (verificationTotalVm && verificationTotalVm > 0) {
+      // Use verification total_vm if available
+      dimensionValue = Math.cbrt(verificationTotalVm * 1000000);
+    } else if (invoiceRequest.verification?.boxes && invoiceRequest.verification.boxes.length > 0) {
+      // Calculate from verification boxes
+      const firstBox = invoiceRequest.verification.boxes[0];
+      if (firstBox.length && firstBox.width && firstBox.height) {
+        const length = parseFloat(firstBox.length.toString());
+        const width = parseFloat(firstBox.width.toString());
+        const height = parseFloat(firstBox.height.toString());
+        dimensionValue = Math.max(length, width, height, 1);
       }
     } else if (invoiceRequest.volume_cbm) {
       const volumeCbm = parseFloat(invoiceRequest.volume_cbm.toString());
@@ -613,13 +648,42 @@ class EMpostAPIService {
     // Get number of boxes
     const numberOfBoxes = invoiceRequest.verification?.number_of_boxes || 1;
     
-    // Build items array from boxes or default
-    const items = [];
-    if (invoiceRequest.verification?.boxes && invoiceRequest.verification.boxes.length > 0) {
+    // Build items array from booking items, boxes, or default
+    let shipmentItems = [];
+    
+    // Priority 1: Use booking items if available
+    if (items && items.length > 0) {
+      shipmentItems = items.map((item, index) => {
+        const itemWeight = weightToUse / items.length;
+        const itemDimension = dimensionValue;
+        return {
+          description: item.commodity || item.name || item.description || `Item ${index + 1}`,
+          countryOfOrigin: sender.country || 'AE',
+          quantity: item.qty || item.quantity || 1,
+          hsCode: item.hsCode || '8504.40',
+          customsValue: {
+            currencyCode: 'AED',
+            amount: Math.max(parseFloat(item.value?.toString() || item.price?.toString() || 0), 0),
+          },
+          weight: {
+            unit: 'KG',
+            value: Math.max(itemWeight, 0.1)
+          },
+          dimensions: {
+            length: Math.max(item.length ? parseFloat(item.length.toString()) : itemDimension, 1),
+            width: Math.max(item.width ? parseFloat(item.width.toString()) : itemDimension, 1),
+            height: Math.max(item.height ? parseFloat(item.height.toString()) : itemDimension, 1),
+            unit: 'CM'
+          }
+        };
+      });
+    } 
+    // Priority 2: Use verification boxes if available
+    else if (invoiceRequest.verification?.boxes && invoiceRequest.verification.boxes.length > 0) {
       invoiceRequest.verification.boxes.forEach((box, index) => {
         const boxWeight = weightToUse / numberOfBoxes;
         const boxDimension = dimensionValue;
-        items.push({
+        shipmentItems.push({
           description: box.items || invoiceRequest.verification.listed_commodities || `Item ${index + 1}`,
           countryOfOrigin: 'AE',
           quantity: 1,
@@ -636,9 +700,10 @@ class EMpostAPIService {
           }
         });
       });
-    } else {
-      // Default item
-      items.push({
+    } 
+    // Priority 3: Default item
+    else {
+      shipmentItems.push({
         description: invoiceRequest.verification?.listed_commodities || 'General Goods',
         countryOfOrigin: 'AE',
         quantity: 1,
@@ -666,30 +731,39 @@ class EMpostAPIService {
       trackingNumber: invoiceRequest.tracking_code || invoiceRequest.invoice_number || '',
       uhawb: invoiceRequest.empost_uhawb && invoiceRequest.empost_uhawb !== 'N/A' ? invoiceRequest.empost_uhawb : '',
       sender: {
-        name: invoiceRequest.customer_name || 'N/A',
-        email: invoiceRequest.customer_phone ? `customer${invoiceRequest._id}@noreply.com` : 'noreply@company.com',
-        phone: invoiceRequest.customer_phone || '+971500000000',
-        secondPhone: '',
-        countryCode: originAddress.countryCode || 'AE',
-        state: originAddress.state || '',
-        postCode: originAddress.postCode || '',
-        city: originAddress.city || 'Dubai',
-        line1: originAddress.line1 || invoiceRequest.origin_place || 'N/A',
-        line2: originAddress.line2 || '',
-        line3: originAddress.line3 || '',
+        name: sender.fullName || sender.name || `${sender.firstName || ''} ${sender.lastName || ''}`.trim() || invoiceRequest.customer_name || 'N/A',
+        email: sender.emailAddress || sender.email || (invoiceRequest.customer_phone ? `customer${invoiceRequest._id}@noreply.com` : 'noreply@company.com'),
+        phone: sender.contactNo || sender.phoneNumber || sender.phone || invoiceRequest.customer_phone || '+971500000000',
+        secondPhone: sender.secondPhone || sender.alternatePhone || '',
+        countryCode: sender.country || originAddress.countryCode || 'AE',
+        state: sender.state || originAddress.state || '',
+        postCode: sender.postCode || sender.postalCode || originAddress.postCode || '',
+        city: sender.city || originAddress.city || 'Dubai',
+        line1: sender.addressLine1 || sender.completeAddress || sender.address || originAddress.line1 || invoiceRequest.origin_place || 'N/A',
+        line2: sender.addressLine2 || originAddress.line2 || '',
+        line3: sender.addressLine3 || originAddress.line3 || '',
       },
       receiver: {
-        name: invoiceRequest.receiver_name || 'N/A',
-        email: '',
-        phone: invoiceRequest.receiver_phone || invoiceRequest.verification?.receiver_phone || '+971500000000',
-        secondPhone: '',
-        countryCode: destinationAddress.countryCode || 'AE',
-        state: destinationAddress.state || '',
-        postCode: destinationAddress.postCode || '',
-        city: destinationAddress.city || 'Dubai',
-        line1: destinationAddress.line1 || invoiceRequest.receiver_address || invoiceRequest.destination_place || 'N/A',
-        line2: destinationAddress.line2 || '',
-        line3: destinationAddress.line3 || '',
+        // Use verification receiver_name if available (operations may have updated it)
+        name: invoiceRequest.verification?.receiver_name || 
+              receiver.fullName || receiver.name || `${receiver.firstName || ''} ${receiver.lastName || ''}`.trim() || 
+              invoiceRequest.receiver_name || 'N/A',
+        email: receiver.emailAddress || receiver.email || '',
+        // Priority: verification.receiver_phone > booking receiver > invoice request
+        phone: invoiceRequest.verification?.receiver_phone || 
+              receiver.contactNo || receiver.phoneNumber || receiver.phone || 
+              invoiceRequest.receiver_phone || '+971500000000',
+        secondPhone: receiver.secondPhone || receiver.alternatePhone || '',
+        countryCode: receiver.country || destinationAddress.countryCode || 'AE',
+        state: receiver.state || destinationAddress.state || '',
+        postCode: receiver.postCode || receiver.postalCode || destinationAddress.postCode || '',
+        city: receiver.city || destinationAddress.city || 'Dubai',
+        // Priority: verification.receiver_address > booking receiver > invoice request
+        line1: invoiceRequest.verification?.receiver_address || 
+               receiver.addressLine1 || receiver.completeAddress || receiver.address || 
+               destinationAddress.line1 || invoiceRequest.receiver_address || invoiceRequest.destination_place || 'N/A',
+        line2: receiver.addressLine2 || destinationAddress.line2 || '',
+        line3: receiver.addressLine3 || destinationAddress.line3 || '',
       },
       details: {
         weight: {
@@ -710,8 +784,10 @@ class EMpostAPIService {
         deliveryAttempts: 0,
         shippingType: shippingType,
         productCategory: productCategory,
-        productType: 'Parcel',
-        descriptionOfGoods: invoiceRequest.verification?.listed_commodities || 'General Goods',
+        // Use verification cargo_service if available (AIR or SEA)
+        productType: invoiceRequest.verification?.cargo_service === 'SEA' ? 'Parcel' : 'Parcel', // Can be extended for SEA shipments
+        descriptionOfGoods: invoiceRequest.verification?.listed_commodities || 
+                             (items.length > 0 ? items.map(item => item.commodity || item.name || item.description).join(', ') : 'General Goods'),
         dimensions: {
           length: dimensionValue,
           width: dimensionValue,
@@ -719,7 +795,7 @@ class EMpostAPIService {
           unit: 'CM'
         }
       },
-      items: items
+      items: shipmentItems
     };
     
     return shipmentData;

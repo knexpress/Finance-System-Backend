@@ -678,6 +678,31 @@ router.post('/:id/review', async (req, res) => {
       bookingSnapshot._id = bookingSnapshot._id.toString();
     }
     
+    // Create booking_data with all booking details EXCEPT identityDocuments
+    // This will be used for EMPOST API and other integrations
+    const bookingData = { ...bookingSnapshot };
+    
+    // Remove identityDocuments and related sensitive fields
+    if (bookingData.identityDocuments !== undefined) {
+      delete bookingData.identityDocuments;
+    }
+    if (bookingData.images !== undefined) {
+      delete bookingData.images;
+    }
+    if (bookingData.selfie !== undefined) {
+      delete bookingData.selfie;
+    }
+    
+    // Convert _id to string if present
+    if (bookingData._id) {
+      bookingData._id = bookingData._id.toString();
+    }
+    
+    // Ensure sender and receiver objects are included (they're needed for EMPOST)
+    bookingData.sender = sender;
+    bookingData.receiver = receiver;
+    bookingData.items = items;
+    
     // Extract insurance data with fallbacks (check both top-level and sender object)
     const insuredRaw = booking.insured ?? booking.insurance ?? booking.isInsured ?? booking.is_insured 
       ?? sender.insured ?? sender.insurance ?? sender.isInsured ?? sender.is_insured;
@@ -708,8 +733,11 @@ router.post('/:id/review', async (req, res) => {
       customerImage: booking.customerImage || booking.customer_image || '',
       customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
       
-      // Booking snapshot
+      // Booking snapshot (full snapshot for audit/debug)
       booking_snapshot: bookingSnapshot,
+      
+      // Complete booking data (excluding identityDocuments) for EMPOST API and integrations
+      booking_data: bookingData,
       
       // Delivery options (from booking sender and receiver)
       sender_delivery_option: sender.deliveryOption || booking.sender?.deliveryOption || undefined,

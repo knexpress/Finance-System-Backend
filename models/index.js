@@ -495,6 +495,12 @@ const invoiceRequestSchema = new mongoose.Schema({
     required: false,
   },
 
+  // Complete booking data (excluding identityDocuments) for EMPOST API and other integrations
+  booking_data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: false,
+  },
+
   // Identity documents and customer images
   identityDocuments: {
     type: mongoose.Schema.Types.Mixed,
@@ -702,7 +708,7 @@ const invoiceRequestSchema = new mongoose.Schema({
     },
     shipment_classification: {
       type: String,
-      enum: ['COMMERCIAL', 'PERSONAL', 'GENERAL'],
+      enum: ['FLOWMIC', 'COMMERCIAL', 'PERSONAL', 'GENERAL'],
       required: false,
     },
     weight_type: {

@@ -451,34 +451,34 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         console.log('✅ Invoice created:', invoice.invoice_id || invoice._id);
         createdInvoices.push(invoice);
 
-        // EMPOST API DISABLED
         // Integrate with EMpost API
-        // try {
-        //   // Populate invoice with client data for EMpost
-        //   const populatedInvoice = await Invoice.findById(invoice._id)
-        //     .populate('client_id', 'company_name contact_name email phone address city country');
-        //   
-        //   console.log('📦 Starting EMpost integration for CSV invoice:', invoice.invoice_id);
-        //   
-        //   // Create shipment in EMpost
-        //   const shipmentResult = await empostAPI.createShipment(populatedInvoice);
-        //   
-        //   if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-        //     // Update invoice with uhawb
-        //     invoice.empost_uhawb = shipmentResult.data.uhawb;
-        //     await invoice.save();
-        //     console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
-        //   }
-        //   
-        //   // Issue invoice in EMpost
-        //   await empostAPI.issueInvoice(populatedInvoice);
-        //   console.log('✅ EMpost integration completed successfully for CSV invoice');
-        //   
-        // } catch (empostError) {
-        //   // Log error but don't block invoice creation
-        //   console.error('❌ EMpost integration failed for CSV invoice (invoice creation will continue):', empostError.message);
-        //   console.error('Error details:', empostError.response?.data || empostError.message);
-        // }
+        try {
+          const empostAPI = require('../services/empost-api');
+          // Populate invoice with client data for EMpost
+          const populatedInvoice = await Invoice.findById(invoice._id)
+            .populate('client_id', 'company_name contact_name email phone address city country');
+          
+          console.log('📦 Starting EMpost integration for CSV invoice:', invoice.invoice_id);
+          
+          // Create shipment in EMpost
+          const shipmentResult = await empostAPI.createShipment(populatedInvoice);
+          
+          if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+            // Update invoice with uhawb
+            invoice.empost_uhawb = shipmentResult.data.uhawb;
+            await invoice.save();
+            console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
+          }
+          
+          // Issue invoice in EMpost
+          await empostAPI.issueInvoice(populatedInvoice);
+          console.log('✅ EMpost integration completed successfully for CSV invoice');
+          
+        } catch (empostError) {
+          // Log error but don't block invoice creation
+          console.error('❌ EMpost integration failed for CSV invoice (invoice creation will continue):', empostError.message);
+          console.error('Error details:', empostError.response?.data || empostError.message);
+        }
 
         // Create audit report for CSV-uploaded invoice - This happens immediately after invoice creation
         console.log('📊 Creating audit report for invoice:', invoice.invoice_id || invoice._id);
@@ -1131,6 +1131,7 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
         // Call EMPOST API to create shipment
         let uhawb = null;
         try {
+          const empostAPI = require('../services/empost-api');
           console.log(`📦 Creating shipment in EMPOST for AWB: ${shipmentData.trackingNumber || 'N/A'}`);
           
           const shipmentResult = await empostAPI.createShipmentFromData(shipmentData);
@@ -1157,6 +1158,7 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
         // We do NOT create Invoice documents in the database collection
         // NOTE: For historical uploads, we use ONLY data from CSV - NO automatic tax calculation
         try {
+          const empostAPI = require('../services/empost-api');
           // Extract invoice-related fields from CSV (use 0 for missing data - no business rules applied)
           const invoiceAmount = parseFloat(getColumnValue(row, ['invoice_amount', 'invoiceamount', 'amount', 'total_amount', 'totalamount']) || 0);
           const deliveryChargeValue = parseFloat(getColumnValue(row, ['delivery charge rate before discount', 'delivery charge', 'delivery_charge', 'deliverycharge', ' delivery charge rate before discount ']) || 0);
@@ -1201,8 +1203,6 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
               contact_name: customerName || 'N/A'
             }
           };
-
-          console.log(`📄 Issuing invoice in EMPOST for AWB: ${invoiceData.awb_number} (historical data - NOT creating database record)`);
           
           // Call EMPOST invoice API - this only sends data to external API, does NOT create database records
           const invoiceResult = await empostAPI.issueInvoice(invoiceData);

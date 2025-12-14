@@ -277,31 +277,23 @@ router.put('/:id/status', async (req, res) => {
 
     await shipmentRequest.save();
 
-    // EMPOST API DISABLED
-    // Update EMPOST shipment status if delivery_status or request_status changed
-    // const deliveryStatusChanged = delivery_status && delivery_status !== oldDeliveryStatus;
-    // const requestStatusChanged = request_status && request_status !== oldRequestStatus;
+    // Sync status to EMPOST if delivery_status or request_status changed
+    const deliveryStatusChanged = delivery_status && delivery_status !== oldDeliveryStatus;
+    const requestStatusChanged = request_status && request_status !== oldRequestStatus;
     
-    // if (deliveryStatusChanged || (requestStatusChanged && request_status === 'CANCELLED')) {
-    //   try {
-    //     const empostAPI = require('../services/empost-api');
-    //     const trackingNumber = shipmentRequest.awb_number || shipmentRequest.tracking_code || shipmentRequest.empost_uhawb;
-    //     
-    //     if (trackingNumber && trackingNumber !== 'N/A') {
-    //       const statusToUpdate = delivery_status || request_status;
-    //       console.log(`🔄 Updating EMPOST shipment status from unified request: ${trackingNumber} -> ${statusToUpdate}`);
-    //       
-    //       await empostAPI.updateShipmentStatus(trackingNumber, statusToUpdate, {
-    //         deliveryDate: statusToUpdate === 'DELIVERED' || statusToUpdate === 'COMPLETED' ? new Date() : undefined
-    //       });
-    //       
-    //       console.log('✅ EMPOST shipment status updated successfully');
-    //     }
-    //   } catch (empostError) {
-    //     console.error('❌ Failed to update EMPOST shipment status (non-critical):', empostError.message);
-    //     // Don't fail the status update if EMPOST fails
-    //   }
-    // }
+    if (deliveryStatusChanged || (requestStatusChanged && request_status === 'CANCELLED')) {
+      const { syncStatusToEMPost, getTrackingNumberFromShipmentRequest } = require('../utils/empost-status-sync');
+      const trackingNumber = getTrackingNumberFromShipmentRequest(shipmentRequest);
+      const statusToUpdate = delivery_status || request_status;
+      
+      await syncStatusToEMPost({
+        trackingNumber,
+        status: statusToUpdate,
+        additionalData: {
+          deliveryDate: statusToUpdate === 'DELIVERED' || statusToUpdate === 'COMPLETED' ? new Date() : undefined
+        }
+      });
+    }
 
     res.json({
       success: true,
@@ -333,28 +325,20 @@ router.put('/:id/delivery-status', async (req, res) => {
 
     await shipmentRequest.save();
 
-    // EMPOST API DISABLED
-    // Update EMPOST shipment status if delivery_status changed
-    // if (delivery_status && delivery_status !== oldDeliveryStatus) {
-    //   try {
-    //     const empostAPI = require('../services/empost-api');
-    //     const trackingNumber = shipmentRequest.awb_number || shipmentRequest.tracking_code || shipmentRequest.empost_uhawb;
-    //     
-    //     if (trackingNumber && trackingNumber !== 'N/A') {
-    //       console.log(`🔄 Updating EMPOST shipment delivery status from unified request: ${trackingNumber} -> ${delivery_status}`);
-    //       
-    //       await empostAPI.updateShipmentStatus(trackingNumber, delivery_status, {
-    //         deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
-    //         notes: notes || internal_notes
-    //       });
-    //       
-    //       console.log('✅ EMPOST shipment delivery status updated successfully');
-    //     }
-    //   } catch (empostError) {
-    //     console.error('❌ Failed to update EMPOST shipment delivery status (non-critical):', empostError.message);
-    //     // Don't fail the status update if EMPOST fails
-    //   }
-    // }
+    // Sync delivery status to EMPOST if changed
+    if (delivery_status && delivery_status !== oldDeliveryStatus) {
+      const { syncStatusToEMPost, getTrackingNumberFromShipmentRequest } = require('../utils/empost-status-sync');
+      const trackingNumber = getTrackingNumberFromShipmentRequest(shipmentRequest);
+      
+      await syncStatusToEMPost({
+        trackingNumber,
+        status: delivery_status,
+        additionalData: {
+          deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
+          notes: notes || internal_notes
+        }
+      });
+    }
 
     res.json({
       success: true,

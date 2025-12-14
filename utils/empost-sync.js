@@ -29,8 +29,7 @@ async function syncInvoiceWithEMPost({ invoiceId, requestId, reason }) {
     const context = reason ? ` (${reason})` : '';
     console.log(`[EMPOST SYNC] Creating/updating EMPOST shipment for invoice ${invoice.invoice_id || invoice._id}${context}`);
 
-    // Only create/update shipment in EMPOST when invoice is created
-    // Do NOT update when invoice status changes (remitted, collected, etc.)
+    // Create/update shipment in EMPOST when invoice is created or updated
     const shipmentResult = await empostAPI.createShipment(invoice);
 
     if (shipmentResult?.data?.uhawb && invoice.empost_uhawb !== shipmentResult.data.uhawb) {
