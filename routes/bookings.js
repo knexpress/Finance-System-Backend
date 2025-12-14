@@ -82,6 +82,110 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// Search AWB numbers by customer first name and last name
+router.post('/search-awb-by-name', auth, async (req, res) => {
+  try {
+    const { firstName, lastName } = req.body;
+
+    // Validate input
+    if (!firstName || !lastName || 
+        !firstName.trim() || !lastName.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'First name and last name are required'
+      });
+    }
+
+    const searchFirstName = firstName.trim().toLowerCase();
+    const searchLastName = lastName.trim().toLowerCase();
+    
+    // Escape special regex characters
+    const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escapedFirstName = escapeRegex(searchFirstName);
+    const escapedLastName = escapeRegex(searchLastName);
+    
+    // Build regex patterns for full name matching (handles both "First Last" and "Last First")
+    const fullNamePattern1 = new RegExp(`^${escapedFirstName}\\s+${escapedLastName}$`, 'i');
+    const fullNamePattern2 = new RegExp(`^${escapedLastName}\\s+${escapedFirstName}$`, 'i');
+    const firstNameRegex = new RegExp(`^${escapedFirstName}$`, 'i');
+    const lastNameRegex = new RegExp(`^${escapedLastName}$`, 'i');
+
+    // Build search query for MongoDB
+    // Use regex patterns for flexible matching
+    const nameQuery = {
+      $or: [
+        // Match customer_name field (handles both "First Last" and "Last First")
+        { customer_name: { $regex: fullNamePattern1 } },
+        { customer_name: { $regex: fullNamePattern2 } },
+        // Match customerName field
+        { customerName: { $regex: fullNamePattern1 } },
+        { customerName: { $regex: fullNamePattern2 } },
+        // Match name field
+        { name: { $regex: fullNamePattern1 } },
+        { name: { $regex: fullNamePattern2 } },
+        // Match sender.fullName
+        { 'sender.fullName': { $regex: fullNamePattern1 } },
+        { 'sender.fullName': { $regex: fullNamePattern2 } },
+        // Match sender.name
+        { 'sender.name': { $regex: fullNamePattern1 } },
+        { 'sender.name': { $regex: fullNamePattern2 } },
+        // Match nested sender object with firstName and lastName
+        {
+          'sender.firstName': firstNameRegex,
+          'sender.lastName': lastNameRegex
+        },
+        // Match customer.firstName and customer.lastName (if exists)
+        {
+          'customer.firstName': firstNameRegex,
+          'customer.lastName': lastNameRegex
+        }
+      ]
+    };
+
+    // Search in bookings collection
+    const bookings = await Booking.find(nameQuery)
+      .select('tracking_code awb awb_number referenceNumber')
+      .lean();
+
+    // Search in invoice requests collection
+    const invoiceRequests = await InvoiceRequest.find(nameQuery)
+      .select('tracking_code awb_number invoice_number')
+      .lean();
+
+    // Extract unique AWB numbers
+    const awbNumbers = new Set();
+
+    [...bookings, ...invoiceRequests].forEach(item => {
+      // Priority: tracking_code > awb_number > awb
+      const awb = item.tracking_code ||
+                  item.awb_number ||
+                  item.awb;
+      
+      if (awb && typeof awb === 'string' && awb.trim()) {
+        awbNumbers.add(awb.trim());
+      }
+    });
+
+    // Convert Set to Array and sort alphabetically
+    const uniqueAwbNumbers = Array.from(awbNumbers).sort();
+
+    res.json({
+      success: true,
+      data: {
+        awbNumbers: uniqueAwbNumbers
+      }
+    });
+
+  } catch (error) {
+    console.error('Error searching AWB by name:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to search for AWB numbers',
+      details: error.message
+    });
+  }
+});
+
 // Get all bookings (paginated, light payload)
 router.get('/', async (req, res) => {
   try {
