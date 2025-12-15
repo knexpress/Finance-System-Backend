@@ -216,8 +216,13 @@ router.get('/', async (req, res) => {
       // Extract agentName from sender object for easy access
       const agentName = booking.sender?.agentName || booking.agentName || null;
       
+      // Normalize review_status - ensure it's always present and properly formatted
+      const normalizedReviewStatus = booking.review_status || 'not reviewed';
+      
       return {
         ...booking,
+        // Ensure review_status is always present and normalized
+        review_status: normalizedReviewStatus,
         // Include OTP info at top level for easy access in manager dashboard
         otpInfo: otpInfo,
         // Include agentName at top level for easy access
@@ -292,16 +297,32 @@ router.get('/status/:reviewStatus', async (req, res) => {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
     const skip = (page - 1) * limit;
 
+    // Build query based on review status
+    // For "not reviewed", include bookings where review_status is null, undefined, or 'not reviewed'
+    let query = {};
+    if (reviewStatus === 'not reviewed' || reviewStatus === 'not_reviewed') {
+      query = {
+        $or: [
+          { review_status: 'not reviewed' },
+          { review_status: { $exists: false } },
+          { review_status: null },
+          { review_status: '' }
+        ]
+      };
+    } else {
+      query = { review_status: reviewStatus };
+    }
+
     // Use lean() to get plain JavaScript objects with all fields including OTP
-    const bookings = await Booking.find({ review_status: reviewStatus })
+    const bookings = await Booking.find(query)
       .select(HEAVY_FIELDS_PROJECTION)
       .lean()
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
-    const total = await Booking.countDocuments({ review_status: reviewStatus });
+    const total = await Booking.countDocuments(query);
     
-    // Format bookings to explicitly include OTP information
+    // Format bookings to explicitly include OTP information and review_status
     const formattedBookings = bookings.map(booking => {
       // Extract OTP from otpVerification object for easy access
       const otpInfo = {
@@ -314,8 +335,13 @@ router.get('/status/:reviewStatus', async (req, res) => {
       // Extract agentName from sender object for easy access
       const agentName = booking.sender?.agentName || booking.agentName || null;
       
+      // Normalize review_status - ensure it's always present and properly formatted
+      const normalizedReviewStatus = booking.review_status || 'not reviewed';
+      
       return {
         ...booking,
+        // Ensure review_status is always present and normalized
+        review_status: normalizedReviewStatus,
         otpInfo: otpInfo,
         // Include agentName at top level for easy access
         agentName: agentName,
