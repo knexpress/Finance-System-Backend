@@ -124,6 +124,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipment(invoice) {
+    // EMPOST API is disabled for testing
+    console.log('[EMPOST DISABLED] Skipping shipment creation in EMPOST');
+    return { data: { uhawb: 'N/A' } };
+    
     try {
       console.log('📦 Creating shipment in EMpost for invoice:', invoice.invoice_id);
       
@@ -157,6 +161,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipmentFromData(shipmentData) {
+    // EMPOST API is disabled for testing
+    console.log('[EMPOST DISABLED] Skipping shipment creation from data in EMPOST');
+    return { data: { uhawb: 'N/A' } };
+    
     try {
       console.log('📦 Creating shipment in EMpost from raw data:', shipmentData.trackingNumber);
       
@@ -187,6 +195,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipmentFromInvoiceRequest(invoiceRequest) {
+    // EMPOST API is disabled for testing
+    console.log('[EMPOST DISABLED] Skipping shipment creation from InvoiceRequest in EMPOST');
+    return { data: { uhawb: 'N/A' } };
+    
     try {
       console.log('📦 Creating shipment in EMpost from InvoiceRequest:', invoiceRequest.tracking_code || invoiceRequest.invoice_number);
       
@@ -222,6 +234,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost update response
    */
   async updateShipmentStatus(trackingNumber, status, additionalData = {}) {
+    // EMPOST API is disabled for testing
+    console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
+    return { success: true, message: 'EMPOST API disabled' };
+    
     try {
       console.log(`🔄 Updating EMPOST shipment status: ${trackingNumber} -> ${status}`);
       
@@ -273,11 +289,15 @@ class EMpostAPIService {
   }
 
   /**
-   * Issue an invoice in EMpost
-   * @param {Object} invoice - Invoice object
+   * Issue invoice in EMpost
+   * @param {Object} invoice - Invoice object with populated client_id
    * @returns {Promise<Object>} EMpost invoice response
    */
   async issueInvoice(invoice) {
+    // EMPOST API is disabled for testing
+    console.log('[EMPOST DISABLED] Skipping invoice issuance in EMPOST');
+    return { success: true, message: 'EMPOST API disabled' };
+    
     try {
       console.log('📄 Issuing invoice in EMpost for invoice:', invoice.invoice_id);
       
@@ -327,68 +347,63 @@ class EMpostAPIService {
       dimensionValue = 10; // Default to 10cm if calculation fails or is too small
     }
     
-    // Get COD amount if delivery type is COD
-    const codAmount = invoice.delivery_type === 'COD' ? parseFloat(invoice.total_amount?.toString() || 0) : 0;
+    // Determine shipping type (DOM or INT) based on origin and destination
+    const originCountry = this.extractCountryFromAddress(invoice.origin_place || '');
+    const destinationCountry = this.extractCountryFromAddress(invoice.destination_place || invoice.receiver_address || '');
+    const shippingType = (originCountry && destinationCountry && 
+      originCountry.toLowerCase() === destinationCountry.toLowerCase()) ? 'DOM' : 'INT';
     
-    // Ensure weight is always greater than 0
-    const totalWeight = invoice.weight_kg && invoice.weight_kg > 0 ? invoice.weight_kg : 0.1;
-    const itemCount = invoice.line_items?.length || 1;
-    const weightPerItem = Math.max(totalWeight / itemCount, 0.1); // Minimum 0.1 KG per item
-
-    // Map line items to EMpost items format
-    const items = (invoice.line_items || []).map((item, index) => ({
-      description: item.description || `Item ${index + 1}`,
-      countryOfOrigin: clientAddress.countryCode || 'AE', // Use sender's country
-      quantity: item.quantity || 1,
-      hsCode: '8504.40', // Default HS code for electronics/general goods
-      customsValue: {
-        currencyCode: 'AED',
-        amount: Math.max(parseFloat(item.total?.toString() || item.unit_price?.toString() || 0), 0),
-      },
-      weight: {
-        unit: 'KG',
-        value: weightPerItem, // Ensure weight is always > 0
-      },
-      dimensions: {
-        length: Math.max(dimensionValue, 1), // Minimum 1 CM
-        width: Math.max(dimensionValue, 1),
-        height: Math.max(dimensionValue, 1),
-        unit: 'CM',
-      },
-    }));
-
-    // If no items, create a default item
-    if (items.length === 0) {
-      items.push({
-        description: 'General Goods',
-        countryOfOrigin: clientAddress.countryCode || 'AE',
-        quantity: 1,
+    // Get product category from shipment type
+    const productCategory = invoice.line_items?.map(item => item.description).join(', ') || 'Electronics';
+    
+    // Get number of boxes
+    const numberOfBoxes = invoice.number_of_boxes || 1;
+    
+    // Build items array
+    const items = invoice.line_items?.map((item, index) => {
+      const itemWeight = (invoice.weight_kg || 0.1) / (invoice.line_items.length || 1);
+      const itemDimension = dimensionValue;
+      return {
+        description: item.description || `Item ${index + 1}`,
+        countryOfOrigin: 'AE',
+        quantity: item.quantity || 1,
         hsCode: '8504.40',
-        customsValue: {
-          currencyCode: 'AED',
-          amount: Math.max(parseFloat(invoice.total_amount?.toString() || 0), 0),
-        },
         weight: {
           unit: 'KG',
-          value: totalWeight, // Use the ensured weight (minimum 0.1)
+          value: Math.max(itemWeight, 0.1)
         },
         dimensions: {
-          length: Math.max(dimensionValue, 1), // Minimum 1 CM
-          width: Math.max(dimensionValue, 1),
-          height: Math.max(dimensionValue, 1),
-          unit: 'CM',
-        },
-      });
-    }
-
+          length: Math.max(itemDimension, 1),
+          width: Math.max(itemDimension, 1),
+          height: Math.max(itemDimension, 1),
+          unit: 'CM'
+        }
+      };
+    }) || [{
+      description: 'General Goods',
+      countryOfOrigin: 'AE',
+      quantity: 1,
+      hsCode: '8504.40',
+      weight: {
+        unit: 'KG',
+        value: invoice.weight_kg || 0.1
+      },
+      dimensions: {
+        length: dimensionValue,
+        width: dimensionValue,
+        height: dimensionValue,
+        unit: 'CM'
+      }
+    }];
+    
+    // Build shipment data
     const shipmentData = {
       trackingNumber: invoice.awb_number || invoice.invoice_id,
       uhawb: invoice.empost_uhawb && invoice.empost_uhawb !== 'N/A' ? invoice.empost_uhawb : '',
       sender: {
         name: client.contact_name || client.company_name || 'N/A',
-        email: client.email || 'N/A',
+        email: client.email || 'noreply@company.com',
         phone: client.phone || '+971500000000',
-        secondPhone: '',
         countryCode: clientAddress.countryCode || 'AE',
         state: clientAddress.state || '',
         postCode: clientAddress.postCode || '',
@@ -401,7 +416,6 @@ class EMpostAPIService {
         name: invoice.receiver_name || 'N/A',
         email: '',
         phone: invoice.receiver_phone || '+971500000000',
-        secondPhone: '',
         countryCode: receiverAddress.countryCode || 'AE',
         state: receiverAddress.state || '',
         postCode: receiverAddress.postCode || '',
@@ -413,50 +427,41 @@ class EMpostAPIService {
       details: {
         weight: {
           unit: 'KG',
-          value: Math.max(invoice.weight_kg || 0.1, 0.1), // Ensure minimum 0.1 KG
+          value: invoice.weight_kg || 0.1
         },
         declaredWeight: {
           unit: 'KG',
-          value: Math.max(invoice.weight_kg || 0.1, 0.1), // Ensure minimum 0.1 KG
+          value: invoice.weight_kg || 0.1
         },
-        cod: codAmount > 0 ? {
-          currencyCode: 'AED',
-          amount: codAmount,
-        } : undefined,
-        customs: undefined,
         deliveryCharges: {
           currencyCode: 'AED',
-          // For PH_TO_UAE we must not send shipping/base charge, only delivery charge
-          amount: isPhToUae
-            ? parseFloat(invoice.delivery_charge?.toString() || 0)
-            : parseFloat(invoice.amount?.toString() || 0), // Base amount without tax
+          amount: isPhToUae ? parseFloat(invoice.delivery_charge?.toString() || 0) : parseFloat(invoice.amount?.toString() || 0)
         },
-        numberOfPieces: invoice.line_items?.length || 1,
-        pickupDate: invoice.issue_date ? new Date(invoice.issue_date).toISOString() : new Date().toISOString(),
-        deliveryStatus: this.mapDeliveryStatus(invoice.status),
-        deliveryDate: invoice.due_date ? new Date(invoice.due_date).toISOString() : undefined,
+        numberOfPieces: numberOfBoxes,
+        pickupDate: new Date().toISOString(),
+        deliveryStatus: 'In Transit',
         deliveryAttempts: 0,
-        shippingType: 'DOM', // Default to Domestic
-        productCategory: 'Electronics', // Default category
-        productType: 'Parcel', // Default type
+        shippingType: shippingType,
+        productCategory: productCategory,
+        productType: 'Parcel',
         descriptionOfGoods: invoice.line_items?.map(item => item.description).join(', ') || 'General Goods',
         dimensions: {
           length: dimensionValue,
           width: dimensionValue,
           height: dimensionValue,
-          unit: 'CM',
-        },
+          unit: 'CM'
+        }
       },
-      items: items,
+      items: items
     };
-
+    
     // Remove undefined fields
     Object.keys(shipmentData.details).forEach(key => {
       if (shipmentData.details[key] === undefined) {
         delete shipmentData.details[key];
       }
     });
-
+    
     return shipmentData;
   }
 
@@ -474,7 +479,7 @@ class EMpostAPIService {
     const totalAmountIncludingTax = isPhToUae
       ? baseCharge + taxAmount
       : parseFloat(invoice.total_amount?.toString() || 0);
-
+    
     const invoiceData = {
       trackingNumber: invoice.awb_number || invoice.invoice_id,
       chargeableWeight: {
@@ -502,7 +507,7 @@ class EMpostAPIService {
         currencyCode: 'AED',
       },
     };
-
+    
     // Add tax as a separate charge if applicable
     if (invoice.tax_amount && parseFloat(invoice.tax_amount.toString()) > 0) {
       invoiceData.charges.push({
@@ -513,7 +518,7 @@ class EMpostAPIService {
         },
       });
     }
-
+    
     return invoiceData;
   }
 
@@ -534,7 +539,7 @@ class EMpostAPIService {
         countryCode: 'AE',
       };
     }
-
+    
     // Simple address parsing - can be enhanced
     const parts = address.split(',').map(p => p.trim());
     
@@ -607,8 +612,8 @@ class EMpostAPIService {
     const verificationVolumeCbm = invoiceRequest.verification?.volume_cbm 
       ? parseFloat(invoiceRequest.verification.volume_cbm.toString())
       : null;
-    const verificationTotalVm = invoiceRequest.verification?.total_vm 
-      ? parseFloat(invoiceRequest.verification.total_vm.toString())
+    const verificationTotalVm = invoiceRequest.verification?.total_vm
+        ? parseFloat(invoiceRequest.verification.total_vm.toString())
       : null;
     
     if (verificationVolumeCbm && verificationVolumeCbm > 0) {
@@ -619,12 +624,12 @@ class EMpostAPIService {
       dimensionValue = Math.cbrt(verificationTotalVm * 1000000);
     } else if (invoiceRequest.verification?.boxes && invoiceRequest.verification.boxes.length > 0) {
       // Calculate from verification boxes
-      const firstBox = invoiceRequest.verification.boxes[0];
-      if (firstBox.length && firstBox.width && firstBox.height) {
-        const length = parseFloat(firstBox.length.toString());
-        const width = parseFloat(firstBox.width.toString());
-        const height = parseFloat(firstBox.height.toString());
-        dimensionValue = Math.max(length, width, height, 1);
+        const firstBox = invoiceRequest.verification.boxes[0];
+        if (firstBox.length && firstBox.width && firstBox.height) {
+          const length = parseFloat(firstBox.length.toString());
+          const width = parseFloat(firstBox.width.toString());
+          const height = parseFloat(firstBox.height.toString());
+          dimensionValue = Math.max(length, width, height, 1);
       }
     } else if (invoiceRequest.volume_cbm) {
       const volumeCbm = parseFloat(invoiceRequest.volume_cbm.toString());
@@ -864,4 +869,3 @@ class EMpostAPIService {
 
 // Export singleton instance
 module.exports = new EMpostAPIService();
-

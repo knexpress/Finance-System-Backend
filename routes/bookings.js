@@ -1,6 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const { Booking, Employee, InvoiceRequest } = require('../models');
+const { Invoice } = require('../models/unified-schema');
 const { createNotificationsForDepartment } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
@@ -366,6 +367,417 @@ router.get('/status/:reviewStatus', async (req, res) => {
   } catch (error) {
     console.error('Error fetching bookings by status:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
+  }
+});
+
+// ========================================
+// CARGO STATUS MANAGEMENT ENDPOINTS
+// ========================================
+// These endpoints must be defined BEFORE /:id to ensure proper route matching
+
+// Valid shipment status values
+const VALID_SHIPMENT_STATUSES = [
+  'SHIPMENT_RECEIVED',
+  'SHIPMENT_PROCESSING',
+  'DEPARTED_FROM_MANILA',
+  'IN_TRANSIT_TO_DUBAI',
+  'ARRIVED_AT_DUBAI',
+  'SHIPMENT_CLEARANCE',
+  'OUT_FOR_DELIVERY',
+  'DELIVERED'
+];
+
+// GET /api/bookings/verified-invoices
+// Get all bookings that have verified/completed invoice requests (not rejected/cancelled)
+// This includes bookings even if invoice hasn't been generated yet
+// Shows bookings when invoice request is reviewed (has verification data) and not rejected
+router.get('/verified-invoices', auth, async (req, res) => {
+  try {
+    // Find all invoice requests that have been reviewed and not rejected/cancelled
+    // Criteria:
+    // 1. Status is VERIFIED or COMPLETED, OR
+    // 2. Has verification data (verification.verified_at is set) and status is not CANCELLED
+    // This ensures bookings show up as soon as verification data is added (reviewed)
+    const verifiedInvoiceRequests = await InvoiceRequest.find({
+      $and: [
+        { status: { $ne: 'CANCELLED' } }, // Not cancelled/rejected
+        {
+          $or: [
+            { status: { $in: ['VERIFIED', 'COMPLETED'] } }, // Status is verified/completed
+            { 'verification.verified_at': { $exists: true, $ne: null } } // Has verification data (reviewed)
+          ]
+        }
+      ]
+    }).lean();
+
+    if (verifiedInvoiceRequests.length === 0) {
+      return res.json({
+        success: true,
+        data: []
+      });
+    }
+
+    // Get all invoice request IDs
+    const invoiceRequestIds = verifiedInvoiceRequests.map(req => req._id);
+
+    // Find all invoices that reference these invoice requests (optional - invoice may not exist yet)
+    const invoices = await Invoice.find({
+      request_id: { $in: invoiceRequestIds }
+    }).lean();
+
+    // Create a map of invoice request ID to invoice (if invoice exists)
+    const invoiceMap = new Map();
+    invoices.forEach(invoice => {
+      const requestId = invoice.request_id?.toString();
+      if (requestId) {
+        invoiceMap.set(requestId, invoice);
+      }
+    });
+
+    // Find bookings by their converted_to_invoice_request_id that match verified invoice requests
+    // Include ALL bookings with verified/completed invoice requests, even if invoice doesn't exist yet
+    const bookings = await Booking.find({
+      converted_to_invoice_request_id: { $in: invoiceRequestIds }
+    }).lean();
+
+    // Format response with invoice information
+    const formattedBookings = bookings.map(booking => {
+      const invoiceRequestId = booking.converted_to_invoice_request_id?.toString();
+      const invoice = invoiceRequestId ? invoiceMap.get(invoiceRequestId) : null;
+      const invoiceRequest = verifiedInvoiceRequests.find(
+        req => req._id.toString() === invoiceRequestId
+      );
+
+      return {
+        _id: booking._id,
+        tracking_code: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
+        awb_number: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
+        customer_name: booking.customer_name || booking.sender?.fullName || null,
+        receiver_name: booking.receiver_name || booking.receiver?.fullName || null,
+        origin_place: booking.origin_place || booking.origin || null,
+        destination_place: booking.destination_place || booking.destination || null,
+        shipment_status: booking.shipment_status || null,
+        batch_no: booking.batch_no || null,
+        invoice_id: invoice?._id || null,
+        invoice_number: invoice?.invoice_id || invoiceRequest?.invoice_number || null,
+        createdAt: booking.createdAt,
+        updatedAt: booking.updatedAt
+      };
+    });
+
+    res.json({
+      success: true,
+      data: formattedBookings
+    });
+  } catch (error) {
+    console.error('Error fetching verified invoices bookings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch verified invoices bookings',
+      details: error.message
+    });
+  }
+});
+
+// PUT /api/bookings/batch/shipment-status
+// Update shipment status for multiple bookings at once (batch update)
+// Frontend calls this when 2+ bookings are selected
+router.put('/batch/shipment-status', auth, async (req, res) => {
+  try {
+    const { booking_ids, shipment_status, batch_no, updated_by, notes } = req.body;
+
+    // Validate booking_ids - must be array with at least 2 items
+    if (!Array.isArray(booking_ids) || booking_ids.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'booking_ids must be an array with at least 2 items'
+      });
+    }
+
+    // Validate shipment_status is required
+    if (!shipment_status) {
+      return res.status(400).json({
+        success: false,
+        error: 'shipment_status is required'
+      });
+    }
+
+    // Validate shipment_status value
+    if (!VALID_SHIPMENT_STATUSES.includes(shipment_status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid shipment_status. Must be one of: ${VALID_SHIPMENT_STATUSES.join(', ')}`
+      });
+    }
+
+    // Find all bookings to verify they exist
+    const bookings = await Booking.find({ _id: { $in: booking_ids } });
+    
+    // Check if all bookings were found
+    if (bookings.length !== booking_ids.length) {
+      return res.status(404).json({
+        success: false,
+        error: `Some bookings not found. Found: ${bookings.length}, Requested: ${booking_ids.length}`
+      });
+    }
+
+    // Get updated_by from request body or default to user email or 'system'
+    const updatedByValue = updated_by || req.user?.email || 'system';
+
+    // Prepare bulk update operations
+    const updateOps = booking_ids.map(bookingId => ({
+      updateOne: {
+        filter: { _id: bookingId },
+        update: {
+          $set: {
+            shipment_status: shipment_status,
+            updatedAt: new Date(),
+            ...(batch_no && { batch_no: batch_no })
+          },
+          $push: {
+            shipment_status_history: {
+              status: shipment_status,
+              updated_at: new Date(),
+              updated_by: updatedByValue,
+              notes: notes || ''
+            }
+          }
+        }
+      }
+    }));
+
+    // Execute bulk update
+    const result = await Booking.bulkWrite(updateOps, { ordered: false });
+
+    // Fetch updated bookings with full details for response
+    const updatedBookings = await Booking.find({
+      _id: { $in: booking_ids }
+    }).select('_id tracking_code awb_number customer_name shipment_status batch_no updatedAt').lean();
+
+    res.json({
+      success: true,
+      data: {
+        updated_count: result.modifiedCount,
+        bookings: updatedBookings.map(booking => ({
+          _id: booking._id,
+          tracking_code: booking.tracking_code || booking.awb_number || null,
+          shipment_status: booking.shipment_status,
+          batch_no: booking.batch_no,
+          updatedAt: booking.updatedAt
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Error updating batch shipment status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update batch shipment status',
+      details: error.message
+    });
+  }
+});
+
+// POST /api/bookings/batch/create
+// Create a batch and assign multiple bookings to it
+router.post('/batch/create', auth, async (req, res) => {
+  try {
+    const { batch_no, booking_ids, created_by, notes } = req.body;
+
+    // Validate required fields
+    if (!batch_no || !batch_no.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'batch_no is required and cannot be empty'
+      });
+    }
+
+    if (!Array.isArray(booking_ids) || booking_ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'booking_ids must be a non-empty array'
+      });
+    }
+
+    // Check if all booking IDs exist
+    const existingBookings = await Booking.find({
+      _id: { $in: booking_ids }
+    }).select('_id').lean();
+
+    if (existingBookings.length !== booking_ids.length) {
+      const existingIds = existingBookings.map(b => b._id.toString());
+      const missingIds = booking_ids.filter(id => !existingIds.includes(id.toString()));
+      return res.status(404).json({
+        success: false,
+        error: `Some booking IDs not found: ${missingIds.join(', ')}`
+      });
+    }
+
+    // Update all bookings with the batch_no
+    const updateOps = booking_ids.map(bookingId => ({
+      updateOne: {
+        filter: { _id: bookingId },
+        update: {
+          $set: {
+            batch_no: batch_no,
+            updatedAt: new Date()
+          }
+        }
+      }
+    }));
+
+    const result = await Booking.bulkWrite(updateOps, { ordered: false });
+
+    // Fetch updated bookings
+    const updatedBookings = await Booking.find({
+      _id: { $in: booking_ids }
+    }).select('_id batch_no').lean();
+
+    res.json({
+      success: true,
+      data: {
+        batch_no: batch_no,
+        booking_count: result.modifiedCount,
+        bookings: updatedBookings.map(booking => ({
+          _id: booking._id,
+          batch_no: booking.batch_no
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Error creating batch:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create batch',
+      details: error.message
+    });
+  }
+});
+
+// GET /api/bookings/batch/:batchNo
+// Get all bookings assigned to a specific batch number
+router.get('/batch/:batchNo', auth, async (req, res) => {
+  try {
+    const { batchNo } = req.params;
+
+    if (!batchNo || !batchNo.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'batchNo is required'
+      });
+    }
+
+    // Find all bookings with the specified batch_no
+    const bookings = await Booking.find({
+      batch_no: batchNo.trim()
+    })
+      .select(HEAVY_FIELDS_PROJECTION)
+      .lean()
+      .sort({ createdAt: -1 });
+
+    // Format bookings
+    const formattedBookings = bookings.map(booking => ({
+      _id: booking._id,
+      tracking_code: booking.tracking_code || booking.awb_number || null,
+      customer_name: booking.customer_name || booking.sender?.fullName || null,
+      shipment_status: booking.shipment_status || null,
+      batch_no: booking.batch_no || null,
+      createdAt: booking.createdAt,
+      updatedAt: booking.updatedAt
+    }));
+
+    res.json({
+      success: true,
+      data: formattedBookings
+    });
+  } catch (error) {
+    console.error('Error fetching bookings by batch:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch bookings by batch',
+      details: error.message
+    });
+  }
+});
+
+// PUT /api/bookings/:id/shipment-status
+// Update the shipment status for a single booking
+// Frontend calls this when exactly 1 booking is selected
+router.put('/:id/shipment-status', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { shipment_status, updated_by, notes } = req.body;
+
+    // Validate shipment_status is required
+    if (!shipment_status) {
+      return res.status(400).json({
+        success: false,
+        error: 'shipment_status is required'
+      });
+    }
+
+    // Validate shipment_status value
+    if (!VALID_SHIPMENT_STATUSES.includes(shipment_status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid shipment_status. Must be one of: ${VALID_SHIPMENT_STATUSES.join(', ')}`
+      });
+    }
+
+    // Find booking
+    const booking = await Booking.findById(id);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+
+    // Get updated_by from request body or default to user email or 'system'
+    const updatedByValue = updated_by || req.user?.email || 'system';
+
+    // Update shipment status
+    booking.shipment_status = shipment_status;
+
+    // Add entry to shipment_status_history
+    if (!booking.shipment_status_history) {
+      booking.shipment_status_history = [];
+    }
+    booking.shipment_status_history.push({
+      status: shipment_status,
+      updated_at: new Date(),
+      updated_by: updatedByValue,
+      notes: notes || ''
+    });
+
+    // Update updatedAt timestamp
+    booking.updatedAt = new Date();
+
+    await booking.save();
+
+    // Populate booking to get full details
+    const populatedBooking = await Booking.findById(id)
+      .select('_id tracking_code awb_number customer_name shipment_status batch_no shipment_status_history updatedAt')
+      .lean();
+
+    res.json({
+      success: true,
+      data: {
+        _id: populatedBooking._id,
+        tracking_code: populatedBooking.tracking_code || populatedBooking.awb_number || null,
+        customer_name: populatedBooking.customer_name || null,
+        shipment_status: populatedBooking.shipment_status,
+        batch_no: populatedBooking.batch_no || null,
+        shipment_status_history: populatedBooking.shipment_status_history || [],
+        updatedAt: populatedBooking.updatedAt
+      }
+    });
+  } catch (error) {
+    console.error('Error updating booking shipment status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update booking shipment status',
+      details: error.message
+    });
   }
 });
 

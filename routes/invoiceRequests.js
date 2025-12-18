@@ -510,21 +510,21 @@ router.put('/:id/verification', async (req, res) => {
     if (verificationData.boxes !== undefined) {
       if (Array.isArray(verificationData.boxes) && verificationData.boxes.length > 0) {
         // Process boxes if provided (for backward compatibility)
-        invoiceRequest.verification.boxes = verificationData.boxes.map(box => {
-          // Force GENERAL for PH_TO_UAE, otherwise normalize provided classification
-          const normalizedClassification = isPhToUae ? 'GENERAL' : normalizeClass(box.classification);
-          
-          return {
-            items: box.items || '',
-            quantity: box.quantity,
-            length: toDecimal128(box.length),
-            width: toDecimal128(box.width),
-            height: toDecimal128(box.height),
-            vm: toDecimal128(box.vm),
+      invoiceRequest.verification.boxes = verificationData.boxes.map(box => {
+        // Force GENERAL for PH_TO_UAE, otherwise normalize provided classification
+        const normalizedClassification = isPhToUae ? 'GENERAL' : normalizeClass(box.classification);
+        
+        return {
+          items: box.items || '',
+          quantity: box.quantity,
+          length: toDecimal128(box.length),
+          width: toDecimal128(box.width),
+          height: toDecimal128(box.height),
+          vm: toDecimal128(box.vm),
             classification: normalizedClassification,
-            shipment_classification: isPhToUae ? 'GENERAL' : normalizedClassification
-          };
-        });
+          shipment_classification: isPhToUae ? 'GENERAL' : normalizedClassification
+        };
+      });
       } else {
         // Empty array - set to empty array
         invoiceRequest.verification.boxes = [];
@@ -545,7 +545,7 @@ router.put('/:id/verification', async (req, res) => {
       console.log('✅ PH_TO_UAE route detected - classification set to GENERAL');
     } else if (isUaeToPh) {
       // UAE_TO_PH: Must be FLOWMIC or COMMERCIAL
-      if (verificationData.shipment_classification !== undefined) {
+    if (verificationData.shipment_classification !== undefined) {
         const normalizedClass = normalizeClass(verificationData.shipment_classification);
         if (normalizedClass === 'FLOWMIC' || normalizedClass === 'COMMERCIAL') {
           invoiceRequest.verification.shipment_classification = normalizedClass;
@@ -608,7 +608,7 @@ router.put('/:id/verification', async (req, res) => {
           success: false,
           error: 'chargeable_weight must be a positive number greater than 0'
         });
-      }
+    }
     } else {
       // Auto-calculate: chargeable_weight = max(actual_weight, volumetric_weight)
       chargeableWeight = Math.max(actualWeight, volumetricWeight);
@@ -635,10 +635,10 @@ router.put('/:id/verification', async (req, res) => {
     // Auto-determine weight_type based on actual_weight and volumetric_weight comparison
     // weight_type = 'ACTUAL' if actual_weight >= volumetric_weight, else 'VOLUMETRIC'
     if (actualWeight >= volumetricWeight) {
-      invoiceRequest.verification.weight_type = 'ACTUAL';
-    } else {
-      invoiceRequest.verification.weight_type = 'VOLUMETRIC';
-    }
+        invoiceRequest.verification.weight_type = 'ACTUAL';
+      } else {
+        invoiceRequest.verification.weight_type = 'VOLUMETRIC';
+      }
     console.log(`✅ Auto-determined weight type: ${invoiceRequest.verification.weight_type} (Actual: ${actualWeight} kg, Volumetric: ${volumetricWeight} kg, Chargeable: ${chargeableWeight} kg)`);
 
     // Handle number_of_boxes (simple input, default 1, must be >= 1)

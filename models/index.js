@@ -955,6 +955,49 @@ const bookingSchema = new mongoose.Schema({
     required: false,
   },
   
+  // Cargo Status Management
+  shipment_status: {
+    type: String,
+    enum: [
+      'SHIPMENT_RECEIVED',
+      'SHIPMENT_PROCESSING',
+      'DEPARTED_FROM_MANILA',
+      'IN_TRANSIT_TO_DUBAI',
+      'ARRIVED_AT_DUBAI',
+      'SHIPMENT_CLEARANCE',
+      'OUT_FOR_DELIVERY',
+      'DELIVERED'
+    ],
+    default: null,
+    required: false,
+  },
+  
+  batch_no: {
+    type: String,
+    default: null,
+    required: false,
+  },
+  
+  shipment_status_history: [{
+    status: {
+      type: String,
+      required: true,
+    },
+    updated_at: {
+      type: Date,
+      required: true,
+      default: Date.now,
+    },
+    updated_by: {
+      type: String,
+      required: true,
+    },
+    notes: {
+      type: String,
+      required: false,
+    },
+  }],
+  
   // All other fields from existing Bookings collection are allowed
 }, {
   timestamps: true,
@@ -963,6 +1006,8 @@ const bookingSchema = new mongoose.Schema({
 
 bookingSchema.index({ review_status: 1 });
 bookingSchema.index({ createdAt: -1 });
+bookingSchema.index({ shipment_status: 1 });
+bookingSchema.index({ batch_no: 1 });
 
 const Booking = mongoose.models.Booking || mongoose.model('Booking', bookingSchema);
 
