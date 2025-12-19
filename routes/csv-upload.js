@@ -65,11 +65,54 @@ function getColumnValue(row, possibleNames) {
   return null;
 }
 
+// Memory management utilities
+function getMemoryUsage() {
+  const used = process.memoryUsage();
+  return {
+    heapUsed: Math.round(used.heapUsed / 1024 / 1024),
+    heapTotal: Math.round(used.heapTotal / 1024 / 1024),
+    rss: Math.round(used.rss / 1024 / 1024),
+    external: Math.round(used.external / 1024 / 1024)
+  };
+}
+
+function logMemoryUsage(label = '') {
+  const mem = getMemoryUsage();
+  console.log(`💾 Memory ${label}: Heap ${mem.heapUsed}MB/${mem.heapTotal}MB, RSS ${mem.rss}MB, External ${mem.external}MB`);
+  return mem;
+}
+
+function forceGarbageCollection() {
+  if (global.gc) {
+    global.gc();
+    return true;
+  }
+  return false;
+}
+
+// Check memory threshold and cleanup if needed
+async function checkMemoryThreshold(thresholdMB = 3000) {
+  const mem = getMemoryUsage();
+  if (mem.heapUsed > thresholdMB) {
+    console.warn(`⚠️ Memory usage high (${mem.heapUsed}MB), forcing cleanup...`);
+    forceGarbageCollection();
+    // Wait a bit for GC to complete
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const afterMem = getMemoryUsage();
+    console.log(`✅ After cleanup: ${afterMem.heapUsed}MB`);
+    return afterMem;
+  }
+  return mem;
+}
+
 // Helper function to parse CSV file and normalize column names
+// Optimized to process in batches to reduce memory usage
 function parseCSV(buffer) {
   return new Promise((resolve, reject) => {
     const results = [];
     const readable = Readable.from(buffer);
+    let firstRow = true;
+    let columnNames = [];
     
     readable
       .pipe(csv())
@@ -85,16 +128,69 @@ function parseCSV(buffer) {
           }
         }
         results.push(normalizedData);
+        
+        // Store column names from first row
+        if (firstRow) {
+          columnNames = Object.keys(normalizedData);
+          firstRow = false;
+        }
       })
       .on('end', () => {
-        if (results.length > 0) {
+        if (columnNames.length > 0) {
           // Log available columns from first row
-          console.log('📋 Available columns in CSV:', Object.keys(results[0]));
+          console.log('📋 Available columns in CSV:', columnNames);
         }
+        // Clear buffer reference immediately
+        readable.destroy();
         resolve(results);
       })
-      .on('error', (error) => reject(error));
+      .on('error', (error) => {
+        readable.destroy();
+        reject(error);
+      });
   });
+}
+
+// Helper function to process CSV in batches to reduce memory usage
+async function processCSVInBatches(csvData, batchSize, processor) {
+  const totalRows = csvData.length;
+  const batches = Math.ceil(totalRows / batchSize);
+  const results = {
+    createdInvoices: [],
+    createdAssignments: [],
+    auditReportsCreated: [],
+    errors: []
+  };
+  
+  console.log(`📦 Processing ${totalRows} rows in ${batches} batches of ${batchSize} rows each`);
+  
+  for (let batchIndex = 0; batchIndex < batches; batchIndex++) {
+    const start = batchIndex * batchSize;
+    const end = Math.min(start + batchSize, totalRows);
+    const batch = csvData.slice(start, end);
+    
+    console.log(`\n🔄 Processing batch ${batchIndex + 1}/${batches} (rows ${start + 1}-${end})`);
+    
+    // Process this batch
+    const batchResults = await processor(batch, start);
+    
+    // Merge results
+    results.createdInvoices.push(...(batchResults.createdInvoices || []));
+    results.createdAssignments.push(...(batchResults.createdAssignments || []));
+    results.auditReportsCreated.push(...(batchResults.auditReportsCreated || []));
+    results.errors.push(...(batchResults.errors || []));
+    
+    // Force garbage collection hint (if available)
+    if (global.gc) {
+      global.gc();
+    }
+    
+    // Log memory usage
+    const used = process.memoryUsage();
+    console.log(`💾 Memory usage: ${Math.round(used.heapUsed / 1024 / 1024)}MB / ${Math.round(used.heapTotal / 1024 / 1024)}MB`);
+  }
+  
+  return results;
 }
 
 // CSV Upload endpoint - creates invoices and delivery assignments
@@ -109,9 +205,20 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
 
     console.log('📄 Processing CSV file:', req.file.originalname);
     console.log('📊 File size:', req.file.size, 'bytes');
+    
+    // Log initial memory
+    logMemoryUsage('(before parsing)');
 
     // Parse CSV file
     const csvData = await parseCSV(req.file.buffer);
+    
+    // Clear file buffer immediately to free memory
+    req.file.buffer = null;
+    delete req.file.buffer;
+    
+    // Force garbage collection after parsing
+    forceGarbageCollection();
+    logMemoryUsage('(after parsing)');
     
     if (!csvData || csvData.length === 0) {
       return res.status(400).json({
@@ -122,15 +229,31 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
 
     console.log('✅ Parsed CSV rows:', csvData.length);
 
+    // Process in batches to reduce memory usage
+    const BATCH_SIZE = 50; // Process 50 rows at a time
     const createdInvoices = [];
     const createdAssignments = [];
     const auditReportsCreated = [];
     const errors = [];
 
-    // Process each row
-    for (let i = 0; i < csvData.length; i++) {
-      const row = csvData[i];
-      const rowNumber = i + 2; // +2 because first row is header, and arrays are 0-indexed
+    // Process CSV in batches
+    const totalRows = csvData.length;
+    const batches = Math.ceil(totalRows / BATCH_SIZE);
+    
+    console.log(`📦 Processing ${totalRows} rows in ${batches} batches of ${BATCH_SIZE} rows each`);
+    
+    for (let batchIndex = 0; batchIndex < batches; batchIndex++) {
+      const start = batchIndex * BATCH_SIZE;
+      const end = Math.min(start + BATCH_SIZE, totalRows);
+      const batch = csvData.slice(start, end);
+      
+      console.log(`\n🔄 Processing batch ${batchIndex + 1}/${batches} (rows ${start + 1}-${end})`);
+      
+      // Process each row in this batch
+      for (let i = 0; i < batch.length; i++) {
+        const globalIndex = start + i;
+        const row = batch[i];
+        const rowNumber = globalIndex + 2; // +2 because first row is header, and arrays are 0-indexed
 
       try {
         console.log(`\n📝 Processing row ${rowNumber}:`, row);
@@ -698,13 +821,33 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           error: rowError.message,
           data: row
         });
+        }
       }
+      
+      // Clear processed batch from memory aggressively
+      batch.length = 0;
+      
+      // Force garbage collection after each batch
+      forceGarbageCollection();
+      
+      // Check memory threshold and cleanup if needed
+      await checkMemoryThreshold(3000);
+      
+      // Log memory usage after each batch
+      logMemoryUsage(`(after batch ${batchIndex + 1})`);
     }
 
+    // Clear CSV data from memory aggressively
+    csvData.length = 0;
+    
+    // Final garbage collection
+    forceGarbageCollection();
+    logMemoryUsage('(after all batches)');
+    
     // Log summary
     console.log('\n===============================');
     console.log('📊 CSV Processing Summary:');
-    console.log(`  Total rows processed: ${csvData.length}`);
+    console.log(`  Total rows processed: ${totalRows}`);
     console.log(`  ✅ Invoices created: ${createdInvoices.length}`);
     console.log(`  📝 Audit reports created: ${auditReportsCreated.length}`);
     console.log(`  🚚 Delivery assignments created: ${createdAssignments.length}`);
@@ -716,7 +859,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
       success: true,
       message: 'CSV processing completed',
       summary: {
-        total_rows: csvData.length,
+        total_rows: totalRows,
         invoices_created: createdInvoices.length,
         audit_reports_created: auditReportsCreated.length,
         assignments_created: createdAssignments.length,
@@ -743,6 +886,17 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
 
   } catch (error) {
     console.error('❌ Error processing CSV upload:', error);
+    
+    // Aggressive cleanup on error
+    if (req.file && req.file.buffer) {
+      req.file.buffer = null;
+      delete req.file.buffer;
+    }
+    
+    // Force garbage collection on error
+    forceGarbageCollection();
+    logMemoryUsage('(after error)');
+    
     res.status(500).json({
       success: false,
       error: 'Failed to process CSV file',
@@ -1034,9 +1188,20 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
 
     console.log('📄 Processing historical CSV file:', uploadedFile.originalname);
     console.log('📊 File size:', uploadedFile.size, 'bytes');
+    
+    // Log initial memory
+    logMemoryUsage('(before parsing)');
 
     // Parse CSV file
     const csvData = await parseCSV(uploadedFile.buffer);
+    
+    // Clear file buffer immediately to free memory
+    uploadedFile.buffer = null;
+    delete uploadedFile.buffer;
+    
+    // Force garbage collection after parsing
+    forceGarbageCollection();
+    logMemoryUsage('(after parsing)');
     
     if (!csvData || csvData.length === 0) {
       return res.status(400).json({
@@ -1076,10 +1241,25 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
       }
     }
 
-    // Process each row
-    for (let i = 0; i < csvData.length; i++) {
-      const row = csvData[i];
-      const rowNumber = i + 2; // +2 because first row is header, and arrays are 0-indexed
+    // Process CSV in batches to reduce memory usage
+    const BATCH_SIZE = 50; // Process 50 rows at a time
+    const totalRows = csvData.length;
+    const batches = Math.ceil(totalRows / BATCH_SIZE);
+    
+    console.log(`📦 Processing ${totalRows} rows in ${batches} batches of ${BATCH_SIZE} rows each`);
+    
+    for (let batchIndex = 0; batchIndex < batches; batchIndex++) {
+      const start = batchIndex * BATCH_SIZE;
+      const end = Math.min(start + BATCH_SIZE, totalRows);
+      const batch = csvData.slice(start, end);
+      
+      console.log(`\n🔄 Processing batch ${batchIndex + 1}/${batches} (rows ${start + 1}-${end})`);
+      
+      // Process each row in this batch
+      for (let i = 0; i < batch.length; i++) {
+        const globalIndex = start + i;
+        const row = batch[i];
+        const rowNumber = globalIndex + 2; // +2 because first row is header, and arrays are 0-indexed
 
       try {
         console.log(`\n📝 Processing row ${rowNumber}`);
@@ -1297,7 +1477,27 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
         });
         summary.errors++;
       }
+      }
+      
+      // Clear processed batch from memory aggressively
+      batch.length = 0;
+      
+      // Force garbage collection after each batch
+      forceGarbageCollection();
+      
+      // Check memory threshold and cleanup if needed
+      await checkMemoryThreshold(3000);
+      
+      // Log memory usage after each batch
+      logMemoryUsage(`(after batch ${batchIndex + 1})`);
     }
+
+    // Clear CSV data from memory aggressively
+    csvData.length = 0;
+    
+    // Final garbage collection
+    forceGarbageCollection();
+    logMemoryUsage('(after all batches)');
 
     // Log summary
     console.log('\n===============================');
@@ -1320,6 +1520,18 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
 
   } catch (error) {
     console.error('❌ Error processing historical CSV upload:', error);
+    
+    // Aggressive cleanup on error
+    const uploadedFile = req.files?.csvFile?.[0] || req.files?.file?.[0] || req.file;
+    if (uploadedFile && uploadedFile.buffer) {
+      uploadedFile.buffer = null;
+      delete uploadedFile.buffer;
+    }
+    
+    // Force garbage collection on error
+    forceGarbageCollection();
+    logMemoryUsage('(after error)');
+    
     res.status(500).json({
       success: false,
       error: 'Failed to process historical CSV file',

@@ -78,33 +78,73 @@ const normalizeInvoiceRequest = (request) => {
   return obj;
 };
 
-// Get all invoice requests
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 500;
+
+// Get all invoice requests with pagination
 router.get('/', async (req, res) => {
   try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const skip = (page - 1) * limit;
+    
+    // Get total count first
+    const total = await InvoiceRequest.countDocuments();
+    
     const invoiceRequests = await InvoiceRequest.find()
       .populate('created_by_employee_id')
       .populate('assigned_to_employee_id')
-      .sort({ createdAt: -1 });
-    res.json(invoiceRequests.map(normalizeInvoiceRequest));
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+    
+    res.json({
+      success: true,
+      data: invoiceRequests.map(normalizeInvoiceRequest),
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
+    });
   } catch (error) {
     console.error('Error fetching invoice requests:', error);
     res.status(500).json({ error: 'Failed to fetch invoice requests' });
   }
 });
 
-// Get invoice requests by status
+// Get invoice requests by status (with pagination)
 router.get('/status/:status', async (req, res) => {
   try {
     const { status } = req.params;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const skip = (page - 1) * limit;
+    
+    // Get total count first
+    const total = await InvoiceRequest.countDocuments({ status });
+    
     const invoiceRequests = await InvoiceRequest.find({ status })
       .populate('created_by_employee_id')
       .populate('assigned_to_employee_id')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
     
     // Convert Decimal128 fields to numbers for proper JSON serialization
     const processedRequests = invoiceRequests.map(normalizeInvoiceRequest);
 
-    res.json(processedRequests);
+    res.json({
+      success: true,
+      data: processedRequests,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
+    });
   } catch (error) {
     console.error('Error fetching invoice requests by status:', error);
     res.status(500).json({ error: 'Failed to fetch invoice requests' });
@@ -115,11 +155,30 @@ router.get('/status/:status', async (req, res) => {
 router.get('/delivery-status/:deliveryStatus', async (req, res) => {
   try {
     const { deliveryStatus } = req.params;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const skip = (page - 1) * limit;
+    
+    // Get total count first
+    const total = await InvoiceRequest.countDocuments({ delivery_status: deliveryStatus });
+    
     const invoiceRequests = await InvoiceRequest.find({ delivery_status: deliveryStatus })
       .populate('created_by_employee_id')
       .populate('assigned_to_employee_id')
-      .sort({ createdAt: -1 });
-    res.json(invoiceRequests.map(normalizeInvoiceRequest));
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+    
+    res.json({
+      success: true,
+      data: invoiceRequests.map(normalizeInvoiceRequest),
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
+    });
   } catch (error) {
     console.error('Error fetching invoice requests by delivery status:', error);
     res.status(500).json({ error: 'Failed to fetch invoice requests' });
@@ -663,6 +722,36 @@ router.put('/:id/verification', async (req, res) => {
       console.log(`✅ Updated service_code from verification: ${verificationData.service_code}`);
     }
 
+    // Handle insurance and declared_value
+    // For UAE_TO_PINAS (UAE_TO_PH) services with insured = true, declared_value is required
+    if (verificationData.insured !== undefined) {
+      invoiceRequest.verification.insured = verificationData.insured === true || verificationData.insured === 'true';
+    }
+    
+    if (verificationData.declared_value !== undefined && verificationData.declared_value !== null && verificationData.declared_value !== '') {
+      const declaredValueNum = parseFloat(verificationData.declared_value);
+      if (isNaN(declaredValueNum) || declaredValueNum < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'declared_value must be a positive number'
+        });
+      }
+      invoiceRequest.verification.declared_value = toDecimal128(declaredValueNum);
+    }
+
+    // Validate: If insured = true and service is UAE_TO_PINAS, declared_value must be provided and > 0
+    const isInsured = invoiceRequest.verification.insured === true;
+    if (isInsured && isUaeToPh) {
+      const declaredValue = invoiceRequest.verification.declared_value;
+      if (!declaredValue || parseFloat(declaredValue.toString()) <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'declared_value is required and must be greater than 0 when insured is true for UAE_TO_PINAS services'
+        });
+      }
+      console.log(`✅ Insurance validation passed: declared_value = ${parseFloat(declaredValue.toString())} AED`);
+    }
+
     // Update other verification fields (excluding fields handled separately above)
     Object.keys(verificationData).forEach(key => {
       if (verificationData[key] !== undefined && 
@@ -679,7 +768,9 @@ router.put('/:id/verification', async (req, res) => {
           key !== 'calculated_rate' &&
           key !== 'shipment_classification' &&
           key !== 'number_of_boxes' &&
-          key !== 'service_code') { // service_code is handled separately above
+          key !== 'service_code' &&
+          key !== 'declared_value' &&
+          key !== 'insured') { // service_code, declared_value, and insured are handled separately above
         // Handle Decimal128 fields
         if (key === 'amount' || key === 'volume_cbm') {
           invoiceRequest.verification[key] = toDecimal128(verificationData[key]);

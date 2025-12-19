@@ -5,18 +5,66 @@ const { InvoiceRequest } = require('../models');
 
 const router = express.Router();
 
-// Get all reports
+// Memory management utilities
+function getMemoryUsage() {
+  const used = process.memoryUsage();
+  return {
+    heapUsed: Math.round(used.heapUsed / 1024 / 1024),
+    heapTotal: Math.round(used.heapTotal / 1024 / 1024),
+    rss: Math.round(used.rss / 1024 / 1024)
+  };
+}
+
+function logMemoryUsage(label = '') {
+  const mem = getMemoryUsage();
+  console.log(`💾 Memory ${label}: Heap ${mem.heapUsed}MB/${mem.heapTotal}MB, RSS ${mem.rss}MB`);
+  return mem;
+}
+
+function forceGarbageCollection() {
+  if (global.gc) {
+    global.gc();
+    return true;
+  }
+  return false;
+}
+
+// Get all reports with pagination
 router.get('/', async (req, res) => {
   try {
-    const reports = await Report.find()
-      .populate('generated_by_employee_id')
-      .sort({ generatedAt: -1 });
+    // Get pagination parameters
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200); // Max 200 per page
+    const skip = (page - 1) * limit;
+    
+    logMemoryUsage('(before report query)');
     
     console.log('📋 Fetching reports from database...');
-    console.log(`📊 Found ${reports.length} reports`);
+    console.log(`📄 Pagination: page=${page}, limit=${limit}, skip=${skip}`);
+    
+    // Get total count first
+    const total = await Report.countDocuments();
+    
+    // Fetch reports with pagination and use lean() to reduce memory
+    const reports = await Report.find()
+      .populate('generated_by_employee_id')
+      .sort({ generatedAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(); // Use lean() to return plain objects
+    
+    logMemoryUsage('(after report query)');
+    
+    console.log(`📊 Found ${reports.length} reports (Total: ${total})`);
     
     // Update delivery status from invoice request for each report
-    const updatedReports = await Promise.all(reports.map(async (report) => {
+    // Process in batches to avoid memory issues
+    const BATCH_SIZE = 20;
+    const updatedReports = [];
+    
+    for (let i = 0; i < reports.length; i += BATCH_SIZE) {
+      const batch = reports.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(batch.map(async (report) => {
       const reportData = report.report_data;
       
       if (reportData && reportData.invoice_id) {
@@ -39,14 +87,36 @@ router.get('/', async (req, res) => {
         }
       }
       
-      return report;
-    }));
+        return report;
+      }));
+      
+      updatedReports.push(...batchResults);
+      
+      // Memory cleanup after each batch
+      if (i % (BATCH_SIZE * 2) === 0) {
+        forceGarbageCollection();
+        logMemoryUsage(`(after batch ${Math.floor(i / BATCH_SIZE) + 1})`);
+      }
+    }
+    
+    // Final memory cleanup
+    forceGarbageCollection();
+    logMemoryUsage('(after all report updates)');
     
     if (updatedReports.length > 0) {
       console.log('📝 Sample report:', JSON.stringify(updatedReports[0], null, 2));
     }
     
-    res.json(updatedReports);
+    res.json({
+      success: true,
+      data: updatedReports,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
+    });
   } catch (error) {
     console.error('Error fetching reports:', error);
     res.status(500).json({ error: 'Failed to fetch reports' });
@@ -64,13 +134,38 @@ router.get('/historical', async (req, res) => {
     };
     
     if (customer_name) {
-      filter['report_data.customer_name'] = { $regex: customer_name, $options: 'i' };
+      // Sanitize to prevent NoSQL injection
+      const sanitized = customer_name.replace(/[.*+?^${}()|[\]\\]/g, '');
+      if (sanitized.length > 100) {
+        return res.status(400).json({
+          success: false,
+          error: 'Search term too long',
+          message: 'Customer name search must be 100 characters or less'
+        });
+      }
+      filter['report_data.customer_name'] = { $regex: sanitized, $options: 'i' };
     }
     if (origin_country) {
-      filter['report_data.origin_country'] = { $regex: origin_country, $options: 'i' };
+      const sanitized = origin_country.replace(/[.*+?^${}()|[\]\\]/g, '');
+      if (sanitized.length > 50) {
+        return res.status(400).json({
+          success: false,
+          error: 'Search term too long',
+          message: 'Origin country search must be 50 characters or less'
+        });
+      }
+      filter['report_data.origin_country'] = { $regex: sanitized, $options: 'i' };
     }
     if (destination_country) {
-      filter['report_data.destination_country'] = { $regex: destination_country, $options: 'i' };
+      const sanitized = destination_country.replace(/[.*+?^${}()|[\]\\]/g, '');
+      if (sanitized.length > 50) {
+        return res.status(400).json({
+          success: false,
+          error: 'Search term too long',
+          message: 'Destination country search must be 50 characters or less'
+        });
+      }
+      filter['report_data.destination_country'] = { $regex: sanitized, $options: 'i' };
     }
     
     const skip = (page - 1) * limit;

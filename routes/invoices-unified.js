@@ -4,6 +4,7 @@ const { Invoice, ShipmentRequest, Client, Employee } = require('../models/unifie
 const { InvoiceRequest } = require('../models');
 const empostAPI = require('../services/empost-api');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
+const { validateObjectIdParam } = require('../middleware/security');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -140,17 +141,59 @@ const transformInvoice = (invoice) => {
   };
 };
 
-// Get all invoices
+// Memory management utilities
+function getMemoryUsage() {
+  const used = process.memoryUsage();
+  return {
+    heapUsed: Math.round(used.heapUsed / 1024 / 1024),
+    heapTotal: Math.round(used.heapTotal / 1024 / 1024),
+    rss: Math.round(used.rss / 1024 / 1024)
+  };
+}
+
+function logMemoryUsage(label = '') {
+  const mem = getMemoryUsage();
+  console.log(`💾 Memory ${label}: Heap ${mem.heapUsed}MB/${mem.heapTotal}MB, RSS ${mem.rss}MB`);
+  return mem;
+}
+
+function forceGarbageCollection() {
+  if (global.gc) {
+    global.gc();
+    return true;
+  }
+  return false;
+}
+
+// Get all invoices with pagination
 router.get('/', async (req, res) => {
   try {
+    // Get pagination parameters
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200); // Max 200 per page
+    const skip = (page - 1) * limit;
+    
+    logMemoryUsage('(before invoice query)');
+    
     console.log('🔄 Fetching invoices from database...');
+    console.log(`📄 Pagination: page=${page}, limit=${limit}, skip=${skip}`);
+    
+    // Get total count first
+    const total = await Invoice.countDocuments();
+    
+    // Fetch invoices with pagination and use lean() to reduce memory
     const invoices = await Invoice.find()
       .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(); // Use lean() to return plain objects instead of Mongoose documents
     
-    console.log('📊 Found invoices:', invoices.length);
+    logMemoryUsage('(after invoice query)');
+    
+    console.log('📊 Found invoices:', invoices.length, `(Total: ${total})`);
     console.log('📋 Invoice details:', invoices.map(inv => ({
       id: inv._id,
       invoice_id: inv.invoice_id,
@@ -159,9 +202,15 @@ router.get('/', async (req, res) => {
     })));
     
     // Transform invoices and populate missing fields from InvoiceRequest
-    const transformedInvoices = await Promise.all(invoices.map(async (invoice) => {
-      const transformed = transformInvoice(invoice);
-      const invoiceObj = invoice.toObject ? invoice.toObject() : invoice;
+    // Process in smaller batches to avoid memory issues
+    const BATCH_SIZE = 20;
+    const transformedInvoices = [];
+    
+    for (let i = 0; i < invoices.length; i += BATCH_SIZE) {
+      const batch = invoices.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(batch.map(async (invoice) => {
+        const transformed = transformInvoice(invoice);
+        const invoiceObj = invoice; // Already a plain object from lean()
       
       // Always try to populate fields from InvoiceRequest if request_id exists
       // Note: request_id might be an InvoiceRequest ObjectId, not a ShipmentRequest
@@ -299,12 +348,31 @@ router.get('/', async (req, res) => {
         console.error('Error stack:', error.stack);
       }
       
-      return transformed;
-    }));
+        return transformed;
+      }));
+      
+      transformedInvoices.push(...batchResults);
+      
+      // Memory cleanup after each batch
+      if (i % (BATCH_SIZE * 2) === 0) {
+        forceGarbageCollection();
+        logMemoryUsage(`(after batch ${Math.floor(i / BATCH_SIZE) + 1})`);
+      }
+    }
+    
+    // Final memory cleanup
+    forceGarbageCollection();
+    logMemoryUsage('(after all transformations)');
     
     res.json({
       success: true,
-      data: transformedInvoices
+      data: transformedInvoices,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
     });
   } catch (error) {
     console.error('❌ Error fetching invoices:', error);
@@ -316,7 +384,7 @@ router.get('/', async (req, res) => {
 });
 
 // Get invoice by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
   try {
     const invoice = await Invoice.findById(req.params.id)
       .populate('request_id', REQUEST_POPULATE_FIELDS)
@@ -731,8 +799,19 @@ router.post('/', async (req, res) => {
       : (invoiceRequest?.declaredAmount ? parseFloat(invoiceRequest.declaredAmount.toString()) : 0);
     
     // Compute insurance charge based on option (only if not found in line_items)
+    // Priority: 1. verification.declared_value * 0.01 (if insured=true), 2. line_items, 3. insurance_option logic
     let insuranceCharge = insuranceChargeFromItems;
-    if (isPhToUae) {
+    
+    // Check if invoiceRequest has verification with insured=true and declared_value
+    // This takes priority over line_items for UAE_TO_PINAS services
+    if (!isPhToUae && invoiceRequest?.verification?.insured === true && 
+        invoiceRequest?.verification?.declared_value && 
+        parseFloat(invoiceRequest.verification.declared_value.toString()) > 0) {
+      // Use declared_value * 0.01 (1% of declared value) for insurance charge
+      const declaredValue = parseFloat(invoiceRequest.verification.declared_value.toString());
+      insuranceCharge = declaredValue * 0.01;
+      console.log(`✅ Using declared_value from verification for insurance charge: ${declaredValue} AED × 0.01 = ${insuranceCharge.toFixed(2)} AED`);
+    } else if (isPhToUae) {
       // PH_TO_UAE: insurance not offered, force to 0 and ignore inputs/line_items
       insuranceCharge = 0;
       insuranceChargeFromItems = 0;

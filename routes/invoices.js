@@ -3,16 +3,31 @@ const router = express.Router();
 const { ShipmentRequest } = require('../models/unified-schema');
 const auth = require('../middleware/auth');
 
-// Get all invoices (from shipment requests with generated invoices)
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 500;
+
+// Get all invoices (from shipment requests with generated invoices) with pagination
 router.get('/', auth, async (req, res) => {
   try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const skip = (page - 1) * limit;
+    
+    // Get total count first
+    const total = await ShipmentRequest.countDocuments({
+      'status.invoice_status': { $in: ['GENERATED', 'SENT', 'PAID'] },
+      'financial.invoice_amount': { $exists: true, $ne: null }
+    });
+    
     const shipmentRequests = await ShipmentRequest.find({
       'status.invoice_status': { $in: ['GENERATED', 'SENT', 'PAID'] },
       'financial.invoice_amount': { $exists: true, $ne: null }
     })
       .populate('created_by', 'full_name email employee_id')
       .populate('assigned_to', 'full_name email employee_id')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
     
     // Transform shipment requests to invoice format expected by frontend
     const invoices = shipmentRequests.map(request => ({
@@ -61,7 +76,13 @@ router.get('/', auth, async (req, res) => {
     
     res.json({
       success: true,
-      data: invoices
+      data: invoices,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
     });
   } catch (error) {
     console.error('Error fetching invoices:', error);

@@ -11,19 +11,66 @@ function generateCashTrackerId() {
   return `CT-${year}-${randomNum}`;
 }
 
-// Get all cash tracker transactions (from both CashTracker and CashFlowTransaction)
+// Memory management utilities
+function getMemoryUsage() {
+  const used = process.memoryUsage();
+  return {
+    heapUsed: Math.round(used.heapUsed / 1024 / 1024),
+    heapTotal: Math.round(used.heapTotal / 1024 / 1024),
+    rss: Math.round(used.rss / 1024 / 1024)
+  };
+}
+
+function logMemoryUsage(label = '') {
+  const mem = getMemoryUsage();
+  console.log(`💾 Memory ${label}: Heap ${mem.heapUsed}MB/${mem.heapTotal}MB, RSS ${mem.rss}MB`);
+  return mem;
+}
+
+function forceGarbageCollection() {
+  if (global.gc) {
+    global.gc();
+    return true;
+  }
+  return false;
+}
+
+// Get all cash tracker transactions (from both CashTracker and CashFlowTransaction) with pagination
 router.get('/', async (req, res) => {
   try {
-    // Fetch from both old CashTracker and new CashFlowTransaction
-    const oldTransactions = await CashTracker.find().sort({ createdAt: -1 });
+    // Get pagination parameters
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200); // Max 200 per page
+    const skip = (page - 1) * limit;
+    
+    logMemoryUsage('(before cash tracker query)');
+    
+    // Get total counts
+    const oldTotal = await CashTracker.countDocuments();
+    const newTotal = await CashFlowTransaction.countDocuments();
+    const total = oldTotal + newTotal;
+    
+    // Fetch from both old CashTracker and new CashFlowTransaction with pagination
+    // Use lean() to reduce memory usage
+    const oldTransactions = await CashTracker.find()
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+      
     const newTransactions = await CashFlowTransaction.find()
       .populate('created_by', 'full_name employee_id')
       .populate('entity_id')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+    
+    logMemoryUsage('(after cash tracker query)');
     
     // Convert CashFlowTransaction to format expected by frontend
     const formattedNewTransactions = newTransactions.map(t => {
-      const transactionData = t.toObject();
+      const transactionData = t; // Already a plain object from lean()
       
       // Convert Decimal128 amount to number
       if (transactionData.amount) {
@@ -39,16 +86,26 @@ router.get('/', async (req, res) => {
     const allTransactions = [...oldTransactions, ...formattedNewTransactions]
       .sort((a, b) => new Date(b.createdAt || b.transaction_date) - new Date(a.createdAt || a.transaction_date));
     
+    // Final memory cleanup
+    forceGarbageCollection();
+    logMemoryUsage('(after processing)');
+    
     console.log('📊 Cash flow transactions fetched:', {
       oldTransactions: oldTransactions.length,
       newTransactions: formattedNewTransactions.length,
       total: allTransactions.length,
-      sample: allTransactions.slice(0, 2)
+      pagination: { page, limit, total }
     });
     
     res.json({
       success: true,
-      data: allTransactions
+      data: allTransactions,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
     });
   } catch (error) {
     console.error('Error fetching cash tracker transactions:', error);
@@ -93,24 +150,48 @@ router.post('/', async (req, res) => {
 });
 
 // Get cash flow summary (from both CashTracker and CashFlowTransaction)
+// Uses aggregation for better performance and memory efficiency
 router.get('/summary', async (req, res) => {
   try {
-    const oldTransactions = await CashTracker.find();
-    const newTransactions = await CashFlowTransaction.find();
+    logMemoryUsage('(before summary query)');
     
-    const summary = [...oldTransactions, ...newTransactions].reduce((acc, transaction) => {
-      const amount = parseFloat(transaction.amount.toString());
-      
-      if (transaction.direction === 'IN') {
-        acc.totalIncome += amount;
-      } else {
-        acc.totalExpenses += amount;
+    // Use aggregation pipeline for better memory efficiency
+    const oldSummary = await CashTracker.aggregate([
+      {
+        $group: {
+          _id: '$direction',
+          total: { $sum: { $toDouble: '$amount' } }
+        }
       }
-      
-      return acc;
-    }, { totalIncome: 0, totalExpenses: 0 });
+    ]);
+    
+    const newSummary = await CashFlowTransaction.aggregate([
+      {
+        $group: {
+          _id: '$direction',
+          total: { $sum: { $toDouble: '$amount' } }
+        }
+      }
+    ]);
+    
+    logMemoryUsage('(after summary query)');
+    
+    // Combine results
+    const summary = { totalIncome: 0, totalExpenses: 0 };
+    
+    [...oldSummary, ...newSummary].forEach(item => {
+      if (item._id === 'IN') {
+        summary.totalIncome += item.total || 0;
+      } else {
+        summary.totalExpenses += item.total || 0;
+      }
+    });
 
     summary.netCashFlow = summary.totalIncome - summary.totalExpenses;
+    
+    // Final memory cleanup
+    forceGarbageCollection();
+    logMemoryUsage('(after summary processing)');
 
     res.json(summary);
   } catch (error) {

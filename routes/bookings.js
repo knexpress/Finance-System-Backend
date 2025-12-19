@@ -7,12 +7,195 @@ const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 const { syncClientFromBooking } = require('../utils/client-sync');
 const auth = require('../middleware/auth');
+const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 
 const router = express.Router();
 
 const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 200;
+const MAX_LIMIT = 500;
 const HEAVY_FIELDS_PROJECTION = '-identityDocuments -attachments -documents -files';
+
+// ========================================
+// FILTERING HELPER FUNCTIONS
+// ========================================
+
+/**
+ * Sanitize status parameter to prevent NoSQL injection
+ */
+function sanitizeStatus(status) {
+  if (!status || typeof status !== 'string') return null;
+  // Remove dangerous characters, keep alphanumeric, spaces, underscores, hyphens
+  return status.trim().replace(/[^a-zA-Z0-9_\s-]/g, '');
+}
+
+/**
+ * Sanitize AWB parameter to prevent NoSQL injection
+ */
+function sanitizeAwb(awb) {
+  if (!awb || typeof awb !== 'string') return null;
+  // Remove dangerous characters, keep alphanumeric
+  return awb.trim().replace(/[^a-zA-Z0-9]/g, '');
+}
+
+/**
+ * Normalize status value to handle various formats
+ */
+function normalizeStatus(status) {
+  if (!status) return null;
+  const normalized = status.toLowerCase().trim();
+  
+  // Handle "not reviewed" variations
+  if (['not reviewed', 'not_reviewed', 'pending', 'notreviewed'].includes(normalized)) {
+    return 'not_reviewed';
+  }
+  
+  // Handle "reviewed" variations
+  if (['reviewed', 'approved'].includes(normalized)) {
+    return 'reviewed';
+  }
+  
+  // Handle "rejected"
+  if (normalized === 'rejected') {
+    return 'rejected';
+  }
+  
+  // Return normalized value for exact matching
+  return normalized;
+}
+
+/**
+ * Build MongoDB query for status filter
+ */
+function buildStatusQuery(status) {
+  const normalized = normalizeStatus(status);
+  
+  if (!normalized) {
+    return {};
+  }
+  
+  // Handle "not reviewed" - match null, undefined, empty, or various formats
+  // A booking is "not reviewed" if:
+  // 1. BOTH reviewed_at AND reviewed_by_employee_id are missing/null, OR
+  // 2. review_status is explicitly set to "not reviewed" or similar values
+  if (normalized === 'not_reviewed') {
+    return {
+      $or: [
+        // Case 1: Both reviewed_at and reviewed_by_employee_id are missing/null
+        {
+          $and: [
+            {
+              $or: [
+                { reviewed_at: { $exists: false } },
+                { reviewed_at: null }
+              ]
+            },
+            {
+              $or: [
+                { reviewed_by_employee_id: { $exists: false } },
+                { reviewed_by_employee_id: null }
+              ]
+            }
+          ]
+        },
+        // Case 2: review_status is explicitly set to "not reviewed" or similar
+        { review_status: { $exists: false } },
+        { review_status: null },
+        { review_status: '' },
+        { review_status: { $in: ['not reviewed', 'not_reviewed', 'pending', 'notreviewed', 'Not Reviewed'] } }
+      ]
+    };
+  }
+  
+  // Handle "reviewed" - match reviewed or approved
+  if (normalized === 'reviewed') {
+    return { 
+      review_status: { $in: ['reviewed', 'approved', 'Reviewed', 'Approved'] } 
+    };
+  }
+  
+  // Handle "rejected"
+  if (normalized === 'rejected') {
+    return { 
+      review_status: { $in: ['rejected', 'Rejected'] } 
+    };
+  }
+  
+  // For other statuses, use case-insensitive exact match
+  try {
+    const escapedStatus = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return { 
+      review_status: { $regex: new RegExp(`^${escapedStatus}$`, 'i') } 
+    };
+  } catch (error) {
+    console.error('Error building status query:', error);
+    return {};
+  }
+}
+
+/**
+ * Build MongoDB query for AWB filter (case-insensitive partial match)
+ */
+function buildAwbQuery(awb) {
+  if (!awb || !awb.trim()) return null;
+  
+  const awbSearch = sanitizeAwb(awb);
+  if (!awbSearch) return null;
+  
+  // Escape special regex characters to prevent ReDoS
+  const escapedAwb = sanitizeRegex(awbSearch);
+  
+  try {
+    return {
+      $or: [
+        { tracking_code: { $regex: escapedAwb, $options: 'i' } },
+        { awb_number: { $regex: escapedAwb, $options: 'i' } },
+        { 'request_id.tracking_code': { $regex: escapedAwb, $options: 'i' } },
+        { 'request_id.awb_number': { $regex: escapedAwb, $options: 'i' } }
+      ]
+    };
+  } catch (error) {
+    console.error('Error building AWB query:', error);
+    return null;
+  }
+}
+
+/**
+ * Format bookings to include OTP info and normalized review_status
+ */
+function formatBookings(bookings) {
+  return bookings.map(booking => {
+    // Extract OTP from otpVerification object for easy access
+    const otpInfo = {
+      otp: booking.otpVerification?.otp || booking.otp || null,
+      verified: booking.otpVerification?.verified || booking.verified || false,
+      verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
+      phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
+    };
+    
+    // Extract agentName from sender object for easy access
+    const agentName = booking.sender?.agentName || booking.agentName || null;
+    
+    // Normalize review_status - ensure it's always present and properly formatted
+    const normalizedReviewStatus = booking.review_status || 'not reviewed';
+    
+    return {
+      ...booking,
+      // Ensure review_status is always present and normalized
+      review_status: normalizedReviewStatus,
+      // Include OTP info at top level for easy access in manager dashboard
+      otpInfo: otpInfo,
+      // Include agentName at top level for easy access
+      agentName: agentName,
+      // Ensure sender object includes agentName
+      sender: booking.sender ? {
+        ...booking.sender,
+        agentName: booking.sender.agentName || null
+      } : null,
+      // Keep original otpVerification object intact
+      otpVerification: booking.otpVerification || null
+    };
+  });
+}
 
 // Create new booking
 router.post('/', async (req, res) => {
@@ -44,7 +227,7 @@ router.post('/', async (req, res) => {
 });
 
 // Update booking
-router.put('/:id', async (req, res) => {
+router.put('/:id', validateObjectIdParam('id'), async (req, res) => {
   try {
     const { id } = req.params;
     const updateData = req.body;
@@ -97,15 +280,35 @@ router.post('/search-awb-by-name', auth, async (req, res) => {
       });
     }
 
+    // Validate and sanitize input
+    if (firstName.length > 50 || lastName.length > 50) {
+      return res.status(400).json({
+        success: false,
+        error: 'Name too long',
+        message: 'First name and last name must be 50 characters or less'
+      });
+    }
+    
     const searchFirstName = firstName.trim().toLowerCase();
     const searchLastName = lastName.trim().toLowerCase();
     
-    // Escape special regex characters
+    // Validate input contains only safe characters
+    const safeNamePattern = /^[a-zA-Z\s'-]+$/;
+    if (!safeNamePattern.test(searchFirstName) || !safeNamePattern.test(searchLastName)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid characters in name',
+        message: 'Names can only contain letters, spaces, hyphens, and apostrophes'
+      });
+    }
+    
+    // Escape special regex characters to prevent injection
     const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const escapedFirstName = escapeRegex(searchFirstName);
     const escapedLastName = escapeRegex(searchLastName);
     
     // Build regex patterns for full name matching (handles both "First Last" and "Last First")
+    // Limit pattern complexity to prevent ReDoS
     const fullNamePattern1 = new RegExp(`^${escapedFirstName}\\s+${escapedLastName}$`, 'i');
     const fullNamePattern2 = new RegExp(`^${escapedLastName}\\s+${escapedFirstName}$`, 'i');
     const firstNameRegex = new RegExp(`^${escapedFirstName}$`, 'i');
@@ -143,14 +346,16 @@ router.post('/search-awb-by-name', auth, async (req, res) => {
       ]
     };
 
-    // Search in bookings collection
+    // Search in bookings collection with limit to prevent memory issues
     const bookings = await Booking.find(nameQuery)
       .select('tracking_code awb awb_number referenceNumber')
+      .limit(1000) // Limit to prevent loading too many results
       .lean();
 
-    // Search in invoice requests collection
+    // Search in invoice requests collection with limit
     const invoiceRequests = await InvoiceRequest.find(nameQuery)
       .select('tracking_code awb_number invoice_number')
+      .limit(1000) // Limit to prevent loading too many results
       .lean();
 
     // Extract unique AWB numbers
@@ -190,55 +395,94 @@ router.post('/search-awb-by-name', auth, async (req, res) => {
 // Get all bookings (paginated, light payload)
 router.get('/', async (req, res) => {
   try {
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
-    const skip = (page - 1) * limit;
-
-    // Use lean() to get plain JavaScript objects with all fields including OTP
-    const bookings = await Booking.find()
-      .select(HEAVY_FIELDS_PROJECTION) // exclude heavy blobs to speed up review list
-      .lean()
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-    const total = await Booking.countDocuments();
+    // Extract and sanitize filter parameters
+    const { status, awb, page, limit: limitParam, all } = req.query;
+    const sanitizedStatus = status ? sanitizeStatus(status) : null;
+    const sanitizedAwb = awb ? sanitizeAwb(awb) : null;
+    const getAll = all === 'true' || all === '1' || all === 'yes';
     
-    // Ensure OTP is included in response (it should be in otpVerification.otp)
-    // Format bookings to explicitly include OTP information for manager dashboard
-    const formattedBookings = bookings.map(booking => {
-      // Extract OTP from otpVerification object for easy access
-      const otpInfo = {
-        otp: booking.otpVerification?.otp || booking.otp || null,
-        verified: booking.otpVerification?.verified || booking.verified || false,
-        verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
-        phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
-      };
-      
-      // Extract agentName from sender object for easy access
-      const agentName = booking.sender?.agentName || booking.agentName || null;
-      
-      // Normalize review_status - ensure it's always present and properly formatted
-      const normalizedReviewStatus = booking.review_status || 'not reviewed';
-      
-      return {
-        ...booking,
-        // Ensure review_status is always present and normalized
-        review_status: normalizedReviewStatus,
-        // Include OTP info at top level for easy access in manager dashboard
-        otpInfo: otpInfo,
-        // Include agentName at top level for easy access
-        agentName: agentName,
-        // Ensure sender object includes agentName
-        sender: booking.sender ? {
-          ...booking.sender,
-          agentName: booking.sender.agentName || null
-        } : null,
-        // Keep original otpVerification object intact
-        otpVerification: booking.otpVerification || null
-      };
-    });
+    // Build query object
+    const query = {};
+    const hasFilters = !!(sanitizedStatus || sanitizedAwb);
     
-    // Debug: Log first booking structure and check for image fields
+    // Apply status filter
+    if (sanitizedStatus) {
+      const statusQuery = buildStatusQuery(sanitizedStatus);
+      Object.assign(query, statusQuery);
+    }
+    
+    // Apply AWB filter
+    if (sanitizedAwb) {
+      const awbQuery = buildAwbQuery(sanitizedAwb);
+      if (awbQuery) {
+        // If we already have a query (from status), combine with $and
+        if (Object.keys(query).length > 0) {
+          // Create a new query object with $and to combine both filters
+          const combinedQuery = {
+            $and: [
+              { ...query },
+              awbQuery
+            ]
+          };
+          // Clear query and set combined query
+          Object.keys(query).forEach(key => delete query[key]);
+          Object.assign(query, combinedQuery);
+        } else {
+          Object.assign(query, awbQuery);
+        }
+      }
+    }
+    
+    // If filters are present OR all=true, query full database (no pagination)
+    // Otherwise, use pagination for backward compatibility
+    let bookings;
+    let total;
+    const shouldGetAll = hasFilters || getAll;
+    
+    if (shouldGetAll) {
+      // Filter full database - no pagination, return ALL matching results
+      bookings = await Booking.find(query)
+        .select(HEAVY_FIELDS_PROJECTION)
+        .lean()
+        .sort({ createdAt: -1 });
+      // No limit applied - get all results
+      total = bookings.length;
+      
+      console.log(`📊 Fetched ${total} bookings ${hasFilters ? 'with filters' : 'without filters (all=true)'}`);
+    } else {
+      // No filters and not requesting all - use pagination
+      const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+      const limitNum = Math.min(Math.max(parseInt(limitParam, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+      const skip = (pageNum - 1) * limitNum;
+      
+      bookings = await Booking.find(query)
+        .select(HEAVY_FIELDS_PROJECTION)
+        .lean()
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum);
+      total = await Booking.countDocuments(query);
+      
+      console.log(`📊 Fetched ${bookings.length} bookings (page ${pageNum}, limit ${limitNum}) out of ${total} total`);
+      
+      // Return pagination info
+      return res.json({ 
+        success: true, 
+        data: formatBookings(bookings), 
+        pagination: { 
+          page: pageNum, 
+          limit: limitNum, 
+          total,
+          pages: Math.ceil(total / limitNum)
+        } 
+      });
+    }
+    
+    // Format bookings
+    const formattedBookings = formatBookings(bookings);
+    
+    // Debug: Log first booking structure and check for image fields (only if no filters)
+    // Note: This debug code only runs when filters are present (since we return early when no filters)
     if (formattedBookings.length > 0) {
       const firstBooking = formattedBookings[0];
       console.log('📦 Backend - First booking structure:', JSON.stringify(firstBooking, null, 2));
@@ -283,87 +527,109 @@ router.get('/', async (req, res) => {
       }
     }
     
-    res.json({ success: true, data: formattedBookings, pagination: { page, limit, total } });
+    // Return response - no pagination when filters are applied
+    res.json({ 
+      success: true, 
+      data: formattedBookings
+    });
   } catch (error) {
     console.error('Error fetching bookings:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
   }
 });
 
-// Get bookings by review status
+// Get bookings by review status (with optional AWB filter)
 router.get('/status/:reviewStatus', async (req, res) => {
   try {
     const { reviewStatus } = req.params;
-
+    const { awb, all } = req.query;
+    
+    // Sanitize inputs
+    const sanitizedStatus = sanitizeStatus(reviewStatus);
+    const sanitizedAwb = awb ? sanitizeAwb(awb) : null;
+    const getAll = all === 'true' || all === '1' || all === 'yes';
+    const hasAwbFilter = !!sanitizedAwb;
+    
     // Build query based on review status
-    // For "not reviewed", check for absence of reviewed_at AND reviewed_by_employee_id
-    // A booking is "not reviewed" if BOTH fields are missing or null
-    let query = {};
-    if (reviewStatus === 'not reviewed' || reviewStatus === 'not_reviewed') {
-      query = {
-        $and: [
-          // reviewed_at must be missing or null
-          {
-            $or: [
-              { reviewed_at: { $exists: false } },
-              { reviewed_at: null }
+    const query = buildStatusQuery(sanitizedStatus || reviewStatus);
+    
+    // Apply AWB filter if provided
+    if (sanitizedAwb) {
+      const awbQuery = buildAwbQuery(sanitizedAwb);
+      if (awbQuery) {
+        // Combine status and AWB filters with $and
+        if (Object.keys(query).length > 0) {
+          const combinedQuery = {
+            $and: [
+              { ...query },
+              awbQuery
             ]
-          },
-          // reviewed_by_employee_id must be missing or null
-          {
-            $or: [
-              { reviewed_by_employee_id: { $exists: false } },
-              { reviewed_by_employee_id: null }
-            ]
-          }
-        ]
-      };
-    } else {
-      // For other statuses, check review_status field
-      query = { review_status: reviewStatus };
+          };
+          // Clear query and set combined query
+          Object.keys(query).forEach(key => delete query[key]);
+          Object.assign(query, combinedQuery);
+        } else {
+          Object.assign(query, awbQuery);
+        }
+      }
     }
-
-    // Use lean() to get plain JavaScript objects with all fields including OTP
-    // Remove pagination limits to return ALL matching bookings
-    const bookings = await Booking.find(query)
-      .select(HEAVY_FIELDS_PROJECTION)
-      .lean()
-      .sort({ createdAt: -1 });
-    const total = bookings.length;
     
-    // Format bookings to explicitly include OTP information and review_status
-    const formattedBookings = bookings.map(booking => {
-      // Extract OTP from otpVerification object for easy access
-      const otpInfo = {
-        otp: booking.otpVerification?.otp || booking.otp || null,
-        verified: booking.otpVerification?.verified || booking.verified || false,
-        verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
-        phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
-      };
+    // If AWB filter is present OR all=true, query full database (no pagination)
+    // Otherwise, use pagination for backward compatibility
+    let bookings;
+    let total;
+    const shouldGetAll = hasAwbFilter || getAll;
+    
+    if (shouldGetAll) {
+      // Filter full database - no pagination, return ALL matching results
+      bookings = await Booking.find(query)
+        .select(HEAVY_FIELDS_PROJECTION)
+        .lean()
+        .sort({ createdAt: -1 });
+      // No limit applied - get all results
+      total = bookings.length;
       
-      // Extract agentName from sender object for easy access
-      const agentName = booking.sender?.agentName || booking.agentName || null;
+      console.log(`📊 Fetched ${total} bookings by status "${reviewStatus}" ${hasAwbFilter ? 'with AWB filter' : 'without AWB filter (all=true)'}`);
+    } else {
+      // No AWB filter and not requesting all - use pagination
+      const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+      const skip = (page - 1) * limit;
       
-      // Normalize review_status - ensure it's always present and properly formatted
-      const normalizedReviewStatus = booking.review_status || 'not reviewed';
+      // Get total count first
+      total = await Booking.countDocuments(query);
       
-      return {
-        ...booking,
-        // Ensure review_status is always present and normalized
-        review_status: normalizedReviewStatus,
-        otpInfo: otpInfo,
-        // Include agentName at top level for easy access
-        agentName: agentName,
-        // Ensure sender object includes agentName
-        sender: booking.sender ? {
-          ...booking.sender,
-          agentName: booking.sender.agentName || null
-        } : null,
-        otpVerification: booking.otpVerification || null
-      };
+      // Use lean() to get plain JavaScript objects with all fields including OTP
+      bookings = await Booking.find(query)
+        .select(HEAVY_FIELDS_PROJECTION)
+        .lean()
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit);
+      
+      console.log(`📊 Fetched ${bookings.length} bookings by status "${reviewStatus}" (page ${page}, limit ${limit}) out of ${total} total`);
+      
+      // Return pagination info
+      return res.json({ 
+        success: true, 
+        data: formatBookings(bookings), 
+        pagination: {
+          page,
+          limit,
+          total,
+          pages: Math.ceil(total / limit)
+        }
+      });
+    }
+    
+    // Format bookings
+    const formattedBookings = formatBookings(bookings);
+    
+    // Return response - no pagination when AWB filter is applied
+    res.json({ 
+      success: true, 
+      data: formattedBookings
     });
-    
-    res.json({ success: true, data: formattedBookings, total });
   } catch (error) {
     console.error('Error fetching bookings by status:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch bookings' });
@@ -783,7 +1049,7 @@ router.put('/:id/shipment-status', auth, async (req, res) => {
 
 // Get booking by ID for review (includes all identityDocuments images)
 // This endpoint must be defined BEFORE /:id to ensure proper route matching
-router.get('/:id/review', auth, async (req, res) => {
+router.get('/:id/review', auth, validateObjectIdParam('id'), async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -856,7 +1122,7 @@ router.get('/:id/review', auth, async (req, res) => {
 });
 
 // Get booking by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
   try {
     // Use lean() to get plain JavaScript object with all fields including OTP
     const booking = await Booking.findById(req.params.id).lean();
@@ -899,7 +1165,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // Review and approve booking (convert to invoice request)
-router.post('/:id/review', async (req, res) => {
+router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
   try {
     const { id } = req.params;
     const { reviewed_by_employee_id } = req.body;
@@ -1268,7 +1534,7 @@ router.post('/:id/review', async (req, res) => {
 });
 
 // Update booking review status only (without converting)
-router.put('/:id/status', async (req, res) => {
+router.put('/:id/status', validateObjectIdParam('id'), async (req, res) => {
   try {
     const { id } = req.params;
     const { review_status, reviewed_by_employee_id, reason } = req.body;

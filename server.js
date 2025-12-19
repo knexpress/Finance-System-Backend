@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { sanitizeRequest, validateRequestSize, limitQueryComplexity } = require('./middleware/security');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -31,12 +32,43 @@ const paymentRemittanceRoutes = require('./routes/payment-remittances');
 const csvUploadRoutes = require('./routes/csv-upload');
 const bookingsRoutes = require('./routes/bookings');
 const chatRoutes = require('./routes/chat');
+const activityRoutes = require('./routes/activity');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Security middleware
-app.use(helmet());
+// Security middleware - Enhanced Helmet configuration
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false, // Allow embedding if needed
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
+
+// Request size validation
+app.use(validateRequestSize);
+
+// Query complexity limits
+app.use(limitQueryComplexity);
+
+// Input sanitization (must be before body parsing for some routes)
+app.use(sanitizeRequest);
 
 // CORS configuration - allow multiple origins
 const allowedOrigins = [
@@ -62,25 +94,92 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Rate limiting - More generous for development
-const limiter = rateLimit({
+// Enhanced Rate Limiting - Stricter for DDoS protection
+const generalLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
-  max: process.env.NODE_ENV === 'production' ? 60 : 300, // 300 requests per minute in development, 60 in production
+  max: process.env.NODE_ENV === 'production' ? 100 : 500, // Stricter limits
   message: {
-    error: 'Too many requests from this IP, please try again later.'
+    success: false,
+    error: 'Too many requests from this IP, please try again later.',
+    retryAfter: '1 minute'
   },
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  standardHeaders: true,
+  legacyHeaders: false,
   skip: (req) => {
-    // Skip rate limiting for health checks
     return req.path === '/api/health';
+  },
+  // Use IP from headers if behind proxy
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
+  },
+  // Custom handler
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      error: 'Too many requests',
+      message: 'Rate limit exceeded. Please try again later.',
+      retryAfter: '1 minute'
+    });
   }
 });
-app.use(limiter);
 
-// Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+// Stricter rate limiting for authentication endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 login attempts per 15 minutes
+  message: {
+    success: false,
+    error: 'Too many authentication attempts',
+    message: 'Please try again after 15 minutes'
+  },
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
+  }
+});
+
+// Stricter rate limiting for file uploads
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // 10 uploads per hour
+  message: {
+    success: false,
+    error: 'Too many file uploads',
+    message: 'Maximum 10 file uploads per hour allowed'
+  },
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
+  }
+});
+
+// Apply rate limiters
+app.use('/api/auth', authLimiter);
+app.use('/api/csv-upload', uploadLimiter);
+app.use(generalLimiter);
+
+// Body parsing middleware with strict limits
+app.use(express.json({ 
+  limit: '10mb',
+  strict: true, // Only parse arrays and objects
+  type: 'application/json'
+}));
+app.use(express.urlencoded({ 
+  extended: true,
+  limit: '10mb',
+  parameterLimit: 50 // Limit number of parameters
+}));
+
+// Trust proxy for accurate IP addresses (if behind reverse proxy)
+app.set('trust proxy', 1);
 
 // MongoDB connection
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance';
@@ -127,6 +226,9 @@ app.use('/api/bookings', bookingsRoutes);
 // Inter-Department Chat routes
 app.use('/api/chat', chatRoutes);
 
+// Activity tracking routes
+app.use('/api/activity', activityRoutes);
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ 
@@ -136,12 +238,49 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Error handling middleware
+// Error handling middleware - Don't leak sensitive information
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).json({ 
+  console.error('Error:', {
+    message: err.message,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+    path: req.path,
+    method: req.method,
+    ip: req.ip
+  });
+  
+  // Don't expose error details in production
+  const isDevelopment = process.env.NODE_ENV === 'development';
+  
+  // Handle specific error types
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({
+      success: false,
+      error: 'Validation error',
+      message: isDevelopment ? err.message : 'Invalid input data'
+    });
+  }
+  
+  if (err.name === 'CastError') {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid data format',
+      message: isDevelopment ? err.message : 'Invalid request format'
+    });
+  }
+  
+  if (err.name === 'MongoServerError' && err.code === 11000) {
+    return res.status(409).json({
+      success: false,
+      error: 'Duplicate entry',
+      message: 'This record already exists'
+    });
+  }
+  
+  // Generic error response
+  res.status(err.status || 500).json({ 
+    success: false,
     error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+    message: isDevelopment ? err.message : 'Something went wrong. Please try again later.'
   });
 });
 

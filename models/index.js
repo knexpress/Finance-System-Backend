@@ -638,6 +638,10 @@ const invoiceRequestSchema = new mongoose.Schema({
       type: mongoose.Schema.Types.Decimal128,
       required: false,
     },
+    insured: {
+      type: Boolean,
+      default: false,
+    },
     agents_name: {
       type: String,
       required: false,

@@ -4,42 +4,126 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { sanitizeRequest, validateRequestSize, limitQueryComplexity } = require('./middleware/security');
 
 // Import unified routes
 const authRoutes = require('./routes/auth');
 const unifiedShipmentRoutes = require('./routes/unified-shipment-requests');
 const { router: notificationRoutes } = require('./routes/notifications');
 const performanceRoutes = require('./routes/performance');
+const activityRoutes = require('./routes/activity');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Security middleware
-app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:9002',
-  credentials: true
+// Security middleware - Enhanced Helmet configuration
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
 }));
 
-// Rate limiting - More generous for development
-const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: process.env.NODE_ENV === 'production' ? 60 : 300, // 300 requests per minute in development, 60 in production
-  message: {
-    error: 'Too many requests from this IP, please try again later.'
+// CORS configuration
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'https://finance-system-frontend.vercel.app',
+  'http://localhost:9002',
+  'http://localhost:3000'
+].filter(Boolean);
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
   },
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-  skip: (req) => {
-    // Skip rate limiting for health checks
-    return req.path === '/api/health';
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Request size validation
+app.use(validateRequestSize);
+
+// Query complexity limits
+app.use(limitQueryComplexity);
+
+// Input sanitization
+app.use(sanitizeRequest);
+
+// Enhanced Rate Limiting
+const generalLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: process.env.NODE_ENV === 'production' ? 100 : 500,
+  message: {
+    success: false,
+    error: 'Too many requests from this IP, please try again later.',
+    retryAfter: '1 minute'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/api/health',
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
   }
 });
-app.use(limiter);
 
-// Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: {
+    success: false,
+    error: 'Too many authentication attempts',
+    message: 'Please try again after 15 minutes'
+  },
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => {
+    return req.headers['x-forwarded-for']?.split(',')[0] || 
+           req.headers['x-real-ip'] || 
+           req.ip || 
+           req.connection.remoteAddress;
+  }
+});
+
+app.use('/api/auth', authLimiter);
+app.use(generalLimiter);
+
+// Trust proxy for accurate IP addresses
+app.set('trust proxy', 1);
+
+// Body parsing middleware with strict limits
+app.use(express.json({ 
+  limit: '10mb',
+  strict: true,
+  type: 'application/json'
+}));
+app.use(express.urlencoded({ 
+  extended: true,
+  limit: '10mb',
+  parameterLimit: 50
+}));
 
 // MongoDB connection
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance';
@@ -98,6 +182,9 @@ app.use('/api/notifications', notificationRoutes);
 // Performance metrics
 app.use('/api/performance', performanceRoutes);
 
+// Activity tracking routes
+app.use('/api/activity', activityRoutes);
+
 // ========================================
 // ERROR HANDLING
 // ========================================
@@ -117,23 +204,33 @@ app.use('*', (req, res) => {
   });
 });
 
-// Global error handler
+// Global error handler - Don't leak sensitive information
 app.use((error, req, res, next) => {
-  console.error('Global error handler:', error);
+  const isDevelopment = process.env.NODE_ENV === 'development';
+  
+  console.error('Global error handler:', {
+    message: error.message,
+    stack: isDevelopment ? error.stack : undefined,
+    path: req.path,
+    method: req.method,
+    ip: req.ip
+  });
   
   // Mongoose validation error
   if (error.name === 'ValidationError') {
     const errors = Object.values(error.errors).map(err => err.message);
     return res.status(400).json({
+      success: false,
       error: 'Validation Error',
-      details: errors
+      details: isDevelopment ? errors : ['Invalid input data']
     });
   }
   
   // Mongoose duplicate key error
   if (error.code === 11000) {
     const field = Object.keys(error.keyValue)[0];
-    return res.status(400).json({
+    return res.status(409).json({
+      success: false,
       error: 'Duplicate Entry',
       message: `${field} already exists`
     });
@@ -142,6 +239,7 @@ app.use((error, req, res, next) => {
   // JWT errors
   if (error.name === 'JsonWebTokenError') {
     return res.status(401).json({
+      success: false,
       error: 'Invalid Token',
       message: 'Access denied. Invalid token provided.'
     });
@@ -149,15 +247,26 @@ app.use((error, req, res, next) => {
   
   if (error.name === 'TokenExpiredError') {
     return res.status(401).json({
+      success: false,
       error: 'Token Expired',
       message: 'Access denied. Token has expired.'
     });
   }
   
+  // Cast errors (invalid ObjectId, etc.)
+  if (error.name === 'CastError') {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid data format',
+      message: isDevelopment ? error.message : 'Invalid request format'
+    });
+  }
+  
   // Default error
-  res.status(500).json({
+  res.status(error.status || 500).json({
+    success: false,
     error: 'Internal Server Error',
-    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+    message: isDevelopment ? error.message : 'Something went wrong. Please try again later.'
   });
 });
 

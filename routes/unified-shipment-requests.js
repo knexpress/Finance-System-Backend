@@ -6,8 +6,12 @@ const {
   User, 
   Department
 } = require('../models/unified-schema');
+const { validateObjectIdParam } = require('../middleware/security');
 
 const router = express.Router();
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 500;
 
 // ========================================
 // SHIPMENT REQUESTS CRUD
@@ -16,9 +20,9 @@ const router = express.Router();
 // Get all shipment requests with filtering and pagination
 router.get('/', async (req, res) => {
   try {
-    const { 
-      page = 1, 
-      limit = 50, 
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const {  
       status, 
       delivery_status, 
       invoice_status, 
@@ -32,6 +36,8 @@ router.get('/', async (req, res) => {
       sort_by = 'createdAt',
       sort_order = 'desc'
     } = req.query;
+    
+    const skip = (page - 1) * limit;
 
     // Build filter object
     const filter = {};
@@ -44,14 +50,25 @@ router.get('/', async (req, res) => {
     if (assigned_to) filter.assigned_to = assigned_to;
     if (origin_country) filter['route.origin.country'] = origin_country;
     if (destination_country) filter['route.destination.country'] = destination_country;
-    if (customer_name) filter['customer.name'] = { $regex: customer_name, $options: 'i' };
+    if (customer_name) {
+      // Sanitize customer name to prevent NoSQL injection
+      const sanitizedCustomerName = customer_name.replace(/[.*+?^${}()|[\]\\]/g, '');
+      // Limit length to prevent ReDoS
+      if (sanitizedCustomerName.length > 100) {
+        return res.status(400).json({
+          success: false,
+          error: 'Customer name too long',
+          message: 'Customer name search must be 100 characters or less'
+        });
+      }
+      filter['customer.name'] = { $regex: sanitizedCustomerName, $options: 'i' };
+    }
 
     // Build sort object
     const sort = {};
     sort[sort_by] = sort_order === 'desc' ? -1 : 1;
 
     // Execute query with pagination
-    const skip = (page - 1) * limit;
     const shipmentRequests = await ShipmentRequest.find(filter)
       .populate('created_by', 'full_name email employee_id')
       .populate('assigned_to', 'full_name email employee_id')
@@ -98,7 +115,7 @@ router.get('/', async (req, res) => {
 });
 
 // Get shipment request by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
   try {
     const shipmentRequest = await ShipmentRequest.findById(req.params.id)
       .populate('created_by', 'full_name email employee_id')
@@ -186,7 +203,7 @@ router.post('/', async (req, res) => {
 });
 
 // Update shipment request
-router.put('/:id', async (req, res) => {
+router.put('/:id', validateObjectIdParam('id'), async (req, res) => {
   try {
     const shipmentRequest = await ShipmentRequest.findById(req.params.id);
     if (!shipmentRequest) {
