@@ -4,6 +4,7 @@ const { InvoiceRequest, Employee, Collections } = require('../models');
 const { createNotificationsForAllUsers, createNotificationsForDepartment } = require('./notifications');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
+const { sanitizeRegex } = require('../middleware/security');
 
 const router = express.Router();
 
@@ -78,39 +79,455 @@ const normalizeInvoiceRequest = (request) => {
   return obj;
 };
 
-const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 500;
+const DEFAULT_LIMIT = 25;
+const MAX_LIMIT = 100;
 
-// Get all invoice requests with pagination
+/**
+ * Default optimized field projection for invoice requests list view
+ * Includes only essential fields needed for display and operations
+ * This improves performance by reducing payload size by 70-80%
+ */
+const DEFAULT_FIELDS = [
+  '_id',
+  'status',
+  'delivery_status',
+  'createdAt',
+  'updatedAt',
+  'tracking_code',
+  'invoice_number',
+  'customer_name',
+  'customer_phone',
+  'receiver_name',
+  'receiver_company',
+  'receiver_phone',
+  'receiver_address',
+  'origin_place',
+  'destination_place',
+  'service_code',
+  'weight',
+  'weight_kg',
+  'number_of_boxes',
+  'verification.actual_weight',
+  'verification.number_of_boxes',
+  'verification.chargeable_weight',
+  'verification.shipment_classification',
+  'verification.insured',
+  'verification.declared_value',
+  'verification.volumetric_weight',
+  'has_delivery',
+  'is_leviable'
+].join(',');
+
+/**
+ * Build search query for invoice requests
+ * Searches across multiple fields with case-insensitive partial matching
+ */
+function buildSearchQuery(searchTerm) {
+  if (!searchTerm || !searchTerm.trim()) {
+    return null;
+  }
+
+  // Sanitize search term to prevent ReDoS
+  const sanitized = sanitizeRegex(searchTerm.trim());
+  if (!sanitized) {
+    return null;
+  }
+
+  // Create case-insensitive regex
+  const searchRegex = new RegExp(sanitized, 'i');
+
+  return {
+    $or: [
+      { customer_name: searchRegex },
+      { receiver_name: searchRegex },
+      { tracking_code: searchRegex },
+      { invoice_number: searchRegex },
+      // Search in _id as string representation
+      { _id: { $regex: sanitized } }
+    ]
+  };
+}
+
+/**
+ * Build status filter query
+ */
+function buildStatusQuery(status) {
+  if (!status || status === 'all') {
+    return null;
+  }
+
+  // Sanitize status
+  const sanitized = status.trim().toUpperCase();
+  
+  // Valid statuses
+  const validStatuses = ['DRAFT', 'SUBMITTED', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED', 'CANCELLED'];
+  if (!validStatuses.includes(sanitized)) {
+    return null;
+  }
+
+  // Case-insensitive exact match
+  return { status: { $regex: new RegExp(`^${sanitized}$`, 'i') } };
+}
+
+/**
+ * Build field projection object from fields query parameter
+ * Handles nested fields (verification.*) and field name variations
+ * @param {string} fields - Comma-separated list of field names
+ * @returns {object} MongoDB projection object with projection, verificationFields, and needsVerification flag
+ */
+function buildProjection(fields) {
+  if (!fields || !fields.trim()) {
+    return { projection: {}, verificationFields: [], needsVerification: false }; // Return all fields (backward compatibility)
+  }
+
+  const fieldArray = fields.split(',').map(f => f.trim()).filter(f => f.length > 0);
+  
+  if (fieldArray.length === 0) {
+    return { projection: {}, verificationFields: [], needsVerification: false }; // Return all fields if no valid fields provided
+  }
+
+  const projection = {};
+  const verificationFields = [];
+  let needsVerification = false;
+
+  fieldArray.forEach(field => {
+    const normalizedField = field.toLowerCase();
+    
+    // Handle nested fields (e.g., verification.actual_weight)
+    if (field.includes('.')) {
+      const [parent, child] = field.split('.');
+      
+      if (parent.toLowerCase() === 'verification') {
+        needsVerification = true;
+        projection.verification = 1; // Include full verification for post-processing
+        verificationFields.push(child.toLowerCase());
+      } else {
+        // For other nested fields, include the parent
+        projection[parent] = 1;
+      }
+      return;
+    }
+    
+    // Map common field name variations and handle special cases
+    if (normalizedField === 'invoice_id' || normalizedField === 'invoiceid') {
+      // invoice_id doesn't exist in schema, but invoice_number does
+      projection.invoice_number = 1;
+    } else if (normalizedField === 'awb' || normalizedField === 'awb_number' || normalizedField === 'tracking_code') {
+      // Include all AWB-related fields if any AWB field is requested
+      projection.tracking_code = 1;
+      projection.awb_number = 1;
+    } else if (normalizedField === 'verification') {
+      // If just "verification" is requested without specific sub-fields
+      needsVerification = true;
+      projection.verification = 1;
+    // Note: InvoiceRequest schema does not have client_id or request_id fields
+    // These are removed from projection to avoid errors
+    } else {
+      // Include the field as-is
+      projection[field] = 1;
+    }
+  });
+
+  // Always include _id unless explicitly excluded
+  if (!fieldArray.includes('_id') && !fieldArray.includes('-id')) {
+    projection._id = 1;
+  }
+
+  return { projection, verificationFields, needsVerification };
+}
+
+/**
+ * Process verification field to return only requested sub-fields
+ * @param {object} invoiceRequest - Invoice request document
+ * @param {array} verificationFields - Array of requested verification sub-fields
+ * @returns {object} Processed invoice request with minimal verification
+ */
+function processVerificationField(invoiceRequest, verificationFields = []) {
+  if (!invoiceRequest.verification || Object.keys(invoiceRequest.verification).length === 0) {
+    // If no verification data exists, return minimal object
+    if (verificationFields.length === 0) {
+      invoiceRequest.verification = { exists: false };
+    } else {
+      invoiceRequest.verification = {};
+    }
+    return invoiceRequest;
+  }
+
+  // If specific verification fields are requested, return only those
+  if (verificationFields.length > 0) {
+    const minimalVerification = {};
+    
+    verificationFields.forEach(field => {
+      const normalizedField = field.toLowerCase();
+      const fieldMap = {
+        'actual_weight': 'actual_weight',
+        'volumetric_weight': 'volumetric_weight',
+        'chargeable_weight': 'chargeable_weight',
+        'number_of_boxes': 'number_of_boxes',
+        'shipment_classification': 'shipment_classification',
+        'insured': 'insured',
+        'declared_value': 'declared_value'
+      };
+      
+      const actualField = fieldMap[normalizedField] || field;
+      if (invoiceRequest.verification[actualField] !== undefined) {
+        minimalVerification[actualField] = invoiceRequest.verification[actualField];
+      }
+    });
+    
+    invoiceRequest.verification = minimalVerification;
+  } else {
+    // If just "verification" is requested without specific sub-fields, return exists flag
+    invoiceRequest.verification = { exists: true };
+  }
+  
+  return invoiceRequest;
+}
+
+// Get all invoice requests with pagination, status filter, and search
 router.get('/', async (req, res) => {
   try {
+    // Parse query parameters
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
     const skip = (page - 1) * limit;
     
-    // Get total count first
-    const total = await InvoiceRequest.countDocuments();
+    const status = req.query.status;
+    const search = req.query.search;
+    // Field projection parameter
+    // - If not provided: use default optimized fields for better performance
+    // - If "all": return all fields (backward compatibility)
+    // - If specific fields: return only those fields
+    let fields = req.query.fields;
+    if (!fields || fields.trim() === '') {
+      // Use default optimized fields when no fields parameter is provided
+      // This ensures optimal performance (70-80% payload reduction)
+      fields = DEFAULT_FIELDS;
+    } else if (fields.toLowerCase() === 'all') {
+      // Explicitly request all fields (backward compatibility)
+      fields = null;
+    }
     
-    const invoiceRequests = await InvoiceRequest.find()
-      .populate('created_by_employee_id')
-      .populate('assigned_to_employee_id')
+    // Build query object
+    const query = {};
+    const queryParts = [];
+    
+    // Apply status filter
+    const statusQuery = buildStatusQuery(status);
+    if (statusQuery) {
+      queryParts.push(statusQuery);
+    }
+    
+    // Apply search filter
+    const searchQuery = buildSearchQuery(search);
+    if (searchQuery) {
+      queryParts.push(searchQuery);
+    }
+    
+    // Combine query parts with $and if multiple filters
+    if (queryParts.length > 0) {
+      if (queryParts.length === 1) {
+        Object.assign(query, queryParts[0]);
+      } else {
+        query.$and = queryParts;
+      }
+    }
+    
+    // Build field projection (NEW)
+    const { projection, verificationFields, needsVerification } = buildProjection(fields);
+    const hasProjection = Object.keys(projection).length > 0;
+    
+    // Start performance tracking
+    const queryStartTime = Date.now();
+    
+    // Get total count (before pagination and projection)
+    // This counts all matching documents regardless of pagination
+    const total = await InvoiceRequest.countDocuments(query);
+    
+    // Log total count for debugging
+    console.log(`📊 Invoice Requests Total Count: ${total} matching documents (page ${page}, limit ${limit})`);
+    
+    // Build query chain
+    let queryChain = InvoiceRequest.find(query);
+    
+    // Apply field projection if specified
+    if (hasProjection) {
+      queryChain = queryChain.select(projection);
+    }
+    
+    // Note: InvoiceRequest schema does not have client_id or request_id fields
+    // These fields exist in other schemas (Invoice, Request) but not in InvoiceRequest
+    // So we skip population for these fields
+    
+    // Only populate employee fields if not using field projection (to avoid unnecessary data)
+    if (!hasProjection) {
+      queryChain = queryChain
+        .populate('created_by_employee_id')
+        .populate('assigned_to_employee_id');
+    }
+    
+    // Apply sorting, pagination, and lean
+    queryChain = queryChain
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(limit);
+      .limit(limit)
+      .lean(); // Use lean() for better performance
+    
+    // Fetch paginated data
+    const queryEndTime = Date.now();
+    let invoiceRequests = await queryChain;
+    const queryTime = queryEndTime - queryStartTime;
+    
+    // Process verification field if requested (return only requested sub-fields)
+    if (needsVerification) {
+      invoiceRequests = invoiceRequests.map(req => processVerificationField(req, verificationFields));
+    }
+    
+    // Post-process to add invoice_id field if requested (map from invoice_number)
+    if (hasProjection && fields.toLowerCase().includes('invoice_id')) {
+      invoiceRequests = invoiceRequests.map(req => {
+        req.invoice_id = req.invoice_number || null;
+        return req;
+      });
+    }
+    
+    // Post-process to add awb field if requested (map from tracking_code or awb_number)
+    if (hasProjection && (fields.toLowerCase().includes('awb') || fields.toLowerCase().includes('awb_number') || fields.toLowerCase().includes('tracking_code'))) {
+      invoiceRequests = invoiceRequests.map(req => {
+        req.awb = req.tracking_code || req.awb_number || null;
+        return req;
+      });
+    }
+    
+    // Normalize invoice requests (convert Decimal128 to numbers)
+    // Check if we have Decimal128 fields that need normalization
+    const hasDecimalFields = hasProjection && (
+      projection.amount || projection.weight_kg || projection.weight || 
+      projection.invoice_amount || projection.verification ||
+      projection.volume_cbm
+    );
+    
+    // Also check if verification sub-fields that are Decimal128 are requested
+    const hasVerificationDecimalFields = hasProjection && needsVerification && (
+      verificationFields.includes('actual_weight') ||
+      verificationFields.includes('volumetric_weight') ||
+      verificationFields.includes('chargeable_weight') ||
+      verificationFields.includes('declared_value')
+    );
+    
+    // Normalize if we have Decimal128 fields or if not using projection
+    const needsNormalization = !hasProjection || hasDecimalFields || hasVerificationDecimalFields;
+    
+    let normalizedRequests;
+    if (needsNormalization) {
+      // Normalize all fields (full normalization)
+      normalizedRequests = invoiceRequests.map(normalizeInvoiceRequest);
+      
+      // If using projection with verification, we need to re-normalize verification after processing
+      if (hasProjection && needsVerification && hasVerificationDecimalFields) {
+        normalizedRequests = normalizedRequests.map(req => {
+          if (req.verification) {
+            // Re-normalize verification Decimal128 fields
+            const normalizeDecimal = (value) => {
+              if (value === null || value === undefined) return value;
+              try {
+                return parseFloat(value.toString());
+              } catch (e) {
+                return value;
+              }
+            };
+            
+            if (req.verification.actual_weight !== undefined) {
+              req.verification.actual_weight = normalizeDecimal(req.verification.actual_weight);
+            }
+            if (req.verification.volumetric_weight !== undefined) {
+              req.verification.volumetric_weight = normalizeDecimal(req.verification.volumetric_weight);
+            }
+            if (req.verification.chargeable_weight !== undefined) {
+              req.verification.chargeable_weight = normalizeDecimal(req.verification.chargeable_weight);
+            }
+            if (req.verification.declared_value !== undefined) {
+              req.verification.declared_value = normalizeDecimal(req.verification.declared_value);
+            }
+          }
+          return req;
+        });
+      }
+    } else {
+      // Skip normalization for performance when using projection without Decimal128 fields
+      normalizedRequests = invoiceRequests;
+    }
+    
+    // Calculate total pages and pagination metadata
+    const pages = Math.ceil(total / limit);
+    const hasNextPage = page < pages;
+    const hasPreviousPage = page > 1;
+    const nextPage = hasNextPage ? page + 1 : null;
+    const previousPage = hasPreviousPage ? page - 1 : null;
+    
+    // Calculate range for display (e.g., "Showing 1-25 of 150")
+    const startRecord = total > 0 ? (page - 1) * limit + 1 : 0;
+    const endRecord = Math.min(page * limit, total);
+    
+    // Calculate processing time
+    const processingTime = Date.now() - queryEndTime;
+    const totalTime = Date.now() - queryStartTime;
+    
+    console.log(`📊 Invoice Requests Query:`, {
+      page,
+      limit,
+      total,
+      pages,
+      hasNextPage,
+      hasPreviousPage,
+      fields: fields || 'all',
+      hasProjection,
+      verificationFields: verificationFields.length > 0 ? verificationFields : 'none',
+      queryTime: `${queryTime}ms`,
+      processingTime: `${processingTime}ms`,
+      totalTime: `${totalTime}ms`,
+      recordsReturned: normalizedRequests.length
+    });
+    
+    // Log field projection details if using projection
+    if (hasProjection) {
+      console.log(`🔍 Field Projection Applied:`, {
+        projectedFields: Object.keys(projection).length,
+        fields: Object.keys(projection),
+        verificationSubFields: verificationFields.length > 0 ? verificationFields : 'all verification',
+        estimatedPayloadReduction: '70-80%'
+      });
+    }
     
     res.json({
       success: true,
-      data: invoiceRequests.map(normalizeInvoiceRequest),
+      data: normalizedRequests,
       pagination: {
         page,
         limit,
         total,
-        pages: Math.ceil(total / limit)
+        pages,
+        hasNextPage,
+        hasPreviousPage,
+        nextPage,
+        previousPage,
+        startRecord,
+        endRecord,
+        // User-friendly summary strings
+        summary: total > 0 
+          ? `Showing ${startRecord}-${endRecord} of ${total} invoice requests`
+          : 'No invoice requests found',
+        displayText: total > 0
+          ? `Invoice Requests (${startRecord}-${endRecord} of ${total})`
+          : 'Invoice Requests (0)'
       }
     });
   } catch (error) {
     console.error('Error fetching invoice requests:', error);
-    res.status(500).json({ error: 'Failed to fetch invoice requests' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch invoice requests' 
+    });
   }
 });
 

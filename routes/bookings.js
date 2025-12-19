@@ -15,6 +15,32 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const HEAVY_FIELDS_PROJECTION = '-identityDocuments -attachments -documents -files';
 
+// Lightweight projection for list views - exclude heavy fields only
+// This approach excludes heavy data while keeping all other fields
+const LIGHTWEIGHT_PROJECTION = [
+  '-identityDocuments',
+  '-attachments',
+  '-documents',
+  '-files',
+  '-images',
+  '-customerImage',
+  '-customerImages',
+  '-customer_images',
+  '-selfie',
+  '-photos',
+  '-booking_data',
+  '-booking_snapshot',
+  '-sender.images',
+  '-sender.selfie',
+  '-sender.customerImage',
+  '-sender.customerImages',
+  '-sender.customer_images',
+  '-receiver.images',
+  '-receiver.selfie',
+  '-receiver.customerImage',
+  '-receiver.customerImages'
+].join(' ');
+
 // ========================================
 // FILTERING HELPER FUNCTIONS
 // ========================================
@@ -147,8 +173,14 @@ function buildAwbQuery(awb) {
   try {
     return {
       $or: [
+        // Primary AWB field (most common)
+        { awb: { $regex: escapedAwb, $options: 'i' } },
+        // Alternative AWB fields
         { tracking_code: { $regex: escapedAwb, $options: 'i' } },
         { awb_number: { $regex: escapedAwb, $options: 'i' } },
+        { referenceNumber: { $regex: escapedAwb, $options: 'i' } },
+        { trackingNumber: { $regex: escapedAwb, $options: 'i' } },
+        // Nested request_id fields
         { 'request_id.tracking_code': { $regex: escapedAwb, $options: 'i' } },
         { 'request_id.awb_number': { $regex: escapedAwb, $options: 'i' } }
       ]
@@ -266,7 +298,8 @@ router.put('/:id', validateObjectIdParam('id'), async (req, res) => {
   }
 });
 
-// Search AWB numbers by customer first name and last name
+// Search bookings by customer first name and last name
+// Returns full booking objects with AWB information for invoice request filtering
 router.post('/search-awb-by-name', auth, async (req, res) => {
   try {
     const { firstName, lastName } = req.body;
@@ -289,8 +322,14 @@ router.post('/search-awb-by-name', auth, async (req, res) => {
       });
     }
     
-    const searchFirstName = firstName.trim().toLowerCase();
-    const searchLastName = lastName.trim().toLowerCase();
+    const searchFirstName = firstName.trim();
+    const searchLastName = lastName.trim();
+    
+    // Check if this is a single name search (firstName === lastName)
+    const isSingleName = searchFirstName.toLowerCase() === searchLastName.toLowerCase();
+    const searchName = isSingleName ? searchFirstName : null;
+    
+    console.log(`🔍 Search Parameters: firstName="${searchFirstName}", lastName="${searchLastName}", isSingleName=${isSingleName}`);
     
     // Validate input contains only safe characters
     const safeNamePattern = /^[a-zA-Z\s'-]+$/;
@@ -306,87 +345,268 @@ router.post('/search-awb-by-name', auth, async (req, res) => {
     const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const escapedFirstName = escapeRegex(searchFirstName);
     const escapedLastName = escapeRegex(searchLastName);
+    const escapedSearchName = searchName ? escapeRegex(searchName) : null;
+    
+    // Build regex patterns for partial matching (case-insensitive)
+    // Support partial matches for better user experience
+    const firstNameRegex = new RegExp(escapedFirstName, 'i');
+    const lastNameRegex = new RegExp(escapedLastName, 'i');
+    const singleNameRegex = escapedSearchName ? new RegExp(escapedSearchName, 'i') : null;
     
     // Build regex patterns for full name matching (handles both "First Last" and "Last First")
-    // Limit pattern complexity to prevent ReDoS
-    const fullNamePattern1 = new RegExp(`^${escapedFirstName}\\s+${escapedLastName}$`, 'i');
-    const fullNamePattern2 = new RegExp(`^${escapedLastName}\\s+${escapedFirstName}$`, 'i');
-    const firstNameRegex = new RegExp(`^${escapedFirstName}$`, 'i');
-    const lastNameRegex = new RegExp(`^${escapedLastName}$`, 'i');
+    const fullNamePattern1 = new RegExp(`${escapedFirstName}.*${escapedLastName}|${escapedLastName}.*${escapedFirstName}`, 'i');
+    const fullNamePattern2 = new RegExp(`^${escapedFirstName}\\s+${escapedLastName}$`, 'i');
+    const fullNamePattern3 = new RegExp(`^${escapedLastName}\\s+${escapedFirstName}$`, 'i');
 
-    // Build search query for MongoDB
-    // Use regex patterns for flexible matching
-    const nameQuery = {
-      $or: [
-        // Match customer_name field (handles both "First Last" and "Last First")
-        { customer_name: { $regex: fullNamePattern1 } },
-        { customer_name: { $regex: fullNamePattern2 } },
-        // Match customerName field
-        { customerName: { $regex: fullNamePattern1 } },
-        { customerName: { $regex: fullNamePattern2 } },
-        // Match name field
-        { name: { $regex: fullNamePattern1 } },
-        { name: { $regex: fullNamePattern2 } },
-        // Match sender.fullName
-        { 'sender.fullName': { $regex: fullNamePattern1 } },
-        { 'sender.fullName': { $regex: fullNamePattern2 } },
-        // Match sender.name
-        { 'sender.name': { $regex: fullNamePattern1 } },
-        { 'sender.name': { $regex: fullNamePattern2 } },
-        // Match nested sender object with firstName and lastName
-        {
-          'sender.firstName': firstNameRegex,
-          'sender.lastName': lastNameRegex
-        },
-        // Match customer.firstName and customer.lastName (if exists)
-        {
-          'customer.firstName': firstNameRegex,
-          'customer.lastName': lastNameRegex
-        }
-      ]
-    };
+    // Build search query based on whether it's a single name or full name search
+    let nameQuery;
+    
+    if (isSingleName && singleNameRegex) {
+      // Single name search - search more broadly in any name field
+      console.log(`🔍 Using single name search for: "${searchName}"`);
+      
+      nameQuery = {
+        $or: [
+          // Search in sender fields
+          { 'sender.firstName': singleNameRegex },
+          { 'sender.first_name': singleNameRegex },
+          { 'sender.firstname': singleNameRegex },
+          { 'sender.lastName': singleNameRegex },
+          { 'sender.last_name': singleNameRegex },
+          { 'sender.lastname': singleNameRegex },
+          { 'sender.name': singleNameRegex },
+          { 'sender.fullName': singleNameRegex },
+          { 'sender.full_name': singleNameRegex },
+          { 'sender.fullname': singleNameRegex },
+          // Search in receiver fields
+          { 'receiver.firstName': singleNameRegex },
+          { 'receiver.first_name': singleNameRegex },
+          { 'receiver.firstname': singleNameRegex },
+          { 'receiver.lastName': singleNameRegex },
+          { 'receiver.last_name': singleNameRegex },
+          { 'receiver.lastname': singleNameRegex },
+          { 'receiver.name': singleNameRegex },
+          { 'receiver.fullName': singleNameRegex },
+          { 'receiver.full_name': singleNameRegex },
+          { 'receiver.fullname': singleNameRegex },
+          // Search in root-level fields
+          { customer_name: singleNameRegex },
+          { customerName: singleNameRegex },
+          { name: singleNameRegex }
+        ]
+      };
+    } else {
+      // Full name search - search for both firstName and lastName
+      console.log(`🔍 Using full name search for: "${searchFirstName}" "${searchLastName}"`);
+      
+      // Build search query for sender fields
+      const senderQuery = {
+        $or: [
+          // Match sender.firstName and sender.lastName (partial match)
+          {
+            $and: [
+              {
+                $or: [
+                  { 'sender.firstName': firstNameRegex },
+                  { 'sender.first_name': firstNameRegex },
+                  { 'sender.firstname': firstNameRegex }
+                ]
+              },
+              {
+                $or: [
+                  { 'sender.lastName': lastNameRegex },
+                  { 'sender.last_name': lastNameRegex },
+                  { 'sender.lastname': lastNameRegex }
+                ]
+              }
+            ]
+          },
+          // Match sender full name fields (handles combined names)
+          {
+            $or: [
+              { 'sender.name': fullNamePattern1 },
+              { 'sender.fullName': fullNamePattern1 },
+              { 'sender.full_name': fullNamePattern1 },
+              { 'sender.fullname': fullNamePattern1 },
+              { 'sender.name': fullNamePattern2 },
+              { 'sender.fullName': fullNamePattern2 },
+              { 'sender.name': fullNamePattern3 },
+              { 'sender.fullName': fullNamePattern3 }
+            ]
+          }
+        ]
+      };
+
+      // Build search query for receiver fields (optional - also search in receiver)
+      const receiverQuery = {
+        $or: [
+          // Match receiver.firstName and receiver.lastName (partial match)
+          {
+            $and: [
+              {
+                $or: [
+                  { 'receiver.firstName': firstNameRegex },
+                  { 'receiver.first_name': firstNameRegex },
+                  { 'receiver.firstname': firstNameRegex }
+                ]
+              },
+              {
+                $or: [
+                  { 'receiver.lastName': lastNameRegex },
+                  { 'receiver.last_name': lastNameRegex },
+                  { 'receiver.lastname': lastNameRegex }
+                ]
+              }
+            ]
+          },
+          // Match receiver full name fields
+          {
+            $or: [
+              { 'receiver.name': fullNamePattern1 },
+              { 'receiver.fullName': fullNamePattern1 },
+              { 'receiver.full_name': fullNamePattern1 },
+              { 'receiver.fullname': fullNamePattern1 },
+              { 'receiver.name': fullNamePattern2 },
+              { 'receiver.fullName': fullNamePattern2 },
+              { 'receiver.name': fullNamePattern3 },
+              { 'receiver.fullName': fullNamePattern3 }
+            ]
+          }
+        ]
+      };
+
+      // Also search in root-level customer_name field (for backward compatibility)
+      const rootNameQuery = {
+        $or: [
+          { customer_name: fullNamePattern1 },
+          { customerName: fullNamePattern1 },
+          { name: fullNamePattern1 },
+          { customer_name: fullNamePattern2 },
+          { customerName: fullNamePattern2 },
+          { name: fullNamePattern2 },
+          { customer_name: fullNamePattern3 },
+          { customerName: fullNamePattern3 },
+          { name: fullNamePattern3 }
+        ]
+      };
+
+      // Combine all queries
+      nameQuery = {
+        $or: [
+          senderQuery,
+          receiverQuery,
+          rootNameQuery
+        ]
+      };
+    }
 
     // Search in bookings collection with limit to prevent memory issues
+    // Return full booking objects with AWB and sender/receiver information
+    // Note: request_id is not in Booking schema, so we don't populate it
     const bookings = await Booking.find(nameQuery)
-      .select('tracking_code awb awb_number referenceNumber')
-      .limit(1000) // Limit to prevent loading too many results
+      .select('awb tracking_code awb_number referenceNumber trackingNumber sender receiver')
+      .limit(100) // Limit to 100 results for performance
       .lean();
 
-    // Search in invoice requests collection with limit
-    const invoiceRequests = await InvoiceRequest.find(nameQuery)
-      .select('tracking_code awb_number invoice_number')
-      .limit(1000) // Limit to prevent loading too many results
-      .lean();
+    // Process bookings to ensure AWB information is included in response
+    const processedBookings = bookings.map(booking => {
+      // Extract AWB from multiple possible fields
+      const awb = booking.tracking_code || 
+                  booking.awb_number || 
+                  booking.awb || 
+                  booking.referenceNumber ||
+                  booking.trackingNumber ||
+                  null;
 
-    // Extract unique AWB numbers
-    const awbNumbers = new Set();
-
-    [...bookings, ...invoiceRequests].forEach(item => {
-      // Priority: tracking_code > awb_number > awb
-      const awb = item.tracking_code ||
-                  item.awb_number ||
-                  item.awb;
-      
-      if (awb && typeof awb === 'string' && awb.trim()) {
-        awbNumbers.add(awb.trim());
-      }
+      return {
+        _id: booking._id,
+        awb: awb,
+        tracking_code: booking.tracking_code || null,
+        awb_number: booking.awb_number || null,
+        sender: booking.sender || null,
+        receiver: booking.receiver || null
+      };
     });
 
-    // Convert Set to Array and sort alphabetically
-    const uniqueAwbNumbers = Array.from(awbNumbers).sort();
+    console.log(`📊 Search by Name: Found ${processedBookings.length} bookings for "${firstName} ${lastName}"`);
 
     res.json({
       success: true,
-      data: {
-        awbNumbers: uniqueAwbNumbers
-      }
+      data: processedBookings
     });
 
   } catch (error) {
-    console.error('Error searching AWB by name:', error);
+    console.error('Error searching bookings by name:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to search for AWB numbers',
+      error: 'Failed to search bookings by name',
+      details: error.message
+    });
+  }
+});
+
+// Search bookings by AWB number
+router.get('/search-awb', auth, async (req, res) => {
+  try {
+    const { awb } = req.query;
+
+    // Validate input
+    if (!awb || !awb.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'AWB number is required'
+      });
+    }
+
+    // Sanitize AWB input
+    const sanitizedAwb = sanitizeAwb(awb);
+    if (!sanitizedAwb) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid AWB number format'
+      });
+    }
+
+    // Escape special regex characters to prevent ReDoS
+    const escapedAwb = sanitizeRegex(sanitizedAwb);
+
+    // Build search query - search in multiple fields with case-insensitive partial match
+    // Priority: awb > tracking_code > awb_number
+    const query = {
+      $or: [
+        { awb: { $regex: escapedAwb, $options: 'i' } },
+        { tracking_code: { $regex: escapedAwb, $options: 'i' } },
+        { awb_number: { $regex: escapedAwb, $options: 'i' } },
+        { referenceNumber: { $regex: escapedAwb, $options: 'i' } },
+        { trackingNumber: { $regex: escapedAwb, $options: 'i' } }
+      ]
+    };
+
+    // Search bookings with limit and sorting
+    // Sort to prioritize exact matches in awb field, then by creation date
+    const bookings = await Booking.find(query)
+      .select(HEAVY_FIELDS_PROJECTION)
+      .limit(50)
+      .sort({ 
+        // Prioritize bookings with awb field matching
+        awb: 1,
+        createdAt: -1 
+      })
+      .lean();
+
+    // Format bookings using the existing formatter
+    const formattedBookings = formatBookings(bookings);
+
+    return res.json({
+      success: true,
+      data: formattedBookings
+    });
+
+  } catch (error) {
+    console.error('Error searching bookings by AWB:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to search bookings',
       details: error.message
     });
   }
@@ -574,24 +794,29 @@ router.get('/status/:reviewStatus', async (req, res) => {
       }
     }
     
-    // If AWB filter is present OR all=true, query full database (no pagination)
-    // Otherwise, use pagination for backward compatibility
+    // For "not reviewed" status, always fetch ALL bookings (no pagination)
+    // For other statuses, use pagination unless all=true or AWB filter is present
+    const normalizedStatus = normalizeStatus(reviewStatus);
+    const isNotReviewed = normalizedStatus === 'not_reviewed';
+    const shouldGetAll = isNotReviewed || hasAwbFilter || getAll;
+    
     let bookings;
     let total;
-    const shouldGetAll = hasAwbFilter || getAll;
     
     if (shouldGetAll) {
       // Filter full database - no pagination, return ALL matching results
+      // Use lightweight projection to exclude heavy data
       bookings = await Booking.find(query)
-        .select(HEAVY_FIELDS_PROJECTION)
+        .select(LIGHTWEIGHT_PROJECTION)
         .lean()
         .sort({ createdAt: -1 });
       // No limit applied - get all results
       total = bookings.length;
       
-      console.log(`📊 Fetched ${total} bookings by status "${reviewStatus}" ${hasAwbFilter ? 'with AWB filter' : 'without AWB filter (all=true)'}`);
+      const filterInfo = hasAwbFilter ? 'with AWB filter' : (isNotReviewed ? '(all not reviewed)' : 'without AWB filter (all=true)');
+      console.log(`📊 Fetched ${total} bookings by status "${reviewStatus}" ${filterInfo}`);
     } else {
-      // No AWB filter and not requesting all - use pagination
+      // Use pagination for other statuses
       const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
       const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
       const skip = (page - 1) * limit;
@@ -599,9 +824,9 @@ router.get('/status/:reviewStatus', async (req, res) => {
       // Get total count first
       total = await Booking.countDocuments(query);
       
-      // Use lean() to get plain JavaScript objects with all fields including OTP
+      // Use lightweight projection to exclude heavy data
       bookings = await Booking.find(query)
-        .select(HEAVY_FIELDS_PROJECTION)
+        .select(LIGHTWEIGHT_PROJECTION)
         .lean()
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -625,10 +850,11 @@ router.get('/status/:reviewStatus', async (req, res) => {
     // Format bookings
     const formattedBookings = formatBookings(bookings);
     
-    // Return response - no pagination when AWB filter is applied
+    // Return response - no pagination when fetching all
     res.json({ 
       success: true, 
-      data: formattedBookings
+      data: formattedBookings,
+      total: total
     });
   } catch (error) {
     console.error('Error fetching bookings by status:', error);

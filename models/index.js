@@ -777,6 +777,15 @@ invoiceRequestSchema.index({ status: 1 });
 invoiceRequestSchema.index({ created_by_employee_id: 1 });
 invoiceRequestSchema.index({ assigned_to_employee_id: 1 });
 invoiceRequestSchema.index({ delivery_status: 1 });
+// Indexes for search and pagination performance
+invoiceRequestSchema.index({ customer_name: 1 });
+invoiceRequestSchema.index({ receiver_name: 1 });
+invoiceRequestSchema.index({ tracking_code: 1 });
+invoiceRequestSchema.index({ invoice_number: 1 });
+invoiceRequestSchema.index({ createdAt: -1 });
+// Compound indexes for common query patterns
+invoiceRequestSchema.index({ status: 1, createdAt: -1 });
+invoiceRequestSchema.index({ customer_name: 1, status: 1 });
 invoiceRequestSchema.index({ shipment_type: 1 });
 
 // Collections Schema
@@ -1012,6 +1021,15 @@ bookingSchema.index({ review_status: 1 });
 bookingSchema.index({ createdAt: -1 });
 bookingSchema.index({ shipment_status: 1 });
 bookingSchema.index({ batch_no: 1 });
+// Indexes for AWB search performance
+bookingSchema.index({ awb: 1 });
+bookingSchema.index({ tracking_code: 1 });
+bookingSchema.index({ awb_number: 1 });
+
+// Indexes for name-based search performance
+bookingSchema.index({ 'sender.firstName': 1, 'sender.lastName': 1 });
+bookingSchema.index({ 'receiver.firstName': 1, 'receiver.lastName': 1 });
+bookingSchema.index({ 'sender.name': 'text', 'receiver.name': 'text', 'customer_name': 'text' }); // Text index for full name search
 
 const Booking = mongoose.models.Booking || mongoose.model('Booking', bookingSchema);
 

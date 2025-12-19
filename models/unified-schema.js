@@ -973,7 +973,7 @@ const deliveryAssignmentSchema = new mongoose.Schema({
   payment_method: {
     type: String,
     required: false,
-    enum: ['CASH', 'BANK_TRANSFER', 'CARD', 'CHEQUE'],
+    enum: ['CASH', 'BANK_TRANSFER', 'CARD', 'CHEQUE', 'TABBY'],
   },
   payment_collected_at: {
     type: Date,
@@ -1034,7 +1034,7 @@ const qrPaymentSessionSchema = new mongoose.Schema({
   payment_method: {
     type: String,
     required: false,
-    enum: ['CASH', 'BANK_TRANSFER', 'CARD', 'CHEQUE'],
+    enum: ['CASH', 'BANK_TRANSFER', 'CARD', 'CHEQUE', 'TABBY'],
   },
   amount: {
     type: mongoose.Schema.Types.Decimal128,
