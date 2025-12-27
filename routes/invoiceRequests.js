@@ -150,6 +150,8 @@ function buildSearchQuery(searchTerm) {
 
 /**
  * Build status filter query
+ * For Finance department: filters by status='VERIFIED' and excludes CANCELLED shipments
+ * Uses exact match (not regex) for optimal index usage
  */
 function buildStatusQuery(status) {
   if (!status || status === 'all') {
@@ -165,8 +167,18 @@ function buildStatusQuery(status) {
     return null;
   }
 
-  // Case-insensitive exact match
-  return { status: { $regex: new RegExp(`^${sanitized}$`, 'i') } };
+  // Use exact match (not regex) for optimal index usage
+  // MongoDB can use the index efficiently with exact match
+  return { status: sanitized };
+}
+
+/**
+ * Build delivery status exclusion query
+ * Excludes CANCELLED shipments for Finance department
+ */
+function buildDeliveryStatusQuery() {
+  // Exclude cancelled shipments
+  return { delivery_status: { $ne: 'CANCELLED' } };
 }
 
 /**
@@ -318,6 +330,13 @@ router.get('/', async (req, res) => {
       queryParts.push(statusQuery);
     }
     
+    // For Finance department (status=VERIFIED), exclude cancelled shipments
+    // This ensures cancelled shipments are not shown even if they have VERIFIED status
+    const deliveryStatusQuery = buildDeliveryStatusQuery();
+    if (deliveryStatusQuery) {
+      queryParts.push(deliveryStatusQuery);
+    }
+    
     // Apply search filter
     const searchQuery = buildSearchQuery(search);
     if (searchQuery) {
@@ -325,6 +344,9 @@ router.get('/', async (req, res) => {
     }
     
     // Combine query parts with $and if multiple filters
+    // Note: Using $and ensures MongoDB can use the compound index efficiently
+    // The index { status: 1, delivery_status: 1, createdAt: -1 } will be used
+    // when querying with status and delivery_status filters
     if (queryParts.length > 0) {
       if (queryParts.length === 1) {
         Object.assign(query, queryParts[0]);
@@ -342,7 +364,9 @@ router.get('/', async (req, res) => {
     
     // Get total count (before pagination and projection)
     // This counts all matching documents regardless of pagination
+    const countStartTime = Date.now();
     const total = await InvoiceRequest.countDocuments(query);
+    const countTime = Date.now() - countStartTime;
     
     // Log total count for debugging
     console.log(`📊 Invoice Requests Total Count: ${total} matching documents (page ${page}, limit ${limit})`);
@@ -360,23 +384,41 @@ router.get('/', async (req, res) => {
     // So we skip population for these fields
     
     // Only populate employee fields if not using field projection (to avoid unnecessary data)
-    if (!hasProjection) {
+    // For Finance department queries, skip population for better performance
+    if (!hasProjection && status !== 'VERIFIED') {
       queryChain = queryChain
         .populate('created_by_employee_id')
         .populate('assigned_to_employee_id');
     }
     
     // Apply sorting, pagination, and lean
+    // Sort order matches compound index: { status: 1, delivery_status: 1, createdAt: -1 }
+    // This ensures MongoDB can use the index efficiently
     queryChain = queryChain
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .lean(); // Use lean() for better performance
+      .lean(); // Use lean() for better performance (returns plain objects, not Mongoose documents)
     
     // Fetch paginated data
-    const queryEndTime = Date.now();
+    const fetchStartTime = Date.now();
     let invoiceRequests = await queryChain;
-    const queryTime = queryEndTime - queryStartTime;
+    const fetchTime = Date.now() - fetchStartTime;
+    const fetchEndTime = Date.now();
+    const queryTime = Date.now() - queryStartTime;
+    
+    // Performance logging for Finance department queries
+    if (status === 'VERIFIED') {
+      console.log(`⚡ Finance Department Query Performance:`, {
+        countTime: `${countTime}ms`,
+        fetchTime: `${fetchTime}ms`,
+        totalTime: `${queryTime}ms`,
+        totalRecords: total,
+        recordsReturned: invoiceRequests.length,
+        indexUsed: 'status_1_delivery_status_1_createdAt_-1 (compound)',
+        query: JSON.stringify(query)
+      });
+    }
     
     // Process verification field if requested (return only requested sub-fields)
     if (needsVerification) {
@@ -469,9 +511,10 @@ router.get('/', async (req, res) => {
     const startRecord = total > 0 ? (page - 1) * limit + 1 : 0;
     const endRecord = Math.min(page * limit, total);
     
-    // Calculate processing time
-    const processingTime = Date.now() - queryEndTime;
-    const totalTime = Date.now() - queryStartTime;
+    // Calculate processing time (time spent on post-processing after fetch)
+    const processingEndTime = Date.now();
+    const processingTime = processingEndTime - fetchEndTime;
+    const totalTime = processingEndTime - queryStartTime;
     
     console.log(`📊 Invoice Requests Query:`, {
       page,

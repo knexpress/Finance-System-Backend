@@ -787,6 +787,10 @@ invoiceRequestSchema.index({ createdAt: -1 });
 invoiceRequestSchema.index({ status: 1, createdAt: -1 });
 invoiceRequestSchema.index({ customer_name: 1, status: 1 });
 invoiceRequestSchema.index({ shipment_type: 1 });
+// Compound index for Finance department queries (VERIFIED status, exclude CANCELLED)
+// This index optimizes queries filtering by status='VERIFIED' and delivery_status != 'CANCELLED'
+// Sort order matches the index for optimal performance
+invoiceRequestSchema.index({ status: 1, delivery_status: 1, createdAt: -1 });
 
 // Collections Schema
 const collectionsSchema = new mongoose.Schema({
