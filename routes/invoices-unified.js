@@ -624,23 +624,51 @@ router.post('/', async (req, res) => {
     
     if (invoiceRequest) {
       // Get weight from multiple possible sources
-      if (invoiceRequest.shipment?.weight) {
-        weight = parseFloat(invoiceRequest.shipment.weight.toString());
-      } else if (invoiceRequest.weight_kg) {
-        weight = parseFloat(invoiceRequest.weight_kg.toString());
-      } else if (invoiceRequest.verification?.chargeable_weight) {
+      // PRIORITY ORDER for Finance invoice generation:
+      // 1. verification.total_kg (manual input from Operations) - highest priority
+      // 2. verification.chargeable_weight (system-calculated)
+      // 3. verification.actual_weight
+      // 4. request.weight (fallback)
+      
+      // Check for total_kg explicitly (not just truthy, since 0 could be valid)
+      if (invoiceRequest.verification && 
+          invoiceRequest.verification.total_kg !== null && 
+          invoiceRequest.verification.total_kg !== undefined) {
+        weight = parseFloat(invoiceRequest.verification.total_kg.toString());
+        console.log(`✅ Using total_kg from verification: ${weight} kg`);
+      } else if (invoiceRequest.verification?.chargeable_weight !== null && 
+                 invoiceRequest.verification?.chargeable_weight !== undefined) {
         weight = parseFloat(invoiceRequest.verification.chargeable_weight.toString());
-      } else if (invoiceRequest.verification?.weight) {
-        weight = parseFloat(invoiceRequest.verification.weight.toString());
+        console.log(`✅ Using chargeable_weight from verification: ${weight} kg`);
+      } else if (invoiceRequest.verification?.actual_weight !== null && 
+                 invoiceRequest.verification?.actual_weight !== undefined) {
+        weight = parseFloat(invoiceRequest.verification.actual_weight.toString());
+        console.log(`✅ Using actual_weight from verification: ${weight} kg`);
+      } else if (invoiceRequest.shipment?.weight !== null && 
+                 invoiceRequest.shipment?.weight !== undefined) {
+        weight = parseFloat(invoiceRequest.shipment.weight.toString());
+        console.log(`✅ Using weight from shipment: ${weight} kg`);
+      } else if (invoiceRequest.weight_kg !== null && 
+                 invoiceRequest.weight_kg !== undefined) {
+        weight = parseFloat(invoiceRequest.weight_kg.toString());
+        console.log(`✅ Using weight_kg: ${weight} kg`);
+      } else if (invoiceRequest.weight !== null && 
+                 invoiceRequest.weight !== undefined) {
+        weight = parseFloat(invoiceRequest.weight.toString());
+        console.log(`✅ Using weight: ${weight} kg`);
       }
       
       // Get number of boxes (default to 1 if not provided)
-      const detectedBoxes = invoiceRequest.shipment?.number_of_boxes ||
-                            invoiceRequest.verification?.number_of_boxes ||
+      // PRIORITY ORDER:
+      // 1. verification.number_of_boxes (manual input from Operations) - highest priority
+      // 2. request.number_of_boxes (fallback)
+      const detectedBoxes = invoiceRequest.verification?.number_of_boxes ||
+                            invoiceRequest.shipment?.number_of_boxes ||
                             invoiceRequest.number_of_boxes ||
                             invoiceRequest.shipment?.boxes_count;
       numberOfBoxes = parseInt(detectedBoxes, 10);
       if (!Number.isFinite(numberOfBoxes) || numberOfBoxes < 1) numberOfBoxes = 1;
+      console.log(`✅ Using number_of_boxes: ${numberOfBoxes}`);
       
       // Get service code (prefer from database/invoiceRequest, then from payload)
       // Database value is source of truth from verification
@@ -1061,10 +1089,37 @@ router.post('/', async (req, res) => {
       // Populate fields from InvoiceRequest if available
       ...(invoiceRequest && {
         service_code: invoiceRequest.service_code || invoiceRequest.verification?.service_code || undefined,
-        weight_kg: invoiceRequest.weight_kg ? parseFloat(invoiceRequest.weight_kg.toString()) : 
-                  (invoiceRequest.weight ? parseFloat(invoiceRequest.weight.toString()) : 
-                  (invoiceRequest.verification?.chargeable_weight ? parseFloat(invoiceRequest.verification.chargeable_weight.toString()) :
-                  (invoiceRequest.verification?.weight ? parseFloat(invoiceRequest.verification.weight.toString()) : undefined))),
+        // PRIORITY ORDER for weight_kg (must match the weight variable set above):
+        // 1. verification.total_kg (manual input from Operations) - highest priority
+        // 2. verification.chargeable_weight (system-calculated)
+        // 3. verification.actual_weight
+        // 4. request.weight (fallback)
+        weight_kg: (() => {
+          let finalWeight = undefined;
+          if (invoiceRequest.verification && 
+              invoiceRequest.verification.total_kg !== null && 
+              invoiceRequest.verification.total_kg !== undefined) {
+            finalWeight = parseFloat(invoiceRequest.verification.total_kg.toString());
+            console.log(`✅ Invoice weight_kg set from verification.total_kg: ${finalWeight} kg`);
+          } else if (invoiceRequest.verification?.chargeable_weight !== null && 
+                     invoiceRequest.verification?.chargeable_weight !== undefined) {
+            finalWeight = parseFloat(invoiceRequest.verification.chargeable_weight.toString());
+            console.log(`✅ Invoice weight_kg set from verification.chargeable_weight: ${finalWeight} kg`);
+          } else if (invoiceRequest.verification?.actual_weight !== null && 
+                     invoiceRequest.verification?.actual_weight !== undefined) {
+            finalWeight = parseFloat(invoiceRequest.verification.actual_weight.toString());
+            console.log(`✅ Invoice weight_kg set from verification.actual_weight: ${finalWeight} kg`);
+          } else if (invoiceRequest.weight_kg) {
+            finalWeight = parseFloat(invoiceRequest.weight_kg.toString());
+            console.log(`✅ Invoice weight_kg set from invoiceRequest.weight_kg: ${finalWeight} kg`);
+          } else if (invoiceRequest.weight) {
+            finalWeight = parseFloat(invoiceRequest.weight.toString());
+            console.log(`✅ Invoice weight_kg set from invoiceRequest.weight: ${finalWeight} kg`);
+          } else {
+            console.log(`⚠️ No weight found for invoice`);
+          }
+          return finalWeight;
+        })(),
         volume_cbm: invoiceRequest.volume_cbm ? parseFloat(invoiceRequest.volume_cbm.toString()) : 
                    (invoiceRequest.verification?.total_vm ? parseFloat(invoiceRequest.verification.total_vm.toString()) : undefined),
         receiver_name: invoiceRequest.receiver_name || undefined,

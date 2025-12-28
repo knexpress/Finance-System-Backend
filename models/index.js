@@ -737,6 +737,10 @@ const invoiceRequestSchema = new mongoose.Schema({
       type: Number,
       required: false,
     },
+    total_kg: {
+      type: mongoose.Schema.Types.Decimal128,
+      required: false,
+    },
     verified_by_employee_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Employee',
@@ -784,7 +788,7 @@ invoiceRequestSchema.index({ tracking_code: 1 });
 invoiceRequestSchema.index({ invoice_number: 1 });
 invoiceRequestSchema.index({ createdAt: -1 });
 // Compound indexes for common query patterns
-invoiceRequestSchema.index({ status: 1, createdAt: -1 });
+invoiceRequestSchema.index({ status: 1, createdAt: -1 }); // For Operations (IN_PROGRESS) and general status queries
 invoiceRequestSchema.index({ customer_name: 1, status: 1 });
 invoiceRequestSchema.index({ shipment_type: 1 });
 // Compound index for Finance department queries (VERIFIED status, exclude CANCELLED)

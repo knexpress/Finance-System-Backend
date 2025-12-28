@@ -821,8 +821,8 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           error: rowError.message,
           data: row
         });
-        }
       }
+    }
       
       // Clear processed batch from memory aggressively
       batch.length = 0;
@@ -843,7 +843,7 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
     // Final garbage collection
     forceGarbageCollection();
     logMemoryUsage('(after all batches)');
-    
+
     // Log summary
     console.log('\n===============================');
     console.log('📊 CSV Processing Summary:');
@@ -1477,7 +1477,7 @@ router.post('/historical', auth, upload.fields([{ name: 'csvFile', maxCount: 1 }
         });
         summary.errors++;
       }
-      }
+    }
       
       // Clear processed batch from memory aggressively
       batch.length = 0;

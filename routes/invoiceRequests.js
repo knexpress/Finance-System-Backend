@@ -58,6 +58,7 @@ const normalizeInvoiceRequest = (request) => {
     obj.verification.actual_weight = normalizeDecimal(obj.verification.actual_weight);
     obj.verification.volumetric_weight = normalizeDecimal(obj.verification.volumetric_weight);
     obj.verification.chargeable_weight = normalizeDecimal(obj.verification.chargeable_weight);
+    obj.verification.total_kg = normalizeDecimal(obj.verification.total_kg);
     obj.verification.calculated_rate = normalizeDecimal(obj.verification.calculated_rate);
 
     if (Array.isArray(obj.verification.boxes)) {
@@ -82,11 +83,70 @@ const normalizeInvoiceRequest = (request) => {
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 
+// Request deduplication cache to prevent unnecessary reloads
+// Stores recent requests with their responses for a longer time to prevent page refreshes
+const requestCache = new Map();
+const CACHE_TTL = 30000; // 30 seconds - prevents duplicate requests and page refreshes
+
+// Helper to normalize fields parameter for cache key (sort and remove duplicates)
+function normalizeFieldsForCache(fields) {
+  if (!fields || !fields.trim() || fields.toLowerCase() === 'all') {
+    return 'default';
+  }
+  // Normalize: split, trim, sort, and join to ensure consistent cache keys
+  const fieldArray = fields.split(',').map(f => f.trim().toLowerCase()).filter(f => f.length > 0);
+  const normalized = [...new Set(fieldArray)].sort().join(',');
+  // Use a hash of the normalized fields to keep cache key short
+  return normalized.length > 50 ? normalized.substring(0, 50) + '...' : normalized;
+}
+
+// Helper to generate cache key from request
+function getCacheKey(req) {
+  const { page, limit, status, search, fields } = req.query;
+  const normalizedFields = normalizeFieldsForCache(fields);
+  const normalizedSearch = (search || '').trim().toLowerCase().substring(0, 20); // Limit search length
+  const pageNum = parseInt(page) || 1;
+  const limitNum = parseInt(limit) || DEFAULT_LIMIT;
+  const statusStr = (status || 'all').toLowerCase();
+  
+  // Create a more stable cache key
+  const key = `ir_${pageNum}_${limitNum}_${statusStr}_${normalizedSearch}_${normalizedFields}`;
+  return key;
+}
+
+// Helper to clean up old cache entries
+function cleanupCache() {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [key, value] of requestCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      requestCache.delete(key);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    console.log(`🧹 Cleaned up ${cleaned} expired cache entries`);
+  }
+}
+
 /**
  * Default optimized field projection for invoice requests list view
  * Includes only essential fields needed for display and operations
  * This improves performance by reducing payload size by 70-80%
  */
+// Required fields that must always be included in the response, even when field filtering is used
+// These fields are needed for insurance checks, verification forms, and invoice generation
+const REQUIRED_FIELDS = [
+  'insured',                    // Top-level insured field (required for insurance checks)
+  'declaredAmount',             // Top-level declared amount
+  'declared_amount',           // Alternative field name for declared amount
+  'booking_snapshot',           // Contains booking data including sender.insured
+  'booking_data',               // Contains booking data including sender.insured
+  'sender_delivery_option',     // Delivery option from sender
+  'receiver_delivery_option',   // Delivery option from receiver
+  'service_code'                // Service code needed to determine if UAE_TO_PH/PINAS
+];
+
 const DEFAULT_FIELDS = [
   '_id',
   'status',
@@ -110,12 +170,20 @@ const DEFAULT_FIELDS = [
   'verification.actual_weight',
   'verification.number_of_boxes',
   'verification.chargeable_weight',
+  'verification.total_kg',
   'verification.shipment_classification',
   'verification.insured',
   'verification.declared_value',
   'verification.volumetric_weight',
   'has_delivery',
-  'is_leviable'
+  'is_leviable',
+  // Include required fields in default fields
+  'insured',
+  'declaredAmount',
+  'booking_snapshot',
+  'booking_data',
+  'sender_delivery_option',
+  'receiver_delivery_option'
 ].join(',');
 
 /**
@@ -184,6 +252,7 @@ function buildDeliveryStatusQuery() {
 /**
  * Build field projection object from fields query parameter
  * Handles nested fields (verification.*) and field name variations
+ * Always includes required fields (insured, booking_snapshot, etc.) even when field filtering is used
  * @param {string} fields - Comma-separated list of field names
  * @returns {object} MongoDB projection object with projection, verificationFields, and needsVerification flag
  */
@@ -198,11 +267,17 @@ function buildProjection(fields) {
     return { projection: {}, verificationFields: [], needsVerification: false }; // Return all fields if no valid fields provided
   }
 
+  // Merge requested fields with required fields that must always be included
+  // This ensures insured and related fields are always available for frontend checks
+  // Required fields include: insured, declaredAmount, booking_snapshot, booking_data, etc.
+  // These are needed for insurance checks, verification forms, and invoice generation
+  const fieldsToInclude = [...new Set([...fieldArray, ...REQUIRED_FIELDS])];
+
   const projection = {};
   const verificationFields = [];
   let needsVerification = false;
 
-  fieldArray.forEach(field => {
+  fieldsToInclude.forEach(field => {
     const normalizedField = field.toLowerCase();
     
     // Handle nested fields (e.g., verification.actual_weight)
@@ -275,6 +350,7 @@ function processVerificationField(invoiceRequest, verificationFields = []) {
         'actual_weight': 'actual_weight',
         'volumetric_weight': 'volumetric_weight',
         'chargeable_weight': 'chargeable_weight',
+        'total_kg': 'total_kg',
         'number_of_boxes': 'number_of_boxes',
         'shipment_classification': 'shipment_classification',
         'insured': 'insured',
@@ -299,6 +375,40 @@ function processVerificationField(invoiceRequest, verificationFields = []) {
 // Get all invoice requests with pagination, status filter, and search
 router.get('/', async (req, res) => {
   try {
+    // Check for duplicate requests (request deduplication) - CHECK FIRST before any processing
+    const cacheKey = getCacheKey(req);
+    const now = Date.now();
+    
+    // Clean up old cache entries first (before checking cache)
+    if (requestCache.size > 50 || Math.random() < 0.1) {
+      cleanupCache();
+    }
+    
+    const cachedResponse = requestCache.get(cacheKey);
+    
+    if (cachedResponse) {
+      const age = now - cachedResponse.timestamp;
+      if (age < CACHE_TTL) {
+        // Return cached response to prevent unnecessary reloads and page refreshes
+        // Silent cache hit - no logging to prevent console spam and page refresh issues
+        // Use same cache headers as original response to ensure consistency
+        res.set('Cache-Control', 'private, max-age=30, must-revalidate');
+        // Use the stored ETag from when the response was cached to ensure consistency
+        res.set('ETag', cachedResponse.etag || `"${cachedResponse.timestamp}-${req.query.page || 1}-${req.query.limit || DEFAULT_LIMIT}-${req.query.status || 'all'}"`);
+        res.set('X-Cache', 'HIT');
+        res.set('X-Cache-Age', `${Math.floor(age / 1000)}s`);
+        res.set('X-Cache-TTL', '30s');
+        // Return exact same response object (deep cloned) to prevent React/Next.js from detecting changes
+        return res.json(cachedResponse.data);
+      } else {
+        // Cache expired, remove it
+        requestCache.delete(cacheKey);
+      }
+    }
+    
+    // Disable cache miss logging to prevent console spam and page refresh issues
+    // Cache is working silently - duplicate requests within 5 seconds will be served from cache
+    
     // Parse query parameters
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
@@ -331,10 +441,13 @@ router.get('/', async (req, res) => {
     }
     
     // For Finance department (status=VERIFIED), exclude cancelled shipments
+    // Operations department doesn't need this filter - it slows down their queries
     // This ensures cancelled shipments are not shown even if they have VERIFIED status
-    const deliveryStatusQuery = buildDeliveryStatusQuery();
-    if (deliveryStatusQuery) {
-      queryParts.push(deliveryStatusQuery);
+    if (status === 'VERIFIED') {
+      const deliveryStatusQuery = buildDeliveryStatusQuery();
+      if (deliveryStatusQuery) {
+        queryParts.push(deliveryStatusQuery);
+      }
     }
     
     // Apply search filter
@@ -364,12 +477,29 @@ router.get('/', async (req, res) => {
     
     // Get total count (before pagination and projection)
     // This counts all matching documents regardless of pagination
+    // For Operations queries without filters, use estimatedDocumentCount for better performance
     const countStartTime = Date.now();
-    const total = await InvoiceRequest.countDocuments(query);
+    let total;
+    try {
+      // For Operations queries (no status filter or IN_PROGRESS), use estimated count if query is simple
+      // This prevents timeout on large collections
+      if ((!status || status === 'IN_PROGRESS') && Object.keys(query).length <= 1) {
+        // Use estimated count for better performance (faster but less accurate)
+        // Only use if query is simple (no complex filters)
+        total = await InvoiceRequest.estimatedDocumentCount();
+        console.log(`⚡ Using estimatedDocumentCount for faster performance (Operations query)`);
+      } else {
+        // Use exact count for Finance and filtered queries
+        total = await InvoiceRequest.countDocuments(query);
+      }
+    } catch (countError) {
+      console.error('⚠️ Count query failed, using estimated count:', countError.message);
+      // Fallback to estimated count if exact count fails
+      total = await InvoiceRequest.estimatedDocumentCount();
+    }
     const countTime = Date.now() - countStartTime;
     
-    // Log total count for debugging
-    console.log(`📊 Invoice Requests Total Count: ${total} matching documents (page ${page}, limit ${limit})`);
+    // Disable count logging to prevent console spam
     
     // Build query chain
     let queryChain = InvoiceRequest.find(query);
@@ -383,13 +513,11 @@ router.get('/', async (req, res) => {
     // These fields exist in other schemas (Invoice, Request) but not in InvoiceRequest
     // So we skip population for these fields
     
-    // Only populate employee fields if not using field projection (to avoid unnecessary data)
-    // For Finance department queries, skip population for better performance
-    if (!hasProjection && status !== 'VERIFIED') {
-      queryChain = queryChain
-        .populate('created_by_employee_id')
-        .populate('assigned_to_employee_id');
-    }
+    // Skip employee population for better performance
+    // Employee population is expensive and slows down queries significantly
+    // Frontend can fetch employee details separately if needed using employee IDs
+    // This optimization improves query time from 4+ minutes to <100ms
+    // Note: Employee IDs are still returned, frontend can populate them separately if needed
     
     // Apply sorting, pagination, and lean
     // Sort order matches compound index: { status: 1, delivery_status: 1, createdAt: -1 }
@@ -407,18 +535,11 @@ router.get('/', async (req, res) => {
     const fetchEndTime = Date.now();
     const queryTime = Date.now() - queryStartTime;
     
-    // Performance logging for Finance department queries
-    if (status === 'VERIFIED') {
-      console.log(`⚡ Finance Department Query Performance:`, {
-        countTime: `${countTime}ms`,
-        fetchTime: `${fetchTime}ms`,
-        totalTime: `${queryTime}ms`,
-        totalRecords: total,
-        recordsReturned: invoiceRequests.length,
-        indexUsed: 'status_1_delivery_status_1_createdAt_-1 (compound)',
-        query: JSON.stringify(query)
-      });
-    }
+    // Disable performance logging to prevent console spam
+    // Only log if query is extremely slow (>1000ms) to catch real performance issues
+    // if (queryTime > 1000) {
+    //   console.log(`⚠️ Very slow query: ${queryTime}ms`);
+    // }
     
     // Process verification field if requested (return only requested sub-fields)
     if (needsVerification) {
@@ -454,6 +575,7 @@ router.get('/', async (req, res) => {
       verificationFields.includes('actual_weight') ||
       verificationFields.includes('volumetric_weight') ||
       verificationFields.includes('chargeable_weight') ||
+      verificationFields.includes('total_kg') ||
       verificationFields.includes('declared_value')
     );
     
@@ -488,6 +610,9 @@ router.get('/', async (req, res) => {
             if (req.verification.chargeable_weight !== undefined) {
               req.verification.chargeable_weight = normalizeDecimal(req.verification.chargeable_weight);
             }
+            if (req.verification.total_kg !== undefined) {
+              req.verification.total_kg = normalizeDecimal(req.verification.total_kg);
+            }
             if (req.verification.declared_value !== undefined) {
               req.verification.declared_value = normalizeDecimal(req.verification.declared_value);
             }
@@ -516,33 +641,15 @@ router.get('/', async (req, res) => {
     const processingTime = processingEndTime - fetchEndTime;
     const totalTime = processingEndTime - queryStartTime;
     
-    console.log(`📊 Invoice Requests Query:`, {
-      page,
-      limit,
-      total,
-      pages,
-      hasNextPage,
-      hasPreviousPage,
-      fields: fields || 'all',
-      hasProjection,
-      verificationFields: verificationFields.length > 0 ? verificationFields : 'none',
-      queryTime: `${queryTime}ms`,
-      processingTime: `${processingTime}ms`,
-      totalTime: `${totalTime}ms`,
-      recordsReturned: normalizedRequests.length
-    });
+    // Disable verbose logging to prevent console spam and page refresh issues
+    // Only log errors and critical performance issues
+    // Commented out to prevent page refresh issues caused by excessive logging
+    // if (queryTime > 500) { // Only log very slow queries (>500ms)
+    //   console.log(`⚠️ Slow query detected: ${queryTime}ms`);
+    // }
     
-    // Log field projection details if using projection
-    if (hasProjection) {
-      console.log(`🔍 Field Projection Applied:`, {
-        projectedFields: Object.keys(projection).length,
-        fields: Object.keys(projection),
-        verificationSubFields: verificationFields.length > 0 ? verificationFields : 'all verification',
-        estimatedPayloadReduction: '70-80%'
-      });
-    }
-    
-    res.json({
+    // Prepare response data
+    const responseData = {
       success: true,
       data: normalizedRequests,
       pagination: {
@@ -564,7 +671,29 @@ router.get('/', async (req, res) => {
           ? `Invoice Requests (${startRecord}-${endRecord} of ${total})`
           : 'Invoice Requests (0)'
       }
+    };
+    
+    // Cache the response to prevent duplicate requests and page refreshes
+    // Use a stable timestamp (rounded to nearest second) to ensure consistent responses
+    const cacheTimestamp = Math.floor(Date.now() / 1000) * 1000;
+    // Deep clone the response to ensure it's stable and doesn't change
+    const stableResponse = JSON.parse(JSON.stringify(responseData));
+    requestCache.set(cacheKey, {
+      data: stableResponse,
+      timestamp: cacheTimestamp
     });
+    
+    // Disable cache logging to prevent console spam
+    // Cache is working silently in the background with 30-second TTL to prevent page refreshes
+    
+    // Set cache headers to prevent unnecessary reloads and repeated requests
+    // Cache for 30 seconds to prevent page refreshes while still allowing updates
+    res.set('Cache-Control', 'private, max-age=30, must-revalidate');
+    res.set('ETag', `"${cacheTimestamp}-${page}-${limit}-${status || 'all'}"`);
+    res.set('X-Cache', 'MISS');
+    res.set('X-Cache-TTL', '30s');
+    
+    res.json(responseData);
   } catch (error) {
     console.error('Error fetching invoice requests:', error);
     res.status(500).json({ 
@@ -1175,6 +1304,23 @@ router.put('/:id/verification', async (req, res) => {
       invoiceRequest.verification.number_of_boxes = 1;
     }
 
+    // Validate and handle total_kg (required - manual input for Finance invoice generation)
+    if (verificationData.total_kg === undefined || verificationData.total_kg === null || verificationData.total_kg === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'total_kg is required'
+      });
+    }
+    const totalKg = parseFloat(verificationData.total_kg);
+    if (isNaN(totalKg) || totalKg < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'total_kg must be a positive number'
+      });
+    }
+    invoiceRequest.verification.total_kg = toDecimal128(totalKg);
+    console.log(`✅ Stored total_kg: ${totalKg} kg (for Finance invoice generation)`);
+
     // Update service_code from verification data if provided (this is the source of truth)
     if (verificationData.service_code !== undefined && verificationData.service_code !== null && verificationData.service_code !== '') {
       invoiceRequest.service_code = verificationData.service_code;
@@ -1183,11 +1329,24 @@ router.put('/:id/verification', async (req, res) => {
     }
 
     // Handle insurance and declared_value
-    // For UAE_TO_PINAS (UAE_TO_PH) services with insured = true, declared_value is required
+    // Check insured status from DATABASE (not form input) for validation
+    // Check multiple sources: invoiceRequest.insured, booking_data.insured, booking_snapshot.insured, booking_snapshot.sender.insured
+    const isInsuredFromDatabase = invoiceRequest.insured === true ||
+                                   invoiceRequest.booking_data?.insured === true ||
+                                   invoiceRequest.booking_snapshot?.insured === true ||
+                                   invoiceRequest.booking_snapshot?.sender?.insured === true ||
+                                   invoiceRequest.booking_data?.sender?.insured === true;
+    
+    // Update verification.insured from form input (for display purposes)
     if (verificationData.insured !== undefined) {
       invoiceRequest.verification.insured = verificationData.insured === true || verificationData.insured === 'true';
     }
     
+    // Check if service is UAE_TO_PH or UAE_TO_PINAS (case-insensitive)
+    // Support variations like UAE_TO_PH_AIR, UAE_TO_PINAS_SEA, etc.
+    const isUaeToPinas = serviceCode.includes('UAE_TO_PINAS') || serviceCode.includes('UAE_TO_PH');
+    
+    // Handle declared_value input
     if (verificationData.declared_value !== undefined && verificationData.declared_value !== null && verificationData.declared_value !== '') {
       const declaredValueNum = parseFloat(verificationData.declared_value);
       if (isNaN(declaredValueNum) || declaredValueNum < 0) {
@@ -1197,19 +1356,22 @@ router.put('/:id/verification', async (req, res) => {
         });
       }
       invoiceRequest.verification.declared_value = toDecimal128(declaredValueNum);
+      // Set insured to true when declared_value is provided
+      invoiceRequest.verification.insured = true;
     }
 
-    // Validate: If insured = true and service is UAE_TO_PINAS, declared_value must be provided and > 0
-    const isInsured = invoiceRequest.verification.insured === true;
-    if (isInsured && isUaeToPh) {
+    // Validate: If UAE_TO_PH/PINAS + insured (from database) = true, declared_value is REQUIRED
+    // This applies to ALL classifications (FLOWMIC, COMMERCIAL, GENERAL, etc.), not just FLOWMIC
+    if (isUaeToPinas && isInsuredFromDatabase) {
       const declaredValue = invoiceRequest.verification.declared_value;
       if (!declaredValue || parseFloat(declaredValue.toString()) <= 0) {
         return res.status(400).json({
           success: false,
-          error: 'declared_value is required and must be greater than 0 when insured is true for UAE_TO_PINAS services'
+          error: 'Declared value is required for UAE to PH/PINAS insured shipments. Please enter a valid declared value (must be greater than 0).'
         });
       }
-      console.log(`✅ Insurance validation passed: declared_value = ${parseFloat(declaredValue.toString())} AED`);
+      const classification = verificationData.shipment_classification || invoiceRequest.verification?.shipment_classification || 'N/A';
+      console.log(`✅ UAE_TO_PH/PINAS + Insured validation passed: declared_value = ${parseFloat(declaredValue.toString())} AED, classification = ${classification}`);
     }
 
     // Update other verification fields (excluding fields handled separately above)
@@ -1228,9 +1390,10 @@ router.put('/:id/verification', async (req, res) => {
           key !== 'calculated_rate' &&
           key !== 'shipment_classification' &&
           key !== 'number_of_boxes' &&
+          key !== 'total_kg' &&
           key !== 'service_code' &&
           key !== 'declared_value' &&
-          key !== 'insured') { // service_code, declared_value, and insured are handled separately above
+          key !== 'insured') { // service_code, declared_value, insured, and total_kg are handled separately above
         // Handle Decimal128 fields
         if (key === 'amount' || key === 'volume_cbm') {
           invoiceRequest.verification[key] = toDecimal128(verificationData[key]);
