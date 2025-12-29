@@ -230,7 +230,7 @@ function buildSearchQuery(searchTerm) {
       // If ObjectId creation fails, fall through to text search
     }
   }
-  
+
   // Sanitize search term to prevent ReDoS
   const sanitized = sanitizeRegex(trimmed);
   if (!sanitized) {
@@ -246,9 +246,9 @@ function buildSearchQuery(searchTerm) {
 
   // Add text field searches (these have indexes)
   searchConditions.push(
-    { customer_name: searchRegex },
-    { receiver_name: searchRegex },
-    { tracking_code: searchRegex },
+      { customer_name: searchRegex },
+      { receiver_name: searchRegex },
+      { tracking_code: searchRegex },
     { invoice_number: searchRegex }
   );
 
@@ -665,7 +665,7 @@ router.get('/', async (req, res) => {
       console.error('⚠️ Count query failed, using estimated count:', countError.message);
       // Fallback to estimated count if exact count fails or times out
       try {
-        total = await InvoiceRequest.estimatedDocumentCount();
+      total = await InvoiceRequest.estimatedDocumentCount();
       } catch (e) {
         // Last resort: use a reasonable default
         total = 0;
@@ -713,11 +713,11 @@ router.get('/', async (req, res) => {
     // This ensures MongoDB can use the index efficiently
     // Use hint() to force specific index and prevent query planner timeout
     try {
-      queryChain = queryChain
+    queryChain = queryChain
         .hint(indexHint) // Force MongoDB to use specific index (prevents planner timeout)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
         .maxTimeMS(10000); // 10 second timeout to prevent hanging
         // Note: .lean() is already applied above
     } catch (hintError) {

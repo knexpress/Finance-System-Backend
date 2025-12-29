@@ -688,6 +688,15 @@ router.post('/', async (req, res) => {
       console.log('⚠️ Using service_code from payload (invoiceRequest not found):', serviceCode);
     }
     
+    // Validate insurance option - only 'none' or 'percent' are allowed
+    const normalizedInsuranceOption = (insurance_option || 'none').toLowerCase();
+    if (normalizedInsuranceOption && !['none', 'percent'].includes(normalizedInsuranceOption)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid insurance option. Only "none" or "percent" are allowed. Fixed amount insurance option has been removed.'
+      });
+    }
+    
     // Extract charges from line_items to calculate subtotal
     // IMPORTANT: Parse line_items FIRST to get actual charges, then use calculated/provided values as fallback
     let shippingCharge = 0;
@@ -712,6 +721,22 @@ router.post('/', async (req, res) => {
           shippingCharge += itemTotal;
         }
       });
+    }
+    
+    // Validate pickup charge - accept 0 as valid (pickupCharge can be 0)
+    // No validation needed here as 0 is a valid business case
+    // pickupCharge is already initialized to 0 and can remain 0
+    
+    // Validate delivery charge if provided - accept 0 as valid
+    if (providedDeliveryCharge !== undefined && providedDeliveryCharge !== null) {
+      const deliveryChargeNum = parseFloat(providedDeliveryCharge);
+      if (isNaN(deliveryChargeNum) || deliveryChargeNum < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Delivery charge must be 0 or greater'
+        });
+      }
+      // deliveryChargeNum === 0 is valid ✅ (indicates free delivery)
     }
     
     // If shipping charge not found in line_items, use amount from request body
@@ -845,9 +870,7 @@ router.post('/', async (req, res) => {
       insuranceChargeFromItems = 0;
       console.log('ℹ️ PH_TO_UAE: Insurance disabled, forcing insuranceCharge = 0');
     } else if (insuranceCharge === 0) {
-      const normalizedInsuranceOption = (insurance_option || 'none').toLowerCase();
-      const normalizedFixedType = (insurance_fixed_type || '').toLowerCase();
-      
+      // Only support 'none' or 'percent' insurance options (fixed option removed)
       if (normalizedInsuranceOption === 'percent') {
         if (!declaredAmountValue || declaredAmountValue <= 0) {
           return res.status(400).json({
@@ -856,26 +879,11 @@ router.post('/', async (req, res) => {
           });
         }
         insuranceCharge = declaredAmountValue * 0.01; // 1% of declared amount
-      } else if (normalizedInsuranceOption === 'fixed') {
-        if (normalizedFixedType === 'mobile') {
-          insuranceCharge = 300;
-        } else if (normalizedFixedType === 'laptop') {
-          insuranceCharge = 400;
-        } else if (normalizedFixedType === 'other') {
-          const manual = insurance_manual_amount !== undefined ? parseFloat(insurance_manual_amount) : 0;
-          if (!manual || manual <= 0) {
-            return res.status(400).json({
-              success: false,
-              error: 'insurance_manual_amount is required and must be > 0 when insurance_option is fixed and insurance_fixed_type is other'
-            });
-          }
-          insuranceCharge = manual;
-        } else {
-          return res.status(400).json({
-            success: false,
-            error: 'insurance_fixed_type must be one of: mobile, laptop, other when insurance_option is fixed'
-          });
-        }
+        console.log(`✅ Insurance charge calculated (1% of declared value): ${declaredAmountValue} AED × 0.01 = ${insuranceCharge.toFixed(2)} AED`);
+      } else {
+        // 'none' or any other value (already validated above) - insurance charge is 0
+        insuranceCharge = 0;
+        console.log('ℹ️ No insurance (insurance_option is "none" or not specified)');
       }
     } else {
       console.log(`✅ Using insurance charge from line_items: ${insuranceCharge} AED`);
@@ -1585,6 +1593,45 @@ router.put('/:id', async (req, res) => {
   try {
     const invoiceId = req.params.id;
     const updateData = req.body;
+
+    // Validate pickup charge if provided - accept 0 as valid
+    if (updateData.pickup_charge !== undefined && updateData.pickup_charge !== null) {
+      const pickupChargeNum = typeof updateData.pickup_charge === 'object' && updateData.pickup_charge.toString
+        ? parseFloat(updateData.pickup_charge.toString())
+        : parseFloat(updateData.pickup_charge);
+      if (isNaN(pickupChargeNum) || pickupChargeNum < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Pickup charge must be 0 or greater'
+        });
+      }
+      // pickupChargeNum === 0 is valid ✅
+    }
+    
+    // Validate delivery charge if provided - accept 0 as valid
+    if (updateData.delivery_charge !== undefined && updateData.delivery_charge !== null) {
+      const deliveryChargeNum = typeof updateData.delivery_charge === 'object' && updateData.delivery_charge.toString
+        ? parseFloat(updateData.delivery_charge.toString())
+        : parseFloat(updateData.delivery_charge);
+      if (isNaN(deliveryChargeNum) || deliveryChargeNum < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Delivery charge must be 0 or greater'
+        });
+      }
+      // deliveryChargeNum === 0 is valid ✅ (indicates free delivery)
+    }
+    
+    // Validate insurance option if provided - only 'none' or 'percent' are allowed
+    if (updateData.insurance_option !== undefined && updateData.insurance_option !== null) {
+      const normalizedInsuranceOption = String(updateData.insurance_option).toLowerCase();
+      if (!['none', 'percent'].includes(normalizedInsuranceOption)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid insurance option. Only "none" or "percent" are allowed. Fixed amount insurance option has been removed.'
+        });
+      }
+    }
 
     const invoice = await Invoice.findById(invoiceId);
     if (!invoice) {
