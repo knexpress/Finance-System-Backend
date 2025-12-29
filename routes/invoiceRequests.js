@@ -2030,4 +2030,291 @@ router.get('/by-awb/:awb', async (req, res) => {
   }
 });
 
+// Get invoice request details by ID (complete details for invoice generation dialog)
+// This endpoint returns FULL invoice request details including all nested information
+// Used when Finance user clicks "View" button in invoice generation dialog
+// Returns ALL verification data, booking data, and request_id data
+router.get('/:id/details', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Validate ID parameter
+    if (!id || !id.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invoice request ID is required'
+      });
+    }
+    
+    // Validate ObjectId format
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid invoice request ID format'
+      });
+    }
+    
+    // Find invoice request by ID
+    const invoiceRequest = await InvoiceRequest.findById(id).lean();
+    
+    if (!invoiceRequest) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invoice request not found'
+      });
+    }
+    
+    // Get related booking if converted_to_invoice_request_id exists
+    let booking = null;
+    try {
+      const { Booking } = require('../models');
+      // Find booking that was converted to this invoice request
+      booking = await Booking.findOne({
+        converted_to_invoice_request_id: invoiceRequest._id
+      }).lean();
+      
+      // If not found by converted_to_invoice_request_id, try to find by AWB
+      if (!booking && invoiceRequest.tracking_code) {
+        booking = await Booking.findOne({
+          $or: [
+            { awb: invoiceRequest.tracking_code },
+            { tracking_code: invoiceRequest.tracking_code },
+            { awb_number: invoiceRequest.tracking_code }
+          ]
+        }).lean();
+      }
+    } catch (bookingError) {
+      console.warn('Could not fetch booking:', bookingError.message);
+      // Continue without booking - use booking_snapshot/booking_data instead
+    }
+    
+    // Get related request_id (from unified schema) if needed
+    let requestIdData = null;
+    try {
+      const { ShipmentRequest } = require('../models/unified-schema');
+      // Try to find by tracking_code or invoice_number
+      if (invoiceRequest.tracking_code || invoiceRequest.invoice_number) {
+        requestIdData = await ShipmentRequest.findOne({
+          $or: [
+            { 'request_id': invoiceRequest.tracking_code },
+            { 'request_id': invoiceRequest.invoice_number }
+          ]
+        }).lean();
+        
+        // Normalize Decimal128 fields in requestIdData if found
+        if (requestIdData) {
+          const normalizeDecimal = (value) => {
+            if (value === null || value === undefined) return value;
+            try {
+              return parseFloat(value.toString());
+            } catch (e) {
+              return value;
+            }
+          };
+          
+          // Normalize shipment Decimal128 fields
+          if (requestIdData.shipment) {
+            if (requestIdData.shipment.volumetric_weight) {
+              requestIdData.shipment.volumetric_weight = normalizeDecimal(requestIdData.shipment.volumetric_weight);
+            }
+            if (requestIdData.shipment.chargeable_weight) {
+              requestIdData.shipment.chargeable_weight = normalizeDecimal(requestIdData.shipment.chargeable_weight);
+            }
+            if (requestIdData.shipment.actual_weight) {
+              requestIdData.shipment.actual_weight = normalizeDecimal(requestIdData.shipment.actual_weight);
+            }
+          }
+          
+          // Normalize verification Decimal128 fields
+          if (requestIdData.verification) {
+            if (requestIdData.verification.calculated_rate) {
+              requestIdData.verification.calculated_rate = normalizeDecimal(requestIdData.verification.calculated_rate);
+            }
+            if (requestIdData.verification.total_vm) {
+              requestIdData.verification.total_vm = normalizeDecimal(requestIdData.verification.total_vm);
+            }
+            if (requestIdData.verification.volumetric_weight) {
+              requestIdData.verification.volumetric_weight = normalizeDecimal(requestIdData.verification.volumetric_weight);
+            }
+            if (requestIdData.verification.chargeable_weight) {
+              requestIdData.verification.chargeable_weight = normalizeDecimal(requestIdData.verification.chargeable_weight);
+            }
+            if (requestIdData.verification.actual_weight) {
+              requestIdData.verification.actual_weight = normalizeDecimal(requestIdData.verification.actual_weight);
+            }
+          }
+          
+          // Normalize financial Decimal128 fields
+          if (requestIdData.financial) {
+            if (requestIdData.financial.base_rate) {
+              requestIdData.financial.base_rate = normalizeDecimal(requestIdData.financial.base_rate);
+            }
+          }
+        }
+      }
+    } catch (requestError) {
+      console.warn('Could not fetch request_id:', requestError.message);
+      // Continue without request_id
+    }
+    
+    // Normalize Decimal128 fields to numbers for JSON serialization
+    const normalizedRequest = normalizeInvoiceRequest(invoiceRequest);
+    
+    // Ensure verification object is complete with all fields
+    if (!normalizedRequest.verification) {
+      normalizedRequest.verification = {};
+    }
+    
+    // Build comprehensive response with all data
+    // Map fields from multiple possible locations as specified in requirements
+    const responseData = {
+      _id: normalizedRequest._id,
+      invoice_number: normalizedRequest.invoice_number,
+      status: normalizedRequest.status,
+      delivery_status: normalizedRequest.delivery_status,
+      customer_name: normalizedRequest.customer_name,
+      customer_phone: normalizedRequest.customer_phone,
+      customer_email: normalizedRequest.customer_email || normalizedRequest.sender?.email || null,
+      origin_place: normalizedRequest.origin_place,
+      destination_place: normalizedRequest.destination_place,
+      service_code: normalizedRequest.service_code || normalizedRequest.verification?.service_code || null,
+      shipment_type: normalizedRequest.shipment_type,
+      tracking_code: normalizedRequest.tracking_code,
+      awb_number: normalizedRequest.awb_number || normalizedRequest.tracking_code,
+      weight: normalizedRequest.weight || normalizedRequest.weight_kg || normalizedRequest.verification?.chargeable_weight || null,
+      number_of_boxes: normalizedRequest.number_of_boxes || 
+                       normalizedRequest.verification?.number_of_boxes || 
+                       (requestIdData?.shipment?.number_of_boxes) || 
+                       (requestIdData?.verification?.number_of_boxes) || 
+                       1,
+      sender_delivery_option: normalizedRequest.sender_delivery_option,
+      receiver_delivery_option: normalizedRequest.receiver_delivery_option,
+      
+      // Full verification object with ALL fields
+      verification: {
+        // Weight calculations (check multiple locations)
+        actual_weight: normalizedRequest.verification?.actual_weight || 
+                       (requestIdData?.verification?.actual_weight) || 
+                       (requestIdData?.shipment?.actual_weight) || 
+                       null,
+        volumetric_weight: normalizedRequest.verification?.volumetric_weight || 
+                          (requestIdData?.verification?.volumetric_weight) || 
+                          (requestIdData?.shipment?.volumetric_weight) || 
+                          null,
+        total_vm: normalizedRequest.verification?.total_vm || 
+                  normalizedRequest.verification?.volumetric_weight || 
+                  (requestIdData?.verification?.total_vm) || 
+                  (requestIdData?.shipment?.volumetric_weight) || 
+                  null,
+        chargeable_weight: normalizedRequest.verification?.chargeable_weight || 
+                          (requestIdData?.verification?.chargeable_weight) || 
+                          (requestIdData?.shipment?.chargeable_weight) || 
+                          null,
+        
+        // Weight type (check multiple locations)
+        weight_type: normalizedRequest.verification?.weight_type || 
+                     (requestIdData?.verification?.weight_type) || 
+                     (requestIdData?.shipment?.weight_type) || 
+                     null,
+        
+        // Calculated rate (check multiple locations)
+        calculated_rate: normalizedRequest.verification?.calculated_rate || 
+                        (requestIdData?.verification?.calculated_rate) || 
+                        normalizedRequest.base_rate || 
+                        (requestIdData?.base_rate) || 
+                        null,
+        
+        // All other verification fields
+        agents_name: normalizedRequest.verification?.agents_name || null,
+        shipment_classification: normalizedRequest.verification?.shipment_classification || null,
+        cargo_service: normalizedRequest.verification?.cargo_service || null,
+        rate_bracket: normalizedRequest.verification?.rate_bracket || null,
+        listed_commodities: normalizedRequest.verification?.listed_commodities || null,
+        verification_notes: normalizedRequest.verification?.verification_notes || null,
+        declared_value: normalizedRequest.verification?.declared_value || null,
+        insured: normalizedRequest.verification?.insured !== undefined ? normalizedRequest.verification.insured : false,
+        service_code: normalizedRequest.verification?.service_code || normalizedRequest.service_code || null,
+        receiver_phone: normalizedRequest.verification?.receiver_phone || 
+                       normalizedRequest.receiver_phone || 
+                       null,
+        receiver_address: normalizedRequest.verification?.receiver_address || 
+                          normalizedRequest.receiver_address || 
+                          normalizedRequest.destination_place || 
+                          null,
+        
+        // Box details with all fields
+        boxes: (normalizedRequest.verification?.boxes || []).map(box => ({
+          classification: box.classification || null,
+          items: box.items || null,
+          length: box.length || null,
+          width: box.width || null,
+          height: box.height || null,
+          vm: box.vm || null,
+          quantity: box.quantity || 1
+        })),
+        
+        // Additional verification fields
+        invoice_number: normalizedRequest.verification?.invoice_number || normalizedRequest.invoice_number || null,
+        tracking_code: normalizedRequest.verification?.tracking_code || normalizedRequest.tracking_code || null,
+        amount: normalizedRequest.verification?.amount || normalizedRequest.amount || null,
+        volume_cbm: normalizedRequest.verification?.volume_cbm || normalizedRequest.volume_cbm || null,
+        sender_details_complete: normalizedRequest.verification?.sender_details_complete || false,
+        receiver_details_complete: normalizedRequest.verification?.receiver_details_complete || false,
+        verified_at: normalizedRequest.verification?.verified_at || null,
+        verified_by_employee_id: normalizedRequest.verification?.verified_by_employee_id || null
+      },
+      
+      // Request ID data (if exists)
+      request_id: requestIdData ? {
+        _id: requestIdData._id,
+        status: requestIdData.status?.request_status || requestIdData.status || null,
+        tracking_code: requestIdData.request_id || requestIdData.tracking_number || null,
+        service_code: requestIdData.route?.service_code || null,
+        shipment: {
+          weight_type: requestIdData.shipment?.weight_type || null,
+          number_of_boxes: requestIdData.shipment?.number_of_boxes || null,
+          volumetric_weight: requestIdData.shipment?.volumetric_weight || null,
+          chargeable_weight: requestIdData.shipment?.chargeable_weight || null
+        },
+        verification: {
+          weight_type: requestIdData.verification?.weight_type || null,
+          calculated_rate: requestIdData.verification?.calculated_rate || null,
+          base_rate: requestIdData.financial?.base_rate || null
+        }
+      } : null,
+      
+      // Base rate (check multiple locations)
+      base_rate: normalizedRequest.verification?.calculated_rate || 
+                normalizedRequest.base_rate || 
+                requestIdData?.verification?.calculated_rate || 
+                requestIdData?.financial?.base_rate || 
+                null,
+      
+      // Timestamps
+      createdAt: normalizedRequest.createdAt,
+      updatedAt: normalizedRequest.updatedAt,
+      
+      // Include booking if found
+      booking: booking || null,
+      
+      // Include booking_snapshot and booking_data if available
+      booking_snapshot: normalizedRequest.booking_snapshot || null,
+      booking_data: normalizedRequest.booking_data || null
+    };
+    
+    res.json({
+      success: true,
+      data: responseData
+    });
+    
+  } catch (error) {
+    console.error('Error fetching invoice request details:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch invoice request details',
+      details: error.message
+    });
+  }
+});
+
 module.exports = router;
