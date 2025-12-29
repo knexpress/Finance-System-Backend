@@ -851,42 +851,31 @@ router.post('/', async (req, res) => {
       ? parseFloat(declared_amount)
       : (invoiceRequest?.declaredAmount ? parseFloat(invoiceRequest.declaredAmount.toString()) : 0);
     
-    // Compute insurance charge based on option (only if not found in line_items)
-    // Priority: 1. verification.declared_value * 0.01 (if insured=true), 2. line_items, 3. insurance_option logic
-    let insuranceCharge = insuranceChargeFromItems;
+    // Compute insurance charge - ONLY FROM FRONTEND LINE_ITEMS
+    // If frontend doesn't send insurance in line_items, set to 0 (no database calculation)
+    let insuranceCharge = 0;
     
-    // Check if invoiceRequest has verification with insured=true and declared_value
-    // This takes priority over line_items for UAE_TO_PINAS services
-    if (!isPhToUae && invoiceRequest?.verification?.insured === true && 
-        invoiceRequest?.verification?.declared_value && 
-        parseFloat(invoiceRequest.verification.declared_value.toString()) > 0) {
-      // Use declared_value * 0.01 (1% of declared value) for insurance charge
-      const declaredValue = parseFloat(invoiceRequest.verification.declared_value.toString());
-      insuranceCharge = declaredValue * 0.01;
-      console.log(`✅ Using declared_value from verification for insurance charge: ${declaredValue} AED × 0.01 = ${insuranceCharge.toFixed(2)} AED`);
+    // Check if insurance is already in line_items (user's explicit choice)
+    const insuranceLineItem = line_items && Array.isArray(line_items) 
+      ? line_items.find(item => {
+          const description = (item.description || '').toLowerCase();
+          return description.includes('insurance');
+        })
+      : null;
+    
+    if (insuranceLineItem) {
+      // User has explicitly set insurance in line_items (could be 0 for "no insurance")
+      insuranceCharge = parseFloat(insuranceLineItem.total?.toString() || insuranceLineItem.unit_price?.toString() || 0);
+      console.log(`✅ Using insurance charge from line_items (user's explicit choice): ${insuranceCharge} AED`);
     } else if (isPhToUae) {
-      // PH_TO_UAE: insurance not offered, force to 0 and ignore inputs/line_items
+      // PH_TO_UAE: insurance not offered, force to 0
       insuranceCharge = 0;
       insuranceChargeFromItems = 0;
       console.log('ℹ️ PH_TO_UAE: Insurance disabled, forcing insuranceCharge = 0');
-    } else if (insuranceCharge === 0) {
-      // Only support 'none' or 'percent' insurance options (fixed option removed)
-      if (normalizedInsuranceOption === 'percent') {
-        if (!declaredAmountValue || declaredAmountValue <= 0) {
-          return res.status(400).json({
-            success: false,
-            error: 'declared_amount is required and must be > 0 when insurance_option is percent'
-          });
-        }
-        insuranceCharge = declaredAmountValue * 0.01; // 1% of declared amount
-        console.log(`✅ Insurance charge calculated (1% of declared value): ${declaredAmountValue} AED × 0.01 = ${insuranceCharge.toFixed(2)} AED`);
-      } else {
-        // 'none' or any other value (already validated above) - insurance charge is 0
-        insuranceCharge = 0;
-        console.log('ℹ️ No insurance (insurance_option is "none" or not specified)');
-      }
     } else {
-      console.log(`✅ Using insurance charge from line_items: ${insuranceCharge} AED`);
+      // Frontend didn't send insurance in line_items → set to 0 (no database calculation)
+      insuranceCharge = 0;
+      console.log('ℹ️ No insurance in line_items from frontend, setting insuranceCharge = 0 (no database calculation)');
     }
     
     // Round all charges to 2 decimal places
