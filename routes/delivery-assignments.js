@@ -438,73 +438,182 @@ router.put('/:id', auth, async (req, res) => {
       assignmentData.assignment_id = assignmentData.invoice_id.awb_number;
     }
     
-    // If status is DELIVERED, update the invoice request delivery_status
+    // If status is DELIVERED, update related documents
     if (normalizedStatus === 'DELIVERED') {
       try {
-        const { InvoiceRequest } = require('../models');
+        const { InvoiceRequest, Booking } = require('../models');
+        const { Invoice, ShipmentRequest } = require('../models/unified-schema');
         
-        // Try to find the invoice request by invoice_id
-        if (assignment.invoice_id) {
-          // Get the invoice ID (either populated or as string)
-          const invoiceId = typeof assignment.invoice_id === 'object' 
+        // Get the invoice ID (either populated or as string)
+        const invoiceId = assignment.invoice_id 
+          ? (typeof assignment.invoice_id === 'object' 
             ? assignment.invoice_id._id?.toString() || assignment.invoice_id.toString()
-            : assignment.invoice_id.toString();
-          
-          console.log('🔍 Looking for invoice ID:', invoiceId);
-          
-          // Find the invoice to get its invoice_id field
-          const { Invoice } = require('../models/unified-schema');
+            : assignment.invoice_id.toString())
+          : null;
+        
+        // Get the request ID (either populated or as string)
+        const requestId = assignment.request_id
+          ? (typeof assignment.request_id === 'object'
+            ? assignment.request_id._id?.toString() || assignment.request_id.toString()
+            : assignment.request_id.toString())
+          : null;
+        
+        console.log('🔍 Updating related documents - Invoice ID:', invoiceId, 'Request ID:', requestId);
+        
+        // 1. Update Invoice delivery_status
+        if (invoiceId) {
+          try {
+            await Invoice.findByIdAndUpdate(invoiceId, {
+              delivery_status: 'DELIVERED',
+              updatedAt: new Date()
+            });
+            console.log('✅ Invoice delivery_status updated to DELIVERED');
+          } catch (invoiceError) {
+            console.warn('⚠️ Error updating invoice delivery_status:', invoiceError.message);
+          }
+        }
+        
+        // 2. Update ShipmentRequest delivery_status (if linked)
+        if (requestId) {
+          try {
+            await ShipmentRequest.findByIdAndUpdate(requestId, {
+              'status.delivery_status': 'DELIVERED',
+              updatedAt: new Date()
+            });
+            console.log('✅ ShipmentRequest delivery_status updated to DELIVERED');
+          } catch (requestError) {
+            console.warn('⚠️ Error updating shipment request delivery_status:', requestError.message);
+          }
+        }
+        
+        // 3. Find and update InvoiceRequest
+        let invoiceRequest = null;
+        if (invoiceId) {
           const invoice = await Invoice.findById(invoiceId);
           
           if (invoice) {
-            console.log('📝 Found invoice with invoice_id:', invoice.invoice_id);
-
-            let invoiceRequest = null;
+            // Try multiple methods to find the invoice request
             if (invoice.request_id) {
+              // Check if request_id points to InvoiceRequest (might be ShipmentRequest)
               invoiceRequest = await InvoiceRequest.findById(invoice.request_id);
             }
-
+            
             if (!invoiceRequest && invoice.invoice_id) {
               invoiceRequest = await InvoiceRequest.findOne({ invoice_number: invoice.invoice_id });
             }
-
+            
             if (!invoiceRequest && invoice.notes) {
               const match = invoice.notes.match(/Invoice for request ([a-fA-F0-9]{24})/);
               if (match && match[1]) {
                 invoiceRequest = await InvoiceRequest.findById(match[1]);
               }
             }
-
-            if (invoiceRequest) {
-              const oldDeliveryStatus = invoiceRequest.delivery_status;
-              invoiceRequest.delivery_status = 'DELIVERED';
-              await invoiceRequest.save();
-              console.log('✅ Invoice request delivery_status updated to DELIVERED');
-              
-              // Sync DELIVERED status to EMPOST
-              if (oldDeliveryStatus !== 'DELIVERED') {
-                const { syncStatusToEMPost, getTrackingNumberFromInvoiceRequest } = require('../utils/empost-status-sync');
-                const trackingNumber = getTrackingNumberFromInvoiceRequest(invoiceRequest);
-                
-                await syncStatusToEMPost({
-                  trackingNumber,
-                  status: 'DELIVERED',
-                  additionalData: {
-                    deliveryDate: new Date()
-                  }
-                });
-              }
-            } else {
-              console.warn('⚠️ Invoice request not found for invoice:', invoice.invoice_id || invoice._id);
+            
+            // Also try matching by tracking_code/awb_number if available
+            if (!invoiceRequest && invoice.awb_number) {
+              invoiceRequest = await InvoiceRequest.findOne({
+                $or: [
+                  { tracking_code: invoice.awb_number },
+                  { awb_number: invoice.awb_number }
+                ]
+              });
             }
-          } else {
-            console.warn('⚠️ Invoice not found or has no link to request');
+          }
+        }
+        
+        if (invoiceRequest) {
+          const oldDeliveryStatus = invoiceRequest.delivery_status;
+          invoiceRequest.delivery_status = 'DELIVERED';
+          await invoiceRequest.save();
+          console.log('✅ Invoice request delivery_status updated to DELIVERED');
+          
+          // Check if invoice request should be marked as COMPLETED
+          // (e.g., if invoice is generated, payment collected, and now delivered)
+          if (invoiceRequest.status !== 'COMPLETED' && 
+              invoiceRequest.status !== 'CANCELLED') {
+            // You can add additional conditions here (e.g., payment collected)
+            // For now, we'll just update delivery_status
+          }
+          
+          // Sync DELIVERED status to EMPOST
+          if (oldDeliveryStatus !== 'DELIVERED') {
+            try {
+              const { syncStatusToEMPost, getTrackingNumberFromInvoiceRequest } = require('../utils/empost-status-sync');
+              const trackingNumber = getTrackingNumberFromInvoiceRequest(invoiceRequest);
+              
+              await syncStatusToEMPost({
+                trackingNumber,
+                status: 'DELIVERED',
+                additionalData: {
+                  deliveryDate: new Date()
+                }
+              });
+            } catch (empostError) {
+              console.warn('⚠️ Error syncing to EMPOST:', empostError.message);
+            }
+          }
+          
+          // 4. CRITICAL: Update Booking's shipment_status
+          // This makes the status appear in Review Requests page (Cargo Status Management)
+          try {
+            const bookingUpdateResult = await Booking.updateMany(
+              { converted_to_invoice_request_id: invoiceRequest._id },
+              { 
+                shipment_status: 'DELIVERED',
+                updatedAt: new Date()
+              }
+            );
+            
+            if (bookingUpdateResult.modifiedCount > 0) {
+              console.log(`✅ Updated ${bookingUpdateResult.modifiedCount} booking(s) shipment_status to DELIVERED`);
+            } else {
+              console.log('ℹ️  No bookings found with converted_to_invoice_request_id:', invoiceRequest._id);
+            }
+          } catch (bookingError) {
+            console.error('❌ Error updating booking shipment_status:', bookingError);
+          }
+        } else {
+          console.warn('⚠️ Invoice request not found for invoice:', invoiceId);
+          
+          // Fallback: Try to find booking by invoice_id if invoice request not found
+          // Some bookings might have invoice_id directly
+          if (invoiceId) {
+            try {
+              // Try to find booking by matching invoice_number or tracking_code
+              const invoice = await Invoice.findById(invoiceId);
+              if (invoice && invoice.invoice_id) {
+                const bookingUpdateResult = await Booking.updateMany(
+                  { 
+                    $or: [
+                      { invoice_id: invoice.invoice_id },
+                      { invoice_number: invoice.invoice_id },
+                      { tracking_code: invoice.awb_number },
+                      { awb_number: invoice.awb_number }
+                    ]
+                  },
+                  { 
+                    shipment_status: 'DELIVERED',
+                    updatedAt: new Date()
+                  }
+                );
+                
+                if (bookingUpdateResult.modifiedCount > 0) {
+                  console.log(`✅ Updated ${bookingUpdateResult.modifiedCount} booking(s) shipment_status to DELIVERED (fallback method)`);
+                }
+              }
+            } catch (fallbackError) {
+              console.warn('⚠️ Error in fallback booking update:', fallbackError.message);
+            }
           }
         }
       } catch (syncError) {
-        console.error('❌ Error syncing invoice request delivery_status:', syncError);
+        console.error('❌ Error syncing related documents:', syncError);
         // Don't fail assignment update if sync fails
       }
+    } else if (normalizedStatus === 'NOT_DELIVERED') {
+      // If status is NOT_DELIVERED, we might want to reset delivery_status in related documents
+      // For now, we'll leave them as is, but you can add logic here if needed
+      console.log('ℹ️  Status set to NOT_DELIVERED - related documents not updated');
     }
     
     res.json({

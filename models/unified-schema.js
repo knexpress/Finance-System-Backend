@@ -109,7 +109,7 @@ const clientSchema = new mongoose.Schema({
   client_id: {
     type: String,
     required: false, // Will be auto-generated in pre-save hook
-    unique: true,
+    // unique: true removed - using sparse unique index instead to allow multiple nulls
   },
   company_name: {
     type: String,
@@ -153,12 +153,34 @@ clientSchema.pre('save', async function(next) {
   if (!this.client_id) {
     try {
       const ClientModel = this.constructor;
-      const count = await ClientModel.countDocuments();
-      this.client_id = `CLT-${String(count + 1).padStart(6, '0')}`;
+      // Use a more reliable method: find max client_id or use timestamp-based fallback
+      const maxClient = await ClientModel.findOne({ client_id: { $ne: null } })
+        .sort({ client_id: -1 })
+        .select('client_id')
+        .lean();
+      
+      if (maxClient && maxClient.client_id) {
+        // Extract number from existing client_id (e.g., "CLT-000123" -> 123)
+        const match = maxClient.client_id.match(/\d+$/);
+        const nextNum = match ? parseInt(match[0]) + 1 : 1;
+        this.client_id = `CLT-${String(nextNum).padStart(6, '0')}`;
+      } else {
+        // No existing clients, start from 1
+        this.client_id = `CLT-000001`;
+      }
+      
+      // Verify uniqueness (retry with timestamp if collision)
+      const exists = await ClientModel.findOne({ client_id: this.client_id });
+      if (exists && exists._id.toString() !== this._id?.toString()) {
+        // Collision detected, use timestamp-based fallback
+        this.client_id = `CLT-${Date.now().toString().slice(-8)}`;
+      }
+      
       console.log(`Generated client_id: ${this.client_id}`);
     } catch (error) {
       console.error('Error generating client_id:', error);
-      this.client_id = `CLT-${Date.now().toString().slice(-6)}`;
+      // Fallback: use timestamp to ensure uniqueness
+      this.client_id = `CLT-${Date.now().toString().slice(-8)}`;
       console.log(`Fallback client_id: ${this.client_id}`);
     }
   }
@@ -1322,7 +1344,8 @@ userSchema.index({ department_id: 1 });
 userSchema.index({ role: 1 });
 
 // Client indexes
-// client_id index is automatically created by unique: true
+// Create sparse unique index for client_id (allows multiple nulls, but unique non-null values)
+clientSchema.index({ client_id: 1 }, { unique: true, sparse: true });
 clientSchema.index({ company_name: 1 });
 
 // Shipment Request indexes

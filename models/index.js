@@ -951,7 +951,7 @@ const performanceMetricsSchema = new mongoose.Schema({
 performanceMetricsSchema.index({ department_id: 1, period: 1, period_start: 1 });
 performanceMetricsSchema.index({ period_start: 1, period_end: 1 });
 
-const PerformanceMetrics = mongoose.model('PerformanceMetrics', performanceMetricsSchema);
+const PerformanceMetrics = mongoose.models.PerformanceMetrics || mongoose.model('PerformanceMetrics', performanceMetricsSchema);
 
 // Chat Models
 const ChatRoom = mongoose.models.ChatRoom || mongoose.model('ChatRoom', chatRoomSchema);

@@ -15,6 +15,69 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const HEAVY_FIELDS_PROJECTION = '-identityDocuments -attachments -documents -files';
 
+/**
+ * Normalize service code to standard format
+ * Converts variations like "ph-to-uae", "PH-TO-UAE", "ph_to_uae" → "PH_TO_UAE"
+ * Handles "uae-to-ph", "UAE_TO_PINAS" → "UAE_TO_PH"
+ * Preserves suffixes like "_EXPRESS", "_STANDARD"
+ * @param {string} serviceCode - Raw service code from various sources
+ * @returns {string|null} - Normalized service code or null
+ */
+function normalizeServiceCode(serviceCode) {
+  if (!serviceCode) return null;
+  
+  try {
+    // Convert to uppercase and replace spaces/dashes with underscores
+    let normalized = String(serviceCode).toUpperCase().replace(/[\s-]+/g, '_');
+    
+    // Handle common variations
+    if (normalized === 'PH_TO_UAE' || normalized.startsWith('PH_TO_UAE')) {
+      return normalized; // Keep suffix if present (e.g., PH_TO_UAE_EXPRESS)
+    } else if (normalized === 'UAE_TO_PH' || normalized.startsWith('UAE_TO_PH')) {
+      return normalized; // Keep suffix if present
+    } else if (normalized === 'UAE_TO_PINAS' || normalized.startsWith('UAE_TO_PINAS')) {
+      // Map UAE_TO_PINAS to UAE_TO_PH (preserve suffix if any)
+      return normalized.replace('UAE_TO_PINAS', 'UAE_TO_PH');
+    }
+    
+    // Return normalized version (preserves any suffixes)
+    return normalized;
+  } catch (error) {
+    console.error('Error normalizing service code:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract service code from booking or related documents
+ * Checks multiple locations in priority order
+ * @param {Object} booking - Booking document
+ * @param {Object} invoiceRequest - Invoice request document (optional)
+ * @returns {string|null} - Normalized service code or null
+ */
+function extractServiceCode(booking, invoiceRequest = null) {
+  // Priority order:
+  // 1. booking.service_code
+  // 2. booking.service
+  // 3. invoiceRequest.service_code
+  // 4. invoiceRequest.verification.service_code
+  // 5. booking.request_id.service_code (if populated)
+  // 6. booking.booking_id.service_code (if populated)
+  
+  const serviceCode = 
+    booking?.service_code ||
+    booking?.service ||
+    invoiceRequest?.service_code ||
+    invoiceRequest?.verification?.service_code ||
+    booking?.request_id?.service_code ||
+    booking?.request_id?.service ||
+    booking?.booking_id?.service_code ||
+    booking?.booking_id?.service ||
+    null;
+  
+  return normalizeServiceCode(serviceCode);
+}
+
 // Lightweight projection for list views - exclude heavy fields only
 // This approach excludes heavy data while keeping all other fields
 const LIGHTWEIGHT_PROJECTION = [
@@ -928,6 +991,8 @@ router.get('/verified-invoices', auth, async (req, res) => {
 
     // Find bookings by their converted_to_invoice_request_id that match verified invoice requests
     // Include ALL bookings with verified/completed invoice requests, even if invoice doesn't exist yet
+    // Note: request_id and booking_id are not in the schema, so we can't populate them
+    // The extractServiceCode function will check these fields if they exist as ObjectIds or already populated
     const bookings = await Booking.find({
       converted_to_invoice_request_id: { $in: invoiceRequestIds }
     }).lean();
@@ -940,18 +1005,28 @@ router.get('/verified-invoices', auth, async (req, res) => {
         req => req._id.toString() === invoiceRequestId
       );
 
+      // Extract and normalize service_code from multiple possible locations
+      const serviceCode = extractServiceCode(booking, invoiceRequest);
+
+      // Set default shipment_status if missing (default to SHIPMENT_RECEIVED)
+      const shipmentStatus = booking.shipment_status || 'SHIPMENT_RECEIVED';
+
       return {
         _id: booking._id,
         tracking_code: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
         awb_number: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
+        awb: booking.awb || invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
         customer_name: booking.customer_name || booking.sender?.fullName || null,
         receiver_name: booking.receiver_name || booking.receiver?.fullName || null,
         origin_place: booking.origin_place || booking.origin || null,
         destination_place: booking.destination_place || booking.destination || null,
-        shipment_status: booking.shipment_status || null,
+        shipment_status: shipmentStatus, // Always include, default to SHIPMENT_RECEIVED if missing
         batch_no: booking.batch_no || null,
         invoice_id: invoice?._id || null,
         invoice_number: invoice?.invoice_id || invoiceRequest?.invoice_number || null,
+        service_code: serviceCode, // Include normalized service_code (can be null)
+        sender: booking.sender || null,
+        receiver: booking.receiver || null,
         createdAt: booking.createdAt,
         updatedAt: booking.updatedAt
       };
