@@ -950,11 +950,13 @@ router.post('/', async (req, res) => {
       console.log(`   Subtotal (a = baseAmount / 1.05): ${subtotalForStorage.toFixed(2)} AED`);
       console.log(`   Tax (b = a * 0.05): ${taxAmount.toFixed(2)} AED`);
       console.log(`   Total (a + b = baseAmount): ${baseAmount.toFixed(2)} AED`);
-    } else if (isPhToUae && deliveryCharge > 0) {
-      // Rule 2: PH_TO_UAE with delivery - 5% VAT on delivery charge only
+    } else if (isPhToUae && tax_rate === 5) {
+      // Rule 2: PH_TO_UAE Tax Invoice - 5% VAT on delivery charge only
+      // For Tax Invoices (tax_rate = 5), always calculate tax on delivery charge
       finalTaxRate = 5;
       taxAmount = deliveryCharge * 0.05;
-      console.log('✅ Applying 5% VAT on delivery charge only (PH_TO_UAE with delivery)');
+      console.log('✅ Applying 5% VAT on delivery charge only (PH_TO_UAE Tax Invoice)');
+      console.log(`   Tax Rate from request: ${tax_rate}%`);
       console.log(`   Delivery Charge: ${deliveryCharge} AED`);
       console.log(`   Tax (5%): ${taxAmount} AED`);
     } else {
@@ -968,36 +970,84 @@ router.post('/', async (req, res) => {
     taxAmount = Math.round(taxAmount * 100) / 100;
     
     // Calculate dual totals for PH_TO_UAE invoices (automatic calculation)
-    let calculatedTotalAmountCod = null;
-    let calculatedTotalAmountTaxInvoice = null;
+    // IMPORTANT: Backend calculation takes precedence - always calculate for PH_TO_UAE
+    let calculatedTotalAmountCod = 0;
+    let calculatedTotalAmountTaxInvoice = 0;
     
     if (isPhToUae) {
-      // Get total_kg for COD delivery charge calculation
+      // Validate and ensure delivery_base_amount is set for PH_TO_UAE
+      // Priority: request body -> invoiceRequest -> fallback to 20
+      if (hasDeliveryComputed) {
+        if (deliveryBaseAmount === null || deliveryBaseAmount === undefined || deliveryBaseAmount <= 0) {
+          // Try to get from request body
+          const reqDeliveryBase = req.body.delivery_base_amount;
+          if (reqDeliveryBase !== undefined && reqDeliveryBase !== null) {
+            deliveryBaseAmount = parseFloat(reqDeliveryBase) || 20;
+          } else if (invoiceRequest?.delivery_base_amount) {
+            deliveryBaseAmount = parseFloat(invoiceRequest.delivery_base_amount.toString()) || 20;
+          } else {
+            deliveryBaseAmount = 20; // Default fallback
+            console.warn(`⚠️ PH_TO_UAE invoice with has_delivery=true but no delivery_base_amount provided. Using default 20 AED.`);
+          }
+        }
+      }
+      
+      // Ensure deliveryBaseAmount is set (final value)
+      const finalDeliveryBaseAmount = deliveryBaseAmount || 20;
+      
+      // Get total_kg for COD delivery charge calculation (priority: verification.total_kg > weight)
       let totalKgForCod = 0;
       if (invoiceRequest?.verification?.total_kg !== null && 
           invoiceRequest?.verification?.total_kg !== undefined) {
         totalKgForCod = parseFloat(invoiceRequest.verification.total_kg.toString());
+      } else if (weight > 0) {
+        // Fallback to weight if total_kg not available
+        totalKgForCod = weight;
       }
+      // If weight is not available, default to weight < 15kg (apply delivery charge)
       
-      // Calculate COD Invoice Total: Shipping + Delivery (base only, or 0 if weight >= 15kg)
+      // Calculate COD Invoice Total (for tax_rate = 0)
+      // Logic:
+      // - If weight >= 15kg: total_amount_cod = amount (shipping only, free delivery)
+      // - If weight < 15kg: total_amount_cod = amount + delivery_base_amount (shipping + delivery base)
+      // - If has_delivery = false: total_amount_cod = amount (no delivery charge)
       let codDeliveryCharge = 0;
-      if (hasDeliveryComputed) {
+      if (hasDeliveryComputed && finalDeliveryBaseAmount > 0) {
         if (totalKgForCod >= 15) {
           codDeliveryCharge = 0; // Free delivery for COD if weight >= 15kg
         } else {
-          codDeliveryCharge = deliveryBaseAmount; // Base amount only (no box calculation for COD)
+          codDeliveryCharge = finalDeliveryBaseAmount; // Base amount only (no box calculation for COD)
         }
       }
+      // If has_delivery = false, codDeliveryCharge remains 0
+      
       calculatedTotalAmountCod = Math.round((shippingCharge + codDeliveryCharge) * 100) / 100;
+      
+      // Final validation: Ensure calculatedTotalAmountCod is at least shippingCharge
+      if (shippingCharge > 0 && calculatedTotalAmountCod < shippingCharge) {
+        console.warn(`⚠️ calculatedTotalAmountCod (${calculatedTotalAmountCod}) is less than shippingCharge (${shippingCharge}). Recalculating...`);
+        calculatedTotalAmountCod = Math.round((shippingCharge + codDeliveryCharge) * 100) / 100;
+      }
+      
+      console.log(`🔍 PH_TO_UAE COD Total Calculation:`);
+      console.log(`   Service: PH_TO_UAE (COD Invoice)`);
+      console.log(`   shippingCharge (amount): ${shippingCharge} AED`);
+      console.log(`   deliveryBaseAmount: ${finalDeliveryBaseAmount} AED`);
+      console.log(`   totalKgForCod: ${totalKgForCod} kg`);
+      console.log(`   has_delivery: ${hasDeliveryComputed}`);
+      console.log(`   Weight >= 15kg: ${totalKgForCod >= 15} (${totalKgForCod >= 15 ? 'Free delivery' : 'Delivery charge applies'})`);
+      console.log(`   codDeliveryCharge: ${codDeliveryCharge} AED`);
+      console.log(`   ✅ calculatedTotalAmountCod: ${calculatedTotalAmountCod} AED`);
+      console.log(`   📊 Formula: ${shippingCharge} + ${codDeliveryCharge} = ${calculatedTotalAmountCod} AED`);
       
       // Calculate Tax Invoice Total: Delivery (with boxes) + Tax
       // Delivery charge for Tax Invoice is already calculated with box formula
       let taxInvoiceDeliveryCharge = 0;
       if (hasDeliveryComputed) {
         if (numberOfBoxes <= 1) {
-          taxInvoiceDeliveryCharge = deliveryBaseAmount;
+          taxInvoiceDeliveryCharge = finalDeliveryBaseAmount;
         } else {
-          taxInvoiceDeliveryCharge = deliveryBaseAmount + ((numberOfBoxes - 1) * 5);
+          taxInvoiceDeliveryCharge = finalDeliveryBaseAmount + ((numberOfBoxes - 1) * 5);
         }
         taxInvoiceDeliveryCharge = Math.round(taxInvoiceDeliveryCharge * 100) / 100;
       }
@@ -1005,23 +1055,29 @@ router.post('/', async (req, res) => {
       const taxInvoiceTax = Math.round((taxInvoiceDeliveryCharge * 0.05) * 100) / 100;
       calculatedTotalAmountTaxInvoice = Math.round((taxInvoiceDeliveryCharge + taxInvoiceTax) * 100) / 100;
       
-      console.log(`✅ PH_TO_UAE Dual Totals Calculated:`);
-      console.log(`   COD Total: Shipping (${shippingCharge}) + Delivery (${codDeliveryCharge}) = ${calculatedTotalAmountCod} AED`);
-      console.log(`   Tax Invoice Total: Delivery (${taxInvoiceDeliveryCharge}) + Tax (${taxInvoiceTax}) = ${calculatedTotalAmountTaxInvoice} AED`);
+      console.log(`🔍 Tax Invoice Total Calculation Debug:`);
+      console.log(`   deliveryBaseAmount: ${finalDeliveryBaseAmount} AED`);
+      console.log(`   numberOfBoxes: ${numberOfBoxes}`);
+      console.log(`   taxInvoiceDeliveryCharge: ${taxInvoiceDeliveryCharge} AED`);
+      console.log(`   taxInvoiceTax: ${taxInvoiceTax} AED`);
+      console.log(`   calculatedTotalAmountTaxInvoice: ${calculatedTotalAmountTaxInvoice} AED`);
       
-      // Allow frontend override if provided (optional)
+      console.log(`✅ PH_TO_UAE Dual Totals Calculated:`);
+      console.log(`   COD Total: ${calculatedTotalAmountCod} AED (Shipping: ${shippingCharge} + Delivery: ${codDeliveryCharge})`);
+      console.log(`   Tax Invoice Total: ${calculatedTotalAmountTaxInvoice} AED (Delivery: ${taxInvoiceDeliveryCharge} + Tax: ${taxInvoiceTax})`);
+      
+      // Backend calculation takes precedence - do NOT allow frontend override for COD invoices
+      // Frontend can still send values, but backend calculation will be used
       if (total_amount_cod !== undefined && total_amount_cod !== null) {
-        const overrideCod = parseFloat(total_amount_cod);
-        if (!isNaN(overrideCod) && overrideCod >= 0) {
-          calculatedTotalAmountCod = Math.round(overrideCod * 100) / 100;
-          console.log(`   ⚠️ Using frontend override for total_amount_cod: ${calculatedTotalAmountCod} AED`);
+        const frontendCod = parseFloat(total_amount_cod);
+        if (!isNaN(frontendCod) && frontendCod >= 0) {
+          console.log(`   ℹ️ Frontend sent total_amount_cod: ${frontendCod} AED, but using backend calculated value: ${calculatedTotalAmountCod} AED`);
         }
       }
       if (total_amount_tax_invoice !== undefined && total_amount_tax_invoice !== null) {
-        const overrideTax = parseFloat(total_amount_tax_invoice);
-        if (!isNaN(overrideTax) && overrideTax >= 0) {
-          calculatedTotalAmountTaxInvoice = Math.round(overrideTax * 100) / 100;
-          console.log(`   ⚠️ Using frontend override for total_amount_tax_invoice: ${calculatedTotalAmountTaxInvoice} AED`);
+        const frontendTax = parseFloat(total_amount_tax_invoice);
+        if (!isNaN(frontendTax) && frontendTax >= 0) {
+          console.log(`   ℹ️ Frontend sent total_amount_tax_invoice: ${frontendTax} AED, but using backend calculated value: ${calculatedTotalAmountTaxInvoice} AED`);
         }
       }
     }
@@ -1034,13 +1090,15 @@ router.post('/', async (req, res) => {
     if (isPhToUae) {
       // PH_TO_UAE: Use calculated dual totals - COD for tax_rate=0, Tax Invoice for tax_rate=5
       if (finalTaxRate === 0) {
-        // COD Invoice: Use calculated total_amount_cod
-        totalAmount = calculatedTotalAmountCod;
+        // COD Invoice: Use calculated total_amount_cod (backend calculation takes precedence)
+        totalAmount = calculatedTotalAmountCod || 0;
         console.log(`✅ PH_TO_UAE COD Invoice: Using calculated total_amount_cod = ${totalAmount} AED`);
+        console.log(`   📋 Invoice total_amount set to: ${totalAmount} AED (same as total_amount_cod)`);
       } else if (finalTaxRate === 5) {
         // Tax Invoice: Use calculated total_amount_tax_invoice
-        totalAmount = calculatedTotalAmountTaxInvoice;
+        totalAmount = calculatedTotalAmountTaxInvoice || 0;
         console.log(`✅ PH_TO_UAE Tax Invoice: Using calculated total_amount_tax_invoice = ${totalAmount} AED`);
+        console.log(`   📋 Invoice total_amount set to: ${totalAmount} AED (same as total_amount_tax_invoice)`);
       } else {
         // Fallback: Calculate normally
         totalAmount = Math.round((baseAmount + taxAmount) * 100) / 100;
@@ -1148,7 +1206,7 @@ router.post('/', async (req, res) => {
       client_id,
       amount: mongoose.Types.Decimal128.fromString(shippingCharge.toFixed(2)), // Shipping charge only (weight × rate)
       delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Delivery charge
-      delivery_base_amount: isPhToUae && has_delivery ? mongoose.Types.Decimal128.fromString(deliveryBaseAmount.toFixed(2)) : undefined, // Base amount for PH_TO_UAE
+      delivery_base_amount: isPhToUae && has_delivery ? mongoose.Types.Decimal128.fromString((deliveryBaseAmount || 20).toFixed(2)) : undefined, // Base amount for PH_TO_UAE
       pickup_charge: mongoose.Types.Decimal128.fromString(pickupCharge.toFixed(2)), // Pickup charge (NOT in line_items to prevent doubling)
       base_amount: mongoose.Types.Decimal128.fromString(subtotalForStorage.toFixed(2)), // Subtotal (for UAE_TO_PH Flowmic: baseAmount/1.05, otherwise: baseAmount)
       insurance_charge: mongoose.Types.Decimal128.fromString((isPhToUae ? 0 : insuranceCharge).toFixed(2)), // Force 0 for PH_TO_UAE
@@ -1158,7 +1216,7 @@ router.post('/', async (req, res) => {
       tax_rate: finalTaxRate, // Tax rate (0% or 5%)
       tax_amount: mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2)), // Calculated tax amount
       total_amount: mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2)), // Final total (base_amount + tax_amount)
-      // Store dual totals for PH_TO_UAE (automatically calculated)
+      // Store dual totals for PH_TO_UAE (automatically calculated - backend takes precedence)
       ...(isPhToUae ? {
         total_amount_cod: mongoose.Types.Decimal128.fromString(calculatedTotalAmountCod.toFixed(2)),
         total_amount_tax_invoice: mongoose.Types.Decimal128.fromString(calculatedTotalAmountTaxInvoice.toFixed(2))
@@ -1223,6 +1281,41 @@ router.post('/', async (req, res) => {
     if (awbNumberToUse) {
       invoiceData.awb_number = awbNumberToUse;
       console.log('✅ Set awb_number in data:', awbNumberToUse);
+    }
+    
+    // Final validation for PH_TO_UAE dual totals before saving
+    if (isPhToUae) {
+      if (calculatedTotalAmountCod === 0 && shippingCharge > 0) {
+        console.error(`❌ ERROR: calculatedTotalAmountCod is 0 but shippingCharge is ${shippingCharge}. Recalculating...`);
+        // Recalculate if needed
+        const finalDeliveryBaseAmount = deliveryBaseAmount || 20;
+        let totalKgForCod = 0;
+        if (invoiceRequest?.verification?.total_kg !== null && 
+            invoiceRequest?.verification?.total_kg !== undefined) {
+          totalKgForCod = parseFloat(invoiceRequest.verification.total_kg.toString());
+        } else if (weight > 0) {
+          totalKgForCod = weight;
+        }
+        
+        let codDeliveryCharge = 0;
+        if (hasDeliveryComputed && finalDeliveryBaseAmount > 0) {
+          if (totalKgForCod >= 15) {
+            codDeliveryCharge = 0;
+          } else {
+            codDeliveryCharge = finalDeliveryBaseAmount;
+          }
+        }
+        calculatedTotalAmountCod = Math.round((shippingCharge + codDeliveryCharge) * 100) / 100;
+        
+        // Update invoiceData with recalculated value
+        invoiceData.total_amount_cod = mongoose.Types.Decimal128.fromString(calculatedTotalAmountCod.toFixed(2));
+        console.log(`✅ Recalculated total_amount_cod: ${calculatedTotalAmountCod} AED`);
+      }
+      
+      console.log(`📊 Final PH_TO_UAE Dual Totals Before Save:`);
+      console.log(`   total_amount_cod: ${calculatedTotalAmountCod} AED`);
+      console.log(`   total_amount_tax_invoice: ${calculatedTotalAmountTaxInvoice} AED`);
+      console.log(`   total_amount: ${totalAmount} AED (based on tax_rate: ${finalTaxRate})`);
     }
     
     console.log('📝 Invoice data to save (with invoice_id):', JSON.stringify(invoiceData, null, 2));
@@ -1831,9 +1924,14 @@ router.put('/:id', async (req, res) => {
           console.log(`   Subtotal (a = baseAmount / 1.05): ${subtotalForUpdate.toFixed(2)} AED`);
           console.log(`   Tax (b = a * 0.05): ${taxAmount.toFixed(2)} AED`);
           console.log(`   Total (a + b = baseAmount): ${baseAmountValue.toFixed(2)} AED`);
-        } else if (isPhToUae && deliveryCharge > 0) {
-          // Rule 2: PH_TO_UAE with delivery - 5% on delivery charge only
+        } else if (isPhToUae) {
+          // Rule 2: PH_TO_UAE Tax Invoice - 5% on delivery charge only
+          // For Tax Invoices (taxRate = 5), always calculate tax on delivery charge
           taxAmount = deliveryCharge * 0.05;
+          console.log('✅ Applying 5% VAT on delivery charge only (PH_TO_UAE Tax Invoice update)');
+          console.log(`   Tax Rate: ${taxRate}%`);
+          console.log(`   Delivery Charge: ${deliveryCharge} AED`);
+          console.log(`   Tax (5%): ${taxAmount} AED`);
         } else {
           // Default: 5% on subtotal
           taxAmount = baseAmountValue * 0.05;
