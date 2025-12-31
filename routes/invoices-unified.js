@@ -704,7 +704,7 @@ router.post('/', async (req, res) => {
       });
     }
     
-    // Validate pickup_base_amount for PH_TO_UAE with pickup option
+    // Validate pickup_base_amount for all service types (PH_TO_UAE and UAE_TO_PH)
     let pickupBaseAmount = null;
     if (pickup_base_amount !== undefined && pickup_base_amount !== null) {
       pickupBaseAmount = parseFloat(pickup_base_amount);
@@ -714,6 +714,7 @@ router.post('/', async (req, res) => {
           error: 'pickup_base_amount must be a number >= 0'
         });
       }
+      console.log(`✅ pickup_base_amount received: ${pickupBaseAmount} AED (service: ${serviceCode || 'N/A'})`);
     }
     
     // Check if pickup_base_amount is required (PH_TO_UAE with pickup option)
@@ -730,6 +731,13 @@ router.post('/', async (req, res) => {
           });
         }
         console.log(`✅ Pickup option detected for PH_TO_UAE, pickup_base_amount: ${pickupBaseAmount} AED`);
+      }
+    }
+    
+    // Log pickup_base_amount for UAE_TO_PH shipments (for debugging)
+    if (serviceCode && serviceCode.toUpperCase().includes('UAE_TO_PH')) {
+      if (pickupBaseAmount !== null && pickupBaseAmount !== undefined) {
+        console.log(`✅ pickup_base_amount provided for UAE_TO_PH: ${pickupBaseAmount} AED`);
       }
     }
     
@@ -771,11 +779,12 @@ router.post('/', async (req, res) => {
         
         if (description.includes('pickup')) {
           pickupCharge += itemTotal;
+          console.log(`✅ Found pickup charge in line_items: ${item.description} = ${itemTotal} AED`);
         } else if (description.includes('delivery')) {
           deliveryChargeFromItems += itemTotal;
         } else if (description.includes('insurance')) {
           insuranceChargeFromItems += itemTotal;
-        } else if (description.includes('shipping') || !description.includes('pickup') && !description.includes('delivery') && !description.includes('insurance')) {
+        } else if (description.includes('shipping') || (!description.includes('pickup') && !description.includes('delivery') && !description.includes('insurance'))) {
           // Shipping charge or any other charge that's not pickup/delivery/insurance
           shippingCharge += itemTotal;
         }
@@ -945,13 +954,28 @@ router.post('/', async (req, res) => {
       console.log('ℹ️ No insurance in line_items from frontend, setting insuranceCharge = 0 (no database calculation)');
     }
     
-    // Calculate pickup_charge from pickup_base_amount
-    // For PH_TO_UAE with pickup option, pickup_charge = pickup_base_amount
+    // Calculate pickup_charge from pickup_base_amount or line_items
+    // For PH_TO_UAE with pickup option: pickup_charge = pickup_base_amount
+    // For UAE_TO_PH Flomic shipments: pickup_charge can come from pickup_base_amount or line_items
     // Priority: pickup_base_amount (if provided) > pickupCharge from line_items
     let finalPickupCharge = pickupCharge; // Default to pickup charge from line_items
+    
+    // IMPORTANT: For UAE_TO_PH Flomic shipments, ensure pickup charge is captured
+    const isUaeToPhForPickup = serviceCode && serviceCode.toUpperCase().includes('UAE_TO_PH');
+    
     if (pickupBaseAmount !== null && pickupBaseAmount !== undefined) {
       finalPickupCharge = pickupBaseAmount;
       console.log(`✅ Using pickup_base_amount for pickup_charge: ${finalPickupCharge} AED`);
+      if (isUaeToPhForPickup) {
+        console.log(`   📋 UAE_TO_PH: Pickup charge from pickup_base_amount will be included in totals`);
+      }
+    } else if (pickupCharge > 0) {
+      console.log(`✅ Using pickup charge from line_items: ${pickupCharge} AED`);
+      if (isUaeToPhForPickup) {
+        console.log(`   📋 UAE_TO_PH: Pickup charge from line_items will be included in totals`);
+      }
+    } else if (isUaeToPhForPickup) {
+      console.log(`ℹ️ UAE_TO_PH: No pickup charge provided (pickup_base_amount: ${pickupBaseAmount}, line_items pickup: ${pickupCharge})`);
     }
     
     // Round all charges to 2 decimal places
@@ -962,15 +986,30 @@ router.post('/', async (req, res) => {
     insuranceCharge = Math.round(insuranceCharge * 100) / 100;
     
     // Calculate subtotal (all charges combined)
+    // IMPORTANT: For UAE_TO_PH Flomic shipments, pickup charge MUST be included in subtotal
+    // Ensure pickupCharge is the final value (from pickup_base_amount or line_items)
     const subtotal = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
     const baseAmount = Math.round(subtotal * 100) / 100;
     
     console.log('📊 Charge Extraction Summary:');
+    console.log(`   Service Code: ${serviceCode || 'N/A'}`);
     console.log(`   Shipping Charge: ${shippingCharge} AED`);
-    console.log(`   Pickup Charge: ${pickupCharge} AED`);
+    console.log(`   Pickup Charge: ${pickupCharge} AED (FINAL - from ${pickupBaseAmount !== null && pickupBaseAmount !== undefined ? 'pickup_base_amount' : 'line_items'})`);
     console.log(`   Delivery Charge: ${deliveryCharge} AED`);
     console.log(`   Insurance Charge: ${insuranceCharge} AED`);
-    console.log(`   Subtotal (base_amount): ${baseAmount} AED`);
+    console.log(`   Subtotal (base_amount before tax adjustment): ${baseAmount} AED`);
+    console.log(`   📋 Formula: ${shippingCharge} + ${pickupCharge} + ${deliveryCharge} + ${insuranceCharge} = ${baseAmount} AED`);
+    
+    // Verify pickup charge is included for UAE_TO_PH and PH_TO_UAE
+    const normalizedServiceCodeForVerification = (serviceCode || '').toUpperCase();
+    const isUaeToPhForVerification = normalizedServiceCodeForVerification.includes('UAE_TO_PH');
+    const isPhToUaeForVerification = normalizedServiceCodeForVerification.includes('PH_TO_UAE');
+    if (isUaeToPhForVerification && pickupCharge > 0) {
+      console.log(`   ✅ VERIFIED: Pickup charge (${pickupCharge} AED) is included in baseAmount for UAE_TO_PH`);
+    }
+    if (isPhToUaeForVerification && pickupCharge > 0) {
+      console.log(`   ✅ VERIFIED: Pickup charge (${pickupCharge} AED) is included in baseAmount for PH_TO_UAE (will be in COD total only)`);
+    }
     
     // ============================================
     // VAT/Tax Calculation (Priority Order)
@@ -1007,6 +1046,7 @@ router.post('/', async (req, res) => {
     });
     
     // For UAE_TO_PH Flomic/Personal: baseAmount already includes tax, need to extract subtotal
+    // IMPORTANT: baseAmount includes pickup charge (shipping + pickup + delivery + insurance)
     let subtotalForStorage = baseAmount; // Default: use baseAmount as subtotal
     if (isUaeToPh && isFlomicOrPersonal) {
       // Rule 1: Flomic/Personal UAE_TO_PH - 5% VAT calculation
@@ -1014,14 +1054,17 @@ router.post('/', async (req, res) => {
       // a = baseAmount / 1.05 (subtotal without tax) - stored as base_amount
       // b = a * 0.05 (tax amount) - stored as tax_amount
       // total = a + b = baseAmount (original) - stored as total_amount
+      // NOTE: baseAmount includes pickup charge, so pickup charge is included in all calculations
       finalTaxRate = 5;
       subtotalForStorage = baseAmount / 1.05; // a - subtotal without tax
       taxAmount = subtotalForStorage * 0.05; // b - tax amount
       console.log('✅ Applying 5% VAT calculation (Flomic/Personal UAE_TO_PH)');
-      console.log(`   Base Amount (input, includes tax): ${baseAmount} AED`);
+      console.log(`   Base Amount (input, includes tax AND pickup charge): ${baseAmount} AED`);
+      console.log(`   Pickup Charge included in baseAmount: ${pickupCharge} AED`);
       console.log(`   Subtotal (a = baseAmount / 1.05): ${subtotalForStorage.toFixed(2)} AED`);
       console.log(`   Tax (b = a * 0.05): ${taxAmount.toFixed(2)} AED`);
       console.log(`   Total (a + b = baseAmount): ${baseAmount.toFixed(2)} AED`);
+      console.log(`   ✅ VERIFIED: Pickup charge (${pickupCharge} AED) is included in total_amount`);
     } else if (isPhToUae && tax_rate === 5) {
       // Rule 2: PH_TO_UAE Tax Invoice - 5% VAT on delivery charge only
       // For Tax Invoices (tax_rate = 5), always calculate tax on delivery charge
@@ -1093,8 +1136,10 @@ router.post('/', async (req, res) => {
       }
       // If has_delivery = false, codDeliveryCharge remains 0
       
-      // Include pickup charge in COD total (only if pickup_base_amount is provided)
-      const codPickupCharge = (pickupBaseAmount !== null && pickupBaseAmount !== undefined) ? pickupBaseAmount : 0;
+      // Include pickup charge in COD total
+      // IMPORTANT: Use pickupCharge (final value) which includes pickup from pickup_base_amount OR line_items
+      // pickupCharge is already calculated above (line 984) and includes pickup from either source
+      const codPickupCharge = pickupCharge; // Use the final pickupCharge value (from pickup_base_amount or line_items)
       calculatedTotalAmountCod = Math.round((shippingCharge + codPickupCharge + codDeliveryCharge) * 100) / 100;
       
       // Final validation: Ensure calculatedTotalAmountCod is at least shippingCharge
@@ -1106,6 +1151,7 @@ router.post('/', async (req, res) => {
       console.log(`🔍 PH_TO_UAE COD Total Calculation:`);
       console.log(`   Service: PH_TO_UAE (COD Invoice)`);
       console.log(`   shippingCharge (amount): ${shippingCharge} AED`);
+      console.log(`   pickupCharge (FINAL - from ${pickupBaseAmount !== null && pickupBaseAmount !== undefined ? 'pickup_base_amount' : 'line_items'}): ${pickupCharge} AED`);
       console.log(`   pickupBaseAmount: ${pickupBaseAmount !== null ? pickupBaseAmount : 0} AED`);
       console.log(`   deliveryBaseAmount: ${finalDeliveryBaseAmount} AED`);
       console.log(`   totalKgForCod: ${totalKgForCod} kg`);
@@ -1115,6 +1161,9 @@ router.post('/', async (req, res) => {
       console.log(`   codDeliveryCharge: ${codDeliveryCharge} AED`);
       console.log(`   ✅ calculatedTotalAmountCod: ${calculatedTotalAmountCod} AED`);
       console.log(`   📊 Formula: ${shippingCharge} + ${codPickupCharge} + ${codDeliveryCharge} = ${calculatedTotalAmountCod} AED`);
+      if (pickupCharge > 0) {
+        console.log(`   ✅ VERIFIED: Pickup charge (${pickupCharge} AED) is included in COD total`);
+      }
       
       // Calculate Tax Invoice Total: Delivery (with boxes) + Tax
       // Delivery charge for Tax Invoice is already calculated with box formula
@@ -1170,6 +1219,9 @@ router.post('/', async (req, res) => {
         totalAmount = calculatedTotalAmountCod || 0;
         console.log(`✅ PH_TO_UAE COD Invoice: Using calculated total_amount_cod = ${totalAmount} AED`);
         console.log(`   📋 Invoice total_amount set to: ${totalAmount} AED (same as total_amount_cod)`);
+        if (pickupCharge > 0) {
+          console.log(`   ✅ VERIFIED: Pickup charge (${pickupCharge} AED) is included in COD total_amount`);
+        }
       } else if (finalTaxRate === 5) {
         // Tax Invoice: Use calculated total_amount_tax_invoice
         totalAmount = calculatedTotalAmountTaxInvoice || 0;
@@ -1182,8 +1234,10 @@ router.post('/', async (req, res) => {
       }
     } else if (isUaeToPh && isFlomicOrPersonal && finalTaxRate > 0) {
       // Base amount already includes tax - total equals original baseAmount
+      // IMPORTANT: baseAmount includes pickup charge (shipping + pickup + delivery + insurance)
       totalAmount = Math.round(baseAmount * 100) / 100;
       console.log('✅ Base amount includes tax (UAE to PH Flomic/Personal) - Total = Original Base Amount');
+      console.log(`   📋 Total includes pickup charge: ${pickupCharge} AED (total: ${totalAmount} AED)`);
     } else {
       // VAT added on top - total = subtotal + tax
       totalAmount = Math.round((baseAmount + taxAmount) * 100) / 100;
@@ -1304,8 +1358,8 @@ router.post('/', async (req, res) => {
       amount: mongoose.Types.Decimal128.fromString(shippingCharge.toFixed(2)), // Shipping charge only (weight × rate)
       delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Delivery charge
       delivery_base_amount: isPhToUae && has_delivery ? mongoose.Types.Decimal128.fromString((deliveryBaseAmount || 20).toFixed(2)) : undefined, // Base amount for PH_TO_UAE
-      pickup_base_amount: (pickupBaseAmount !== null && pickupBaseAmount !== undefined) ? mongoose.Types.Decimal128.fromString(pickupBaseAmount.toFixed(2)) : undefined, // Base amount for PH_TO_UAE pickup charge
-      pickup_charge: mongoose.Types.Decimal128.fromString(pickupCharge.toFixed(2)), // Pickup charge (from pickup_base_amount if provided, otherwise from line_items)
+      pickup_base_amount: (pickupBaseAmount !== null && pickupBaseAmount !== undefined) ? mongoose.Types.Decimal128.fromString(pickupBaseAmount.toFixed(2)) : undefined, // Base amount for pickup charge (PH_TO_UAE or UAE_TO_PH)
+      pickup_charge: mongoose.Types.Decimal128.fromString(pickupCharge.toFixed(2)), // Pickup charge (from pickup_base_amount if provided, otherwise from line_items) - INCLUDED in base_amount and total_amount for all service types
       base_amount: mongoose.Types.Decimal128.fromString(subtotalForStorage.toFixed(2)), // Subtotal (for UAE_TO_PH Flomic: baseAmount/1.05, otherwise: baseAmount)
       insurance_charge: mongoose.Types.Decimal128.fromString((isPhToUae ? 0 : insuranceCharge).toFixed(2)), // Force 0 for PH_TO_UAE
       due_date: invoiceDueDate,
