@@ -124,6 +124,7 @@ const transformInvoice = (invoice) => {
     ...invoiceObj,
     amount: convertDecimal128(invoiceObj.amount),
     delivery_charge: convertDecimal128(invoiceObj.delivery_charge),
+    cod_delivery_charge: convertDecimal128(invoiceObj.cod_delivery_charge),
     delivery_base_amount: convertDecimal128(invoiceObj.delivery_base_amount),
     pickup_base_amount: convertDecimal128(invoiceObj.pickup_base_amount),
     pickup_charge: convertDecimal128(invoiceObj.pickup_charge),
@@ -1088,6 +1089,7 @@ router.post('/', async (req, res) => {
     // IMPORTANT: Backend calculation takes precedence - always calculate for PH_TO_UAE
     let calculatedTotalAmountCod = 0;
     let calculatedTotalAmountTaxInvoice = 0;
+    let codDeliveryCharge = 0; // Initialize outside block so it's available for invoice creation
     
     if (isPhToUae) {
       // Validate and ensure delivery_base_amount is set for PH_TO_UAE
@@ -1126,7 +1128,8 @@ router.post('/', async (req, res) => {
       // - If weight >= 15kg: total_amount_cod = amount + pickup_base_amount (shipping + pickup, free delivery)
       // - If weight < 15kg: total_amount_cod = amount + pickup_base_amount + delivery_base_amount (shipping + pickup + delivery base)
       // - If has_delivery = false: total_amount_cod = amount + pickup_base_amount (shipping + pickup, no delivery charge)
-      let codDeliveryCharge = 0;
+      // codDeliveryCharge is already declared above, just reset it here
+      codDeliveryCharge = 0;
       if (hasDeliveryComputed && finalDeliveryBaseAmount > 0) {
         if (totalKgForCod >= 15) {
           codDeliveryCharge = 0; // Free delivery for COD if weight >= 15kg
@@ -1141,6 +1144,9 @@ router.post('/', async (req, res) => {
       // pickupCharge is already calculated above (line 984) and includes pickup from either source
       const codPickupCharge = pickupCharge; // Use the final pickupCharge value (from pickup_base_amount or line_items)
       calculatedTotalAmountCod = Math.round((shippingCharge + codPickupCharge + codDeliveryCharge) * 100) / 100;
+      
+      // Store cod_delivery_charge separately for COD invoices (independent from Tax invoice delivery_charge)
+      // This allows COD and Tax invoice delivery charges to be edited independently
       
       // Final validation: Ensure calculatedTotalAmountCod is at least shippingCharge
       if (shippingCharge > 0 && calculatedTotalAmountCod < shippingCharge) {
@@ -1356,8 +1362,9 @@ router.post('/', async (req, res) => {
       request_id,
       client_id,
       amount: mongoose.Types.Decimal128.fromString(shippingCharge.toFixed(2)), // Shipping charge only (weight × rate)
-      delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Delivery charge
-      delivery_base_amount: isPhToUae && has_delivery ? mongoose.Types.Decimal128.fromString((deliveryBaseAmount || 20).toFixed(2)) : undefined, // Base amount for PH_TO_UAE
+      delivery_charge: mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)), // Delivery charge (for Tax invoices)
+      cod_delivery_charge: isPhToUae ? mongoose.Types.Decimal128.fromString(codDeliveryCharge.toFixed(2)) : undefined, // COD delivery charge (for COD invoices, independent from Tax invoice delivery_charge)
+      delivery_base_amount: isPhToUae && has_delivery ? mongoose.Types.Decimal128.fromString((deliveryBaseAmount || 20).toFixed(2)) : undefined, // Base amount for PH_TO_UAE (kept for backward compatibility)
       pickup_base_amount: (pickupBaseAmount !== null && pickupBaseAmount !== undefined) ? mongoose.Types.Decimal128.fromString(pickupBaseAmount.toFixed(2)) : undefined, // Base amount for pickup charge (PH_TO_UAE or UAE_TO_PH)
       pickup_charge: mongoose.Types.Decimal128.fromString(pickupCharge.toFixed(2)), // Pickup charge (from pickup_base_amount if provided, otherwise from line_items) - INCLUDED in base_amount and total_amount for all service types
       base_amount: mongoose.Types.Decimal128.fromString(subtotalForStorage.toFixed(2)), // Subtotal (for UAE_TO_PH Flomic: baseAmount/1.05, otherwise: baseAmount)
@@ -1972,6 +1979,9 @@ router.put('/:id', async (req, res) => {
 
       if (invoiceType === 'COD') {
         // COD Invoice Edit
+        // IMPORTANT: For COD invoices, we update cod_delivery_charge (NOT delivery_charge)
+        // delivery_charge is for Tax invoices only and must remain independent
+        
         // Validate required fields
         if (updateData.amount === undefined || updateData.amount === null) {
           return res.status(400).json({
@@ -1979,10 +1989,10 @@ router.put('/:id', async (req, res) => {
             error: 'amount is required for COD invoice edit'
           });
         }
-        if (updateData.delivery_base_amount === undefined || updateData.delivery_base_amount === null) {
+        if (updateData.cod_delivery_charge === undefined || updateData.cod_delivery_charge === null) {
           return res.status(400).json({
             success: false,
-            error: 'delivery_base_amount is required for COD invoice edit'
+            error: 'cod_delivery_charge is required for COD invoice edit'
           });
         }
         if (updateData.total_amount_cod === undefined || updateData.total_amount_cod === null) {
@@ -1996,35 +2006,61 @@ router.put('/:id', async (req, res) => {
         const amount = typeof updateData.amount === 'object' && updateData.amount.toString
           ? parseFloat(updateData.amount.toString())
           : parseFloat(updateData.amount);
-        const deliveryBaseAmount = typeof updateData.delivery_base_amount === 'object' && updateData.delivery_base_amount.toString
-          ? parseFloat(updateData.delivery_base_amount.toString())
-          : parseFloat(updateData.delivery_base_amount);
+        const codDeliveryCharge = typeof updateData.cod_delivery_charge === 'object' && updateData.cod_delivery_charge.toString
+          ? parseFloat(updateData.cod_delivery_charge.toString())
+          : parseFloat(updateData.cod_delivery_charge);
         const totalAmountCod = typeof updateData.total_amount_cod === 'object' && updateData.total_amount_cod.toString
           ? parseFloat(updateData.total_amount_cod.toString())
           : parseFloat(updateData.total_amount_cod);
 
-        // Validate calculations
-        const expectedTotal = amount + deliveryBaseAmount;
+        // Validate cod_delivery_charge
+        if (isNaN(codDeliveryCharge) || codDeliveryCharge < 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'cod_delivery_charge must be 0 or greater'
+          });
+        }
+
+        // Get pickup charge from existing invoice or updateData
+        const pickupCharge = updateData.pickup_charge !== undefined
+          ? (typeof updateData.pickup_charge === 'object' && updateData.pickup_charge.toString ? parseFloat(updateData.pickup_charge.toString()) : parseFloat(updateData.pickup_charge))
+          : (invoice.pickup_charge ? parseFloat(invoice.pickup_charge.toString()) : 0);
+
+        // Validate calculations (amount + pickup + cod_delivery_charge = total_amount_cod)
+        const expectedTotal = amount + pickupCharge + codDeliveryCharge;
         if (Math.abs(totalAmountCod - expectedTotal) > 0.01) {
-          console.warn(`⚠️ COD total validation: expected ${expectedTotal}, got ${totalAmountCod}`);
+          console.warn(`⚠️ COD total validation: expected ${expectedTotal} (${amount} + ${pickupCharge} + ${codDeliveryCharge}), got ${totalAmountCod}`);
         }
 
         // Set COD invoice fields
-        updateData.amount = mongoose.Types.Decimal128.fromString(amount.toFixed(2));
-        updateData.delivery_base_amount = mongoose.Types.Decimal128.fromString(deliveryBaseAmount.toFixed(2));
+        // IMPORTANT: Do NOT update delivery_charge (this is for Tax invoices only)
+        // IMPORTANT: Do NOT update amount (shipping charge must be preserved)
+        updateData.cod_delivery_charge = mongoose.Types.Decimal128.fromString(codDeliveryCharge.toFixed(2));
         updateData.total_amount_cod = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
         updateData.tax_rate = 0;
         updateData.tax_amount = mongoose.Types.Decimal128.fromString('0.00');
         updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
         updateData.base_amount = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
-        updateData.delivery_charge = mongoose.Types.Decimal128.fromString(deliveryBaseAmount.toFixed(2));
+        
+        // Explicitly preserve amount (shipping charge) - do not update it
+        if (updateData.amount !== undefined) {
+          // Convert to Decimal128 if needed, but preserve the value
+          updateData.amount = typeof updateData.amount === 'object' && updateData.amount.toString
+            ? updateData.amount
+            : mongoose.Types.Decimal128.fromString(parseFloat(updateData.amount).toFixed(2));
+        }
+        
+        // Explicitly do NOT update delivery_charge (preserve Tax invoice delivery charge)
+        delete updateData.delivery_charge;
 
         console.log('✅ COD Invoice Edit Applied:');
-        console.log(`   Amount (Shipping): ${amount} AED`);
-        console.log(`   Delivery Base Amount: ${deliveryBaseAmount} AED`);
+        console.log(`   Amount (Shipping - PRESERVED): ${amount} AED`);
+        console.log(`   Pickup Charge: ${pickupCharge} AED`);
+        console.log(`   COD Delivery Charge: ${codDeliveryCharge} AED`);
         console.log(`   Total Amount COD: ${totalAmountCod} AED`);
         console.log(`   Tax Rate: 0%`);
         console.log(`   Tax Amount: 0 AED`);
+        console.log(`   ⚠️ delivery_charge (Tax invoice) is NOT updated - remains independent`);
 
         // Skip the general recalculation logic for COD edits
         // Remove invoice_type from updateData before saving (it's not a database field)
@@ -2056,6 +2092,9 @@ router.put('/:id', async (req, res) => {
 
       } else if (invoiceType === 'TAX') {
         // Tax Invoice Edit
+        // IMPORTANT: For Tax invoices, we update delivery_charge (NOT cod_delivery_charge)
+        // cod_delivery_charge is for COD invoices only and must remain independent
+        
         // Validate required fields
         if (updateData.delivery_charge === undefined || updateData.delivery_charge === null) {
           return res.status(400).json({
@@ -2087,6 +2126,14 @@ router.put('/:id', async (req, res) => {
           ? parseFloat(updateData.total_amount_tax_invoice.toString())
           : parseFloat(updateData.total_amount_tax_invoice);
 
+        // Validate delivery_charge
+        if (isNaN(deliveryCharge) || deliveryCharge < 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'delivery_charge must be 0 or greater'
+          });
+        }
+
         // Validate calculations
         const expectedTotal = deliveryCharge + taxAmount;
         if (Math.abs(totalAmountTaxInvoice - expectedTotal) > 0.01) {
@@ -2094,11 +2141,26 @@ router.put('/:id', async (req, res) => {
         }
 
         // Set Tax invoice fields
+        // IMPORTANT: Do NOT update cod_delivery_charge (this is for COD invoices only)
+        // IMPORTANT: Do NOT update amount (shipping charge must be preserved)
         updateData.delivery_charge = mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2));
         updateData.total_amount_tax_invoice = mongoose.Types.Decimal128.fromString(totalAmountTaxInvoice.toFixed(2));
         updateData.tax_rate = 5;
+        
+        // Explicitly do NOT update cod_delivery_charge (preserve COD delivery charge)
+        delete updateData.cod_delivery_charge;
+        
+        // Explicitly preserve amount (shipping charge) - do not update it
+        if (updateData.amount !== undefined) {
+          // Convert to Decimal128 if needed, but preserve the value
+          updateData.amount = typeof updateData.amount === 'object' && updateData.amount.toString
+            ? updateData.amount
+            : mongoose.Types.Decimal128.fromString(parseFloat(updateData.amount).toFixed(2));
+        } else {
+          // If amount not provided, preserve existing amount from invoice
+          updateData.amount = invoice.amount;
+        }
         updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
-        updateData.amount = mongoose.Types.Decimal128.fromString('0.00'); // Shipping hidden in tax invoice
         updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountTaxInvoice.toFixed(2));
         updateData.base_amount = mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)); // Subtotal = delivery charge only
 
@@ -2107,7 +2169,8 @@ router.put('/:id', async (req, res) => {
         console.log(`   Tax Amount (5%): ${taxAmount} AED`);
         console.log(`   Total Amount Tax Invoice: ${totalAmountTaxInvoice} AED`);
         console.log(`   Tax Rate: 5%`);
-        console.log(`   Amount (Shipping): 0 AED (hidden in tax invoice)`);
+        console.log(`   Amount (Shipping - PRESERVED): ${invoice.amount ? parseFloat(invoice.amount.toString()).toFixed(2) : '0.00'} AED`);
+        console.log(`   ⚠️ cod_delivery_charge (COD invoice) is NOT updated - remains independent`);
 
         // Skip the general recalculation logic for Tax edits
         // Remove invoice_type from updateData before saving (it's not a database field)

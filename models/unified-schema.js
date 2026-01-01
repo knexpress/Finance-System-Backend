@@ -618,10 +618,16 @@ const invoiceSchema = new mongoose.Schema({
     required: false,
     default: 0,
   },
+  cod_delivery_charge: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+    default: null,
+    // Separate delivery charge for PH_TO_UAE COD invoices (independent from Tax invoice delivery_charge)
+  },
   delivery_base_amount: {
     type: mongoose.Schema.Types.Decimal128,
     required: false,
-    // Base amount for PH_TO_UAE delivery charge calculation (default: 20)
+    // Base amount for PH_TO_UAE delivery charge calculation (default: 20) - kept for backward compatibility
   },
   pickup_base_amount: {
     type: mongoose.Schema.Types.Decimal128,
@@ -1484,7 +1490,7 @@ const priceBracketSchema = new mongoose.Schema({
 });
 
 // Price Bracket indexes
-priceBracketSchema.index({ route: 1 }, { unique: true });
+// Note: route field already has unique: true, so no need for explicit index definition
 
 // ========================================
 // EXPORT MODELS
