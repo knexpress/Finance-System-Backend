@@ -124,9 +124,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipment(invoice) {
-    // EMPOST API is disabled for testing
-    console.log('[EMPOST DISABLED] Skipping shipment creation in EMPOST');
-    return { data: { uhawb: 'N/A' } };
+    if (process.env.EMPOST_API_DISABLED === 'true') {
+      console.log('[EMPOST DISABLED] Skipping shipment creation in EMPOST');
+      return { data: { uhawb: 'N/A' } };
+    }
     
     try {
       console.log('📦 Creating shipment in EMpost for invoice:', invoice.invoice_id);
@@ -196,9 +197,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost shipment response
    */
   async createShipmentFromInvoiceRequest(invoiceRequest) {
-    // EMPOST API is disabled for testing
-    console.log('[EMPOST DISABLED] Skipping shipment creation from InvoiceRequest in EMPOST');
-    return { data: { uhawb: 'N/A' } };
+    if (process.env.EMPOST_API_DISABLED === 'true') {
+      console.log('[EMPOST DISABLED] Skipping shipment creation from InvoiceRequest in EMPOST');
+      return { data: { uhawb: 'N/A' } };
+    }
     
     try {
       console.log('📦 Creating shipment in EMpost from InvoiceRequest:', invoiceRequest.tracking_code || invoiceRequest.invoice_number);
@@ -235,9 +237,10 @@ class EMpostAPIService {
    * @returns {Promise<Object>} EMpost update response
    */
   async updateShipmentStatus(trackingNumber, status, additionalData = {}) {
-    // EMPOST API is disabled for testing
-    console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
-    return { success: true, message: 'EMPOST API disabled' };
+    if (process.env.EMPOST_API_DISABLED === 'true') {
+      console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
+      return { success: true, message: 'EMPOST API disabled' };
+    }
     
     try {
       console.log(`🔄 Updating EMPOST shipment status: ${trackingNumber} -> ${status}`);
