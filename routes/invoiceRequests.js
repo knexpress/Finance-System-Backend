@@ -1710,7 +1710,7 @@ router.put('/:id/verification', async (req, res) => {
       }
     console.log(`✅ Auto-determined weight type: ${invoiceRequest.verification.weight_type} (Actual: ${actualWeight} kg, Volumetric: ${volumetricWeight} kg, Chargeable: ${chargeableWeight} kg)`);
 
-    // Handle number_of_boxes (simple input, default 1, must be >= 1)
+    // Handle number_of_boxes (simple input, default to boxes.length if boxes exist, otherwise 1, must be >= 1)
     if (verificationData.number_of_boxes !== undefined) {
       const numBoxes = parseInt(verificationData.number_of_boxes);
       if (isNaN(numBoxes) || numBoxes < 1) {
@@ -1721,8 +1721,14 @@ router.put('/:id/verification', async (req, res) => {
       }
       invoiceRequest.verification.number_of_boxes = numBoxes;
     } else {
-      // Default to 1 if not provided
-      invoiceRequest.verification.number_of_boxes = 1;
+      // Auto-sync with boxes array length if boxes exist, otherwise default to 1
+      if (Array.isArray(invoiceRequest.verification.boxes) && invoiceRequest.verification.boxes.length > 0) {
+        invoiceRequest.verification.number_of_boxes = invoiceRequest.verification.boxes.length;
+        console.log(`✅ Auto-synced number_of_boxes with boxes array length: ${invoiceRequest.verification.number_of_boxes}`);
+      } else {
+        // Default to 1 if no boxes array or boxes array is empty
+        invoiceRequest.verification.number_of_boxes = 1;
+      }
     }
 
     // Auto-set total_kg = chargeable_weight (for Finance invoice generation)
