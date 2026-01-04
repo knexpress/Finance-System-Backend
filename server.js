@@ -37,8 +37,6 @@ const csvUploadRoutes = require('./routes/csv-upload');
 const bookingsRoutes = require('./routes/bookings');
 const chatRoutes = require('./routes/chat');
 const activityRoutes = require('./routes/activity');
-const dataRetentionRoutes = require('./routes/data-retention');
-const dataRetentionService = require('./services/data-retention');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -183,24 +181,6 @@ mongoose.connect(MONGODB_URI)
 .then(() => {
   console.log('✅ Connected to MongoDB');
   
-  // Initialize data retention service after MongoDB connection
-  const cron = require('node-cron');
-  
-  // Run data retention cleanup daily at 2:00 AM UTC
-  // Format: minute hour day month day-of-week
-  cron.schedule('0 2 * * *', async () => {
-    console.log('🕐 Scheduled data retention cleanup triggered');
-    await dataRetentionService.runCleanup();
-  }, {
-    scheduled: true,
-    timezone: 'UTC'
-  });
-  
-  // Also run immediately on server start (optional - for testing)
-  // Uncomment the line below if you want to run cleanup on server start
-  // dataRetentionService.runCleanup().catch(err => console.error('Error running initial cleanup:', err));
-  
-  console.log('✅ Data retention service scheduled (runs daily at 2:00 AM UTC)');
 })
 .catch((error) => {
   console.error('❌ MongoDB connection error:', error);
@@ -246,7 +226,6 @@ app.use('/uploads/chat', express.static(path.join(__dirname, 'uploads/chat')));
 
 // Activity tracking routes
 app.use('/api/activity', activityRoutes);
-app.use('/api/data-retention', dataRetentionRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {

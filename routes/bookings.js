@@ -1601,18 +1601,18 @@ router.get('/:id/review', auth, validateObjectIdParam('id'), async (req, res) =>
     // If still not found in InvoiceRequest, fall back to Booking collection
     if (!invoiceRequest) {
       booking = await Booking.findById(id).lean();
-      
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          error: 'Booking not found'
-        });
-      }
+    
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
     }
     
     // Merge data from all sources
     const mergedData = mergeBookingData(invoiceRequest, booking);
-    
+
     // Extract OTP from otpVerification object for easy access
     const otpInfo = {
       otp: mergedData.otpVerification?.otp || mergedData.otp || null,

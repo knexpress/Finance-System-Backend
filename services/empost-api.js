@@ -125,8 +125,8 @@ class EMpostAPIService {
    */
   async createShipment(invoice) {
     if (process.env.EMPOST_API_DISABLED === 'true') {
-      console.log('[EMPOST DISABLED] Skipping shipment creation in EMPOST');
-      return { data: { uhawb: 'N/A' } };
+    console.log('[EMPOST DISABLED] Skipping shipment creation in EMPOST');
+    return { data: { uhawb: 'N/A' } };
     }
     
     try {
@@ -163,8 +163,8 @@ class EMpostAPIService {
    */
   async createShipmentFromData(shipmentData) {
     if (process.env.EMPOST_API_DISABLED === 'true') {
-      console.log('[EMPOST DISABLED] Skipping shipment creation from data in EMPOST');
-      return { data: { uhawb: 'N/A' } };
+    console.log('[EMPOST DISABLED] Skipping shipment creation from data in EMPOST');
+    return { data: { uhawb: 'N/A' } };
     }
     
     try {
@@ -198,8 +198,8 @@ class EMpostAPIService {
    */
   async createShipmentFromInvoiceRequest(invoiceRequest) {
     if (process.env.EMPOST_API_DISABLED === 'true') {
-      console.log('[EMPOST DISABLED] Skipping shipment creation from InvoiceRequest in EMPOST');
-      return { data: { uhawb: 'N/A' } };
+    console.log('[EMPOST DISABLED] Skipping shipment creation from InvoiceRequest in EMPOST');
+    return { data: { uhawb: 'N/A' } };
     }
     
     try {
@@ -238,8 +238,8 @@ class EMpostAPIService {
    */
   async updateShipmentStatus(trackingNumber, status, additionalData = {}) {
     if (process.env.EMPOST_API_DISABLED === 'true') {
-      console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
-      return { success: true, message: 'EMPOST API disabled' };
+    console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
+    return { success: true, message: 'EMPOST API disabled' };
     }
     
     try {
@@ -299,8 +299,8 @@ class EMpostAPIService {
    */
   async issueInvoice(invoice) {
     if (process.env.EMPOST_API_DISABLED === 'true') {
-      console.log('[EMPOST DISABLED] Skipping invoice issuance in EMPOST');
-      return { success: true, message: 'EMPOST API disabled' };
+    console.log('[EMPOST DISABLED] Skipping invoice issuance in EMPOST');
+    return { success: true, message: 'EMPOST API disabled' };
     }
     
     try {
@@ -312,7 +312,7 @@ class EMpostAPIService {
         console.log('📄 Issuing invoice in EMpost for tracking:', invoice.trackingNumber);
       } else {
         // Needs mapping (from invoice object)
-        console.log('📄 Issuing invoice in EMpost for invoice:', invoice.invoice_id);
+      console.log('📄 Issuing invoice in EMpost for invoice:', invoice.invoice_id);
         invoiceData = this.mapInvoiceToEMpostInvoice(invoice);
       }
       

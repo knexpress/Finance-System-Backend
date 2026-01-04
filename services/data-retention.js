@@ -210,22 +210,33 @@ class DataRetentionService {
 
   /**
    * Delete old OTPs (30 days)
-   * OTPs might be in a separate collection or embedded in bookings
+   * DISABLED: This function has been disabled to prevent accidental deletion of OTPs
+   * OTPs should be preserved as they are part of the booking record and serve as historical/audit data
    */
   async deleteOldOTPs() {
+    // DISABLED: Automatic OTP deletion has been disabled
+    // OTPs in bookings and OTP collection are now preserved
+    console.log('⚠️  OTP deletion is disabled - all OTPs are preserved');
+    return 0;
+    
+    /* DISABLED CODE - Kept for reference
     try {
       const cutoffDate = this.getCutoffDate(30);
       let totalCleaned = 0;
       
-      // Try to find and delete from separate OTP collection if it exists
+      // Only delete from separate OTP collection if it exists
+      // This is safe because OTPs in the collection are temporary verification codes
       try {
         const OTPModel = mongoose.models.OTP || mongoose.model('OTP', new mongoose.Schema({}, { strict: false, timestamps: true }));
+        
+        // Only delete OTPs that are verified and old (unverified OTPs might still be in use)
         const otpResult = await OTPModel.deleteMany({
-          createdAt: { $lt: cutoffDate }
+          createdAt: { $lt: cutoffDate },
+          verified: true // Only delete verified OTPs that are old
         });
         
         if (otpResult.deletedCount > 0) {
-          console.log(`✅ Deleted ${otpResult.deletedCount} OTPs from OTP collection older than 30 days`);
+          console.log(`✅ Deleted ${otpResult.deletedCount} verified OTPs from OTP collection older than 30 days`);
           totalCleaned += otpResult.deletedCount;
         }
       } catch (error) {
@@ -235,43 +246,18 @@ class DataRetentionService {
         }
       }
       
-      // Also clean up OTP data embedded in bookings
-      try {
-        const bookingResult = await Booking.updateMany(
-          {
-            $or: [
-              { 'otpVerification.createdAt': { $lt: cutoffDate } },
-              { 'otp.createdAt': { $lt: cutoffDate } },
-              { 'otp_verification.createdAt': { $lt: cutoffDate } }
-            ],
-            $or: [
-              { 'otpVerification': { $exists: true } },
-              { 'otp': { $exists: true } },
-              { 'otp_verification': { $exists: true } }
-            ]
-          },
-          {
-            $unset: { 
-              otpVerification: '',
-              otp: '',
-              otp_verification: ''
-            }
-          }
-        );
-        
-        if (bookingResult.modifiedCount > 0) {
-          console.log(`✅ Cleaned up OTP data from ${bookingResult.modifiedCount} bookings older than 30 days`);
-          totalCleaned += bookingResult.modifiedCount;
-        }
-      } catch (error) {
-        console.warn('⚠️  Could not clean OTP data from bookings:', error.message);
-      }
+      // DO NOT delete OTPs from bookings
+      // OTPs in bookings are part of the booking record and should be preserved
+      // even if they are old, as they serve as historical/audit data
+      // The booking itself will be deleted when appropriate (reviewed/rejected bookings)
+      // but the OTP data should remain with the booking until the booking is deleted
       
       return totalCleaned;
     } catch (error) {
       console.error('❌ Error deleting OTPs:', error);
       return 0;
     }
+    */
   }
 
   /**
