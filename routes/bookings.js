@@ -1944,6 +1944,31 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       bookingSnapshot._id = bookingSnapshot._id.toString();
     }
     
+    // Extract identity documents from booking
+    // Check both booking.identityDocuments object and root level fields
+    const bookingIdentityDocs = booking.identityDocuments || {};
+    const identityDocuments = {
+      // Check nested in identityDocuments object first
+      eidFrontImage: bookingIdentityDocs.eidFrontImage || bookingIdentityDocs.eidFront || bookingIdentityDocs.eid_front || bookingIdentityDocs.emiratesIdFront || null,
+      eidBackImage: bookingIdentityDocs.eidBackImage || bookingIdentityDocs.eidBack || bookingIdentityDocs.eid_back || bookingIdentityDocs.emiratesIdBack || null,
+      philippinesIdFront: bookingIdentityDocs.philippinesIdFront || bookingIdentityDocs.philippines_id_front || bookingIdentityDocs.phIdFront || null,
+      philippinesIdBack: bookingIdentityDocs.philippinesIdBack || bookingIdentityDocs.philippines_id_back || bookingIdentityDocs.phIdBack || null,
+      // Also check root level fields
+      ...(booking.eidFrontImage ? { eidFrontImage: booking.eidFrontImage } : {}),
+      ...(booking.eidBackImage ? { eidBackImage: booking.eidBackImage } : {}),
+      ...(booking.philippinesIdFront ? { philippinesIdFront: booking.philippinesIdFront } : {}),
+      ...(booking.philippinesIdBack ? { philippinesIdBack: booking.philippinesIdBack } : {}),
+      // Include any other identity document fields
+      ...bookingIdentityDocs
+    };
+    
+    // Remove null/undefined/empty values
+    Object.keys(identityDocuments).forEach(key => {
+      if (identityDocuments[key] === null || identityDocuments[key] === undefined || identityDocuments[key] === '') {
+        delete identityDocuments[key];
+      }
+    });
+
     // Create booking_data with all booking details EXCEPT identityDocuments
     // This will be used for EMPOST API and other integrations
     const bookingData = { ...bookingSnapshot };
@@ -2011,7 +2036,10 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
       
-      // Customer images (identityDocuments excluded)
+      // Identity documents (for PDF generation)
+      identityDocuments: Object.keys(identityDocuments).length > 0 ? identityDocuments : {},
+      
+      // Customer images
       customerImage: booking.customerImage || booking.customer_image || '',
       customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
       
@@ -2245,20 +2273,112 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
   try {
     console.log(`📄 Starting PDF generation for booking: ${booking._id}`);
     
-    // Extract booking data for PDF
-    const sender = booking.sender || {};
-    const receiver = booking.receiver || {};
-    const items = booking.items || [];
+    // Fetch booking fresh from database to ensure we have all identity documents
+    // Identity documents are ONLY stored in bookings collection
+    const bookingId = booking._id || booking;
+    const fullBooking = await Booking.findById(bookingId).lean();
     
-    // Get identity documents from booking
-    const identityDocs = booking.identityDocuments || {};
+    if (!fullBooking) {
+      console.error(`❌ Booking not found: ${bookingId}`);
+      return;
+    }
+    
+    // Extract booking data for PDF
+    const sender = fullBooking.sender || {};
+    const receiver = fullBooking.receiver || {};
+    const items = fullBooking.items || [];
+    
+    // Get identity documents - ONLY from booking collection (not InvoiceRequest)
+    const bookingIdentityDocs = fullBooking.identityDocuments || {};
+    
+    // Helper function to get image from multiple sources
+    const getImage = (sources) => {
+      for (const source of sources) {
+        if (source && source.trim() && source !== 'null' && source !== 'undefined') {
+          return source;
+        }
+      }
+      return null;
+    };
+    
+    // Extract EID Front Image - check booking only
+    const eidFrontImage = getImage([
+      bookingIdentityDocs.eidFrontImage,
+      bookingIdentityDocs.eidFront,
+      bookingIdentityDocs.eid_front,
+      bookingIdentityDocs.emiratesIdFront,
+      fullBooking.eidFrontImage,
+      fullBooking.eid_front_image,
+      fullBooking.emiratesIdFront
+    ]);
+    
+    // Extract EID Back Image - check booking only
+    const eidBackImage = getImage([
+      bookingIdentityDocs.eidBackImage,
+      bookingIdentityDocs.eidBack,
+      bookingIdentityDocs.eid_back,
+      bookingIdentityDocs.emiratesIdBack,
+      fullBooking.eidBackImage,
+      fullBooking.eid_back_image,
+      fullBooking.emiratesIdBack
+    ]);
+    
+    // Extract Philippines ID Front - check booking only
+    const philippinesIdFront = getImage([
+      bookingIdentityDocs.philippinesIdFront,
+      bookingIdentityDocs.philippines_id_front,
+      bookingIdentityDocs.phIdFront,
+      fullBooking.philippinesIdFront,
+      fullBooking.philippines_id_front,
+      fullBooking.phIdFront
+    ]);
+    
+    // Extract Philippines ID Back - check booking only
+    const philippinesIdBack = getImage([
+      bookingIdentityDocs.philippinesIdBack,
+      bookingIdentityDocs.philippines_id_back,
+      bookingIdentityDocs.phIdBack,
+      fullBooking.philippinesIdBack,
+      fullBooking.philippines_id_back,
+      fullBooking.phIdBack
+    ]);
+    
+    // Extract Customer Images - ONLY from booking collection
+    const customerImage = getImage([
+      fullBooking.customerImage,
+      fullBooking.customer_image
+    ]);
+    
+    const customerImages = (() => {
+      // Check booking customerImages array
+      if (fullBooking.customerImages && Array.isArray(fullBooking.customerImages) && fullBooking.customerImages.length > 0) {
+        return fullBooking.customerImages.filter(img => img && img.trim());
+      }
+      // Check booking customer_images array
+      if (fullBooking.customer_images && Array.isArray(fullBooking.customer_images) && fullBooking.customer_images.length > 0) {
+        return fullBooking.customer_images.filter(img => img && img.trim());
+      }
+      // Fall back to single customerImage
+      if (customerImage) {
+        return [customerImage];
+      }
+      return [];
+    })();
+    
+    // Log image extraction for debugging
+    console.log('📸 Image extraction summary:');
+    console.log(`   EID Front: ${eidFrontImage ? '✅ Found' : '❌ Not found'}`);
+    console.log(`   EID Back: ${eidBackImage ? '✅ Found' : '❌ Not found'}`);
+    console.log(`   PH ID Front: ${philippinesIdFront ? '✅ Found' : '❌ Not found'}`);
+    console.log(`   PH ID Back: ${philippinesIdBack ? '✅ Found' : '❌ Not found'}`);
+    console.log(`   Customer Images: ${customerImages.length} found`);
     
     // Prepare PDF data structure
     const pdfData = {
-      referenceNumber: booking.referenceNumber || booking._id.toString(),
-      bookingId: booking._id.toString(),
-      awb: invoiceRequest.tracking_code || invoiceRequest.awb_number || booking.awb || booking.tracking_code || null,
-      service: booking.service || booking.service_code || invoiceRequest.service_code,
+      referenceNumber: fullBooking.referenceNumber || fullBooking._id.toString(),
+      bookingId: fullBooking._id.toString(),
+      awb: invoiceRequest.tracking_code || invoiceRequest.awb_number || fullBooking.awb || fullBooking.tracking_code || null,
+      service: fullBooking.service || fullBooking.service_code || invoiceRequest.service_code,
       sender: {
         fullName: sender.fullName || sender.name || (sender.firstName && sender.lastName ? `${sender.firstName} ${sender.lastName}` : '') || '',
         completeAddress: sender.completeAddress || sender.address || sender.addressLine1 || '',
@@ -2280,14 +2400,14 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
         commodity: item.commodity || item.name || item.description || `Item ${index + 1}`,
         qty: item.qty || item.quantity || 1
       })),
-      eidFrontImage: identityDocs.eidFront || identityDocs.eid_front || identityDocs.emiratesIdFront || null,
-      eidBackImage: identityDocs.eidBack || identityDocs.eid_back || identityDocs.emiratesIdBack || null,
-      philippinesIdFront: identityDocs.philippinesIdFront || identityDocs.philippines_id_front || identityDocs.phIdFront || null,
-      philippinesIdBack: identityDocs.philippinesIdBack || identityDocs.philippines_id_back || identityDocs.phIdBack || null,
-      customerImage: booking.customerImage || booking.customer_image || null,
-      customerImages: booking.customerImages || booking.customer_images || (booking.customerImage ? [booking.customerImage] : []),
-      submissionTimestamp: booking.createdAt || booking.submittedAt || new Date().toISOString(),
-      declarationText: booking.declarationText || booking.declaration_text || null
+      eidFrontImage: eidFrontImage,
+      eidBackImage: eidBackImage,
+      philippinesIdFront: philippinesIdFront,
+      philippinesIdBack: philippinesIdBack,
+      customerImage: customerImage,
+      customerImages: customerImages,
+      submissionTimestamp: fullBooking.createdAt || fullBooking.submittedAt || new Date().toISOString(),
+      declarationText: fullBooking.declarationText || fullBooking.declaration_text || null
     };
 
     // Generate PDF
