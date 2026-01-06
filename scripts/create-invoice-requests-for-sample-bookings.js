@@ -1,60 +1,8 @@
 const mongoose = require('mongoose');
 require('dotenv').config();
 
-// Import models and utilities
+const { Booking, InvoiceRequest, Employee } = require('../models');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
-const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
-const { createNotificationsForDepartment } = require('../routes/notifications');
-
-// Connect to MongoDB
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance';
-
-// Load models
-require('../models/index');
-
-const Booking = mongoose.models.Booking;
-const InvoiceRequest = mongoose.models.InvoiceRequest;
-const Employee = mongoose.models.Employee;
-
-// Cache for default employee ID
-let defaultEmployeeIdCache = null;
-
-/**
- * Get default employee ID for system operations
- */
-async function getDefaultEmployeeId(preferredEmployeeId = null) {
-  // If preferred employee ID is provided and valid, use it
-  if (preferredEmployeeId) {
-    try {
-      const employee = await Employee.findById(preferredEmployeeId).lean();
-      if (employee) {
-        return preferredEmployeeId;
-      }
-    } catch (error) {
-      console.warn(`⚠️ Preferred employee ID ${preferredEmployeeId} not found, using default`);
-    }
-  }
-  
-  // Use cached default employee ID if available
-  if (defaultEmployeeIdCache) {
-    return defaultEmployeeIdCache;
-  }
-  
-  // Find any employee in the database
-  try {
-    const employee = await Employee.findOne().lean();
-    if (employee) {
-      defaultEmployeeIdCache = employee._id;
-      console.log(`✅ Using default employee: ${employee._id}`);
-      return employee._id;
-    }
-  } catch (error) {
-    console.error('❌ Error finding default employee:', error);
-  }
-  
-  // If no employee found, throw error
-  throw new Error('No employee found in database. Cannot create InvoiceRequest without created_by_employee_id. Please create at least one employee.');
-}
 
 // Helper function to convert to Decimal128
 const toDecimal128 = (value) => {
@@ -72,7 +20,7 @@ const toDecimal128 = (value) => {
   }
 };
 
-// Normalize truthy/falsey values that may arrive as strings/numbers
+// Normalize truthy/falsey values
 const normalizeBoolean = (value) => {
   if (value === undefined || value === null) return undefined;
   if (typeof value === 'string') {
@@ -84,10 +32,32 @@ const normalizeBoolean = (value) => {
 };
 
 /**
- * Convert a reviewed booking to an invoice request
- * Uses the same logic as the review endpoint
+ * Get or create a default employee for system operations
  */
-async function convertBookingToInvoiceRequest(booking) {
+async function getOrCreateDefaultEmployee() {
+  try {
+    // Try to find any existing employee
+    let employee = await Employee.findOne().lean();
+    
+    if (employee) {
+      console.log(`✅ Using existing employee: ${employee._id}`);
+      return employee._id;
+    }
+    
+    // If no employee exists, we'll need to handle this differently
+    // For now, we'll return null and handle it in the conversion function
+    console.warn('⚠️ No employees found in database. InvoiceRequests will need a default employee ID.');
+    return null;
+  } catch (error) {
+    console.error('❌ Error finding employee:', error);
+    return null;
+  }
+}
+
+/**
+ * Convert a reviewed booking to an invoice request
+ */
+async function convertBookingToInvoiceRequest(booking, defaultEmployeeId) {
   try {
     // Extract data from booking
     const sender = booking.sender || {};
@@ -129,13 +99,13 @@ async function convertBookingToInvoiceRequest(booking) {
     // Get service code from booking
     let serviceCode = booking.service || booking.service_code || '';
     
-    // Normalize service code for price bracket determination
+    // Normalize service code
     if (serviceCode) {
       const normalized = serviceCode.toString().toUpperCase().replace(/[\s-]+/g, '_');
       if (normalized === 'PH_TO_UAE' || normalized.startsWith('PH_TO_UAE')) {
         serviceCode = 'PH_TO_UAE';
       } else if (normalized === 'UAE_TO_PH' || normalized.startsWith('UAE_TO_PH')) {
-        serviceCode = 'UAE_TO_PH';
+        serviceCode = normalized; // Keep COMMERCIAL or FLOMIC suffix
       } else {
         serviceCode = normalized;
       }
@@ -196,18 +166,22 @@ async function convertBookingToInvoiceRequest(booking) {
     if (booking.boxes && Array.isArray(booking.boxes)) {
       verificationBoxes = booking.boxes.map(box => ({
         items: box.items || box.commodity || box.description || '',
+        quantity: box.quantity || 1,
         length: toDecimal128(box.length),
         width: toDecimal128(box.width),
         height: toDecimal128(box.height),
         vm: toDecimal128(box.vm || box.volume),
+        classification: box.classification || undefined,
       }));
     } else if (items.length > 0) {
       verificationBoxes = items.map((item, index) => ({
         items: item.commodity || item.name || item.description || `Item ${index + 1}`,
+        quantity: item.qty || item.quantity || 1,
         length: toDecimal128(item.length),
         width: toDecimal128(item.width),
         height: toDecimal128(item.height),
         vm: toDecimal128(item.vm || item.volume),
+        classification: item.classification || undefined,
       }));
     }
     
@@ -247,12 +221,22 @@ async function convertBookingToInvoiceRequest(booking) {
     bookingData.receiver = receiver;
     bookingData.items = items;
     
+    // Extract identity documents from booking
+    const identityDocuments = booking.identityDocuments || {};
+    
     // Extract insurance data with fallbacks
     const insuredRaw = booking.insured ?? booking.insurance ?? booking.isInsured ?? booking.is_insured 
       ?? sender.insured ?? sender.insurance ?? sender.isInsured ?? sender.is_insured;
     const declaredAmountRaw = booking.declaredAmount ?? booking.declared_amount ?? booking.declared_value ?? booking.declaredValue
       ?? sender.declaredAmount ?? sender.declared_amount ?? sender.declared_value ?? sender.declaredValue;
 
+    // Use defaultEmployeeId if booking doesn't have reviewed_by_employee_id
+    const createdByEmployeeId = booking.reviewed_by_employee_id || defaultEmployeeId;
+    
+    if (!createdByEmployeeId) {
+      throw new Error('No employee ID available. Cannot create InvoiceRequest without created_by_employee_id.');
+    }
+    
     // Build invoice request data
     const invoiceRequestData = {
       invoice_number: invoiceNumber,
@@ -265,6 +249,7 @@ async function convertBookingToInvoiceRequest(booking) {
       origin_place: originPlace,
       destination_place: destinationPlace,
       shipment_type: shipment_type,
+      created_by_employee_id: createdByEmployeeId, // REQUIRED - use default if booking doesn't have it
       
       // Customer details
       customer_phone: sender.contactNo || sender.phoneNumber || sender.phone || booking.customer_phone || '',
@@ -272,7 +257,8 @@ async function convertBookingToInvoiceRequest(booking) {
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
       
-      // Customer images
+      // Identity documents (from booking)
+      identityDocuments: identityDocuments,
       customerImage: booking.customerImage || booking.customer_image || '',
       customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
       
@@ -284,6 +270,10 @@ async function convertBookingToInvoiceRequest(booking) {
       sender_delivery_option: sender.deliveryOption || booking.sender?.deliveryOption || undefined,
       receiver_delivery_option: receiver.deliveryOption || booking.receiver?.deliveryOption || undefined,
       
+      // Weight
+      weight: toDecimal128(booking.weight || booking.weight_kg),
+      weight_kg: toDecimal128(booking.weight || booking.weight_kg),
+      
       // Insurance information
       insured: normalizeBoolean(insuredRaw) ?? false,
       declaredAmount: toDecimal128(declaredAmountRaw),
@@ -292,9 +282,6 @@ async function convertBookingToInvoiceRequest(booking) {
       status: 'SUBMITTED',
       delivery_status: 'PENDING',
       is_leviable: true,
-      
-      // Employee reference (use reviewed_by_employee_id if available, otherwise get default)
-      created_by_employee_id: await getDefaultEmployeeId(booking.reviewed_by_employee_id || null),
       
       // Additional notes
       notes: booking.additionalDetails || booking.notes || '',
@@ -310,42 +297,19 @@ async function convertBookingToInvoiceRequest(booking) {
         agents_name: sender.agentName || '',
         sender_details_complete: !!(sender.fullName && sender.contactNo),
         receiver_details_complete: !!(receiver.fullName && receiver.contactNo),
+        insured: normalizeBoolean(insuredRaw) ?? false,
+        declared_value: toDecimal128(declaredAmountRaw),
       },
     };
 
     const invoiceRequest = new InvoiceRequest(invoiceRequestData);
     await invoiceRequest.save();
 
-    // Sync with EMPost (non-critical, don't fail if it errors)
-    try {
-      await syncInvoiceWithEMPost({
-        requestId: invoiceRequest._id,
-        reason: `Invoice request created from reviewed booking migration (${invoiceRequest.status})`,
-      });
-    } catch (syncError) {
-      console.warn(`⚠️ EMPost sync failed for booking ${booking._id} (non-critical):`, syncError.message);
-    }
-
     // Link booking to invoice request
     const bookingDoc = await Booking.findById(booking._id);
     if (bookingDoc) {
       bookingDoc.converted_to_invoice_request_id = invoiceRequest._id;
       await bookingDoc.save();
-    }
-
-    // Create notifications for relevant departments
-    if (booking.reviewed_by_employee_id) {
-      const relevantDepartments = ['Sales', 'Operations', 'Finance'];
-      for (const deptName of relevantDepartments) {
-        try {
-          const dept = await mongoose.model('Department').findOne({ name: deptName });
-          if (dept) {
-            await createNotificationsForDepartment('invoice_request', invoiceRequest._id, dept._id, booking.reviewed_by_employee_id);
-          }
-        } catch (notifError) {
-          console.warn(`⚠️ Failed to create notification for ${deptName} (non-critical):`, notifError.message);
-        }
-      }
     }
 
     return { booking, invoiceRequest };
@@ -356,37 +320,35 @@ async function convertBookingToInvoiceRequest(booking) {
 }
 
 /**
- * Main migration function
+ * Main function to create InvoiceRequests for sample reviewed bookings
  */
-async function migrateReviewedBookingsToInvoiceRequests() {
+async function createInvoiceRequestsForSampleBookings() {
   try {
-    await mongoose.connect(MONGODB_URI);
-    console.log('✅ Connected to MongoDB');
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log('✅ Connected to MongoDB\n');
 
-    // Initialize default employee ID cache
-    try {
-      await getDefaultEmployeeId();
-      console.log('✅ Default employee ID initialized');
-    } catch (error) {
-      console.error('❌ Cannot proceed without an employee in the database:', error.message);
+    // Get or create default employee
+    const defaultEmployeeId = await getOrCreateDefaultEmployee();
+    
+    if (!defaultEmployeeId) {
+      console.error('❌ Cannot proceed without an employee ID. Please create at least one employee in the database.');
       await mongoose.disconnect();
       process.exit(1);
     }
 
-    // Find all bookings that are reviewed but don't have an invoice request
+    // Find all reviewed bookings that don't have an invoice request yet
     const reviewedBookings = await Booking.find({
       review_status: 'reviewed',
-      reviewed_at: { $exists: true, $ne: null },
       $or: [
         { converted_to_invoice_request_id: { $exists: false } },
         { converted_to_invoice_request_id: null }
       ]
     }).lean();
 
-    console.log(`\n📋 Found ${reviewedBookings.length} reviewed bookings without invoice requests`);
+    console.log(`📋 Found ${reviewedBookings.length} reviewed bookings without InvoiceRequests\n`);
 
     if (reviewedBookings.length === 0) {
-      console.log('✅ No bookings to migrate. All reviewed bookings already have invoice requests.');
+      console.log('✅ No bookings to process. All reviewed bookings already have InvoiceRequests.');
       await mongoose.disconnect();
       return;
     }
@@ -399,21 +361,48 @@ async function migrateReviewedBookingsToInvoiceRequests() {
     // Process each booking
     for (let i = 0; i < reviewedBookings.length; i++) {
       const booking = reviewedBookings[i];
-      console.log(`\n[${i + 1}/${reviewedBookings.length}] Processing booking ${booking._id}...`);
-      console.log(`   Reference: ${booking.referenceNumber || 'N/A'}`);
+      console.log(`[${i + 1}/${reviewedBookings.length}] Processing booking: ${booking.referenceNumber || booking._id}`);
       console.log(`   AWB: ${booking.awb || 'N/A'}`);
-      console.log(`   Customer: ${booking.sender?.fullName || booking.customer_name || 'N/A'}`);
+      console.log(`   Service: ${booking.service_code || booking.service || 'N/A'}`);
 
       try {
-        const result = await convertBookingToInvoiceRequest(booking);
+        // Check if InvoiceRequest already exists for this AWB
+        const existingInvoiceRequest = await InvoiceRequest.findOne({
+          $or: [
+            { tracking_code: booking.awb },
+            { awb_number: booking.awb }
+          ]
+        });
+
+        if (existingInvoiceRequest) {
+          console.log(`   ⚠️ InvoiceRequest already exists for AWB ${booking.awb}, linking booking...`);
+          const bookingDoc = await Booking.findById(booking._id);
+          if (bookingDoc) {
+            bookingDoc.converted_to_invoice_request_id = existingInvoiceRequest._id;
+            await bookingDoc.save();
+          }
+          results.success.push({
+            bookingId: booking._id,
+            referenceNumber: booking.referenceNumber,
+            invoiceRequestId: existingInvoiceRequest._id,
+            invoiceNumber: existingInvoiceRequest.invoice_number,
+            trackingCode: existingInvoiceRequest.tracking_code,
+            action: 'linked'
+          });
+          console.log(`   ✅ Linked to existing InvoiceRequest: ${existingInvoiceRequest.invoice_number}`);
+          continue;
+        }
+
+        const result = await convertBookingToInvoiceRequest(booking, defaultEmployeeId);
         results.success.push({
           bookingId: booking._id,
           referenceNumber: booking.referenceNumber,
           invoiceRequestId: result.invoiceRequest._id,
           invoiceNumber: result.invoiceRequest.invoice_number,
-          trackingCode: result.invoiceRequest.tracking_code
+          trackingCode: result.invoiceRequest.tracking_code,
+          action: 'created'
         });
-        console.log(`   ✅ Successfully created invoice request: ${result.invoiceRequest.invoice_number} (${result.invoiceRequest.tracking_code})`);
+        console.log(`   ✅ Created InvoiceRequest: ${result.invoiceRequest.invoice_number} (${result.invoiceRequest.tracking_code})`);
       } catch (error) {
         results.failed.push({
           bookingId: booking._id,
@@ -426,25 +415,24 @@ async function migrateReviewedBookingsToInvoiceRequests() {
 
     // Print summary
     console.log('\n' + '='.repeat(60));
-    console.log('📊 MIGRATION SUMMARY');
+    console.log('📊 SUMMARY');
     console.log('='.repeat(60));
-    console.log(`✅ Successfully migrated: ${results.success.length}`);
+    console.log(`✅ Successfully processed: ${results.success.length}`);
     console.log(`❌ Failed: ${results.failed.length}`);
     console.log(`📋 Total processed: ${reviewedBookings.length}`);
 
     if (results.success.length > 0) {
-      console.log('\n✅ Successfully migrated bookings:');
+      console.log('\n✅ Successfully processed bookings:');
       results.success.forEach((item, index) => {
-        console.log(`   ${index + 1}. Booking ${item.bookingId} → Invoice Request ${item.invoiceRequestId}`);
-        console.log(`      Reference: ${item.referenceNumber || 'N/A'}`);
+        console.log(`   ${index + 1}. ${item.action === 'created' ? 'Created' : 'Linked'} InvoiceRequest for booking ${item.referenceNumber || item.bookingId}`);
         console.log(`      Invoice: ${item.invoiceNumber}, AWB: ${item.trackingCode}`);
       });
     }
 
     if (results.failed.length > 0) {
-      console.log('\n❌ Failed migrations:');
+      console.log('\n❌ Failed bookings:');
       results.failed.forEach((item, index) => {
-        console.log(`   ${index + 1}. Booking ${item.bookingId} (${item.referenceNumber || 'N/A'}): ${item.error}`);
+        console.log(`   ${index + 1}. Booking ${item.referenceNumber || item.bookingId}: ${item.error}`);
       });
     }
 
@@ -453,7 +441,7 @@ async function migrateReviewedBookingsToInvoiceRequests() {
     
     return results;
   } catch (error) {
-    console.error('❌ Error during migration:', error);
+    console.error('❌ Error:', error);
     await mongoose.disconnect();
     process.exit(1);
   }
@@ -461,16 +449,17 @@ async function migrateReviewedBookingsToInvoiceRequests() {
 
 // Run the script
 if (require.main === module) {
-  migrateReviewedBookingsToInvoiceRequests()
+  createInvoiceRequestsForSampleBookings()
     .then((results) => {
-      console.log('\n✅ Migration script completed');
+      console.log('\n✅ Script completed');
       process.exit(0);
     })
     .catch((error) => {
-      console.error('\n❌ Migration script failed:', error);
+      console.error('\n❌ Script failed:', error);
       process.exit(1);
     });
 }
 
-module.exports = { migrateReviewedBookingsToInvoiceRequests, convertBookingToInvoiceRequest };
+module.exports = { createInvoiceRequestsForSampleBookings, convertBookingToInvoiceRequest };
+
 
