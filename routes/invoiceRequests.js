@@ -1980,6 +1980,426 @@ router.put('/:id/complete-verification', async (req, res) => {
   }
 });
 
+// Reverify verification (update existing verification data for VERIFIED invoice requests)
+router.put('/:id/reverify', async (req, res) => {
+  try {
+    const verificationData = req.body;
+    const invoiceRequestId = req.params.id;
+
+    console.log('🔄 Reverification request:', {
+      id: invoiceRequestId,
+      data: verificationData
+    });
+
+    const invoiceRequest = await InvoiceRequest.findById(invoiceRequestId);
+    if (!invoiceRequest) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Invoice request not found' 
+      });
+    }
+
+    // Check if invoice request is in VERIFIED status
+    if (invoiceRequest.status !== 'VERIFIED') {
+      return res.status(400).json({
+        success: false,
+        error: `Invoice request is not in VERIFIED status. Current status: ${invoiceRequest.status}`
+      });
+    }
+
+    // Ensure verification object exists
+    if (!invoiceRequest.verification) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invoice request does not have verification data to reverify'
+      });
+    }
+
+    // Get verified_by_employee_id from request body (required for reverification)
+    const verifiedByEmployeeId = verificationData.verified_by_employee_id;
+    if (!verifiedByEmployeeId) {
+      return res.status(400).json({
+        success: false,
+        error: 'verified_by_employee_id is required for reverification'
+      });
+    }
+
+    // Determine service route for classification logic
+    const serviceCode = (invoiceRequest.service_code || invoiceRequest.verification?.service_code || verificationData.service_code || '').toUpperCase();
+    const isPhToUae = serviceCode.includes('PH_TO_UAE');
+    const isUaeToPh = serviceCode.includes('UAE_TO_PH') || serviceCode.includes('UAE_TO_PINAS');
+
+    // Helper function to safely convert to Decimal128
+    const toDecimal128 = (value) => {
+      if (value === null || value === undefined || value === '') {
+        return undefined;
+      }
+      try {
+        const numValue = parseFloat(value);
+        if (isNaN(numValue)) {
+          return undefined;
+        }
+        return new mongoose.Types.Decimal128(numValue.toFixed(2));
+      } catch (error) {
+        console.error('Error converting to Decimal128:', value, error);
+        return undefined;
+      }
+    };
+
+    // Normalize classification helper
+    const normalizeClass = (value) => {
+      if (!value) return undefined;
+      return value.toString().trim().toUpperCase();
+    };
+
+    // Handle boxes data - accept empty array (Box List removed from frontend)
+    if (verificationData.boxes !== undefined) {
+      if (Array.isArray(verificationData.boxes) && verificationData.boxes.length > 0) {
+        invoiceRequest.verification.boxes = verificationData.boxes.map(box => {
+          const normalizedClassification = isPhToUae ? 'GENERAL' : normalizeClass(box.classification);
+          
+          return {
+            items: box.items || '',
+            quantity: box.quantity,
+            length: toDecimal128(box.length),
+            width: toDecimal128(box.width),
+            height: toDecimal128(box.height),
+            vm: toDecimal128(box.vm),
+            classification: normalizedClassification,
+            shipment_classification: isPhToUae ? 'GENERAL' : normalizedClassification
+          };
+        });
+      } else {
+        invoiceRequest.verification.boxes = [];
+      }
+    }
+
+    // Handle listed_commodities
+    if (verificationData.listed_commodities !== undefined) {
+      invoiceRequest.verification.listed_commodities = verificationData.listed_commodities || '';
+    }
+
+    // Shipment classification handling
+    if (isPhToUae) {
+      invoiceRequest.verification.shipment_classification = 'GENERAL';
+      console.log('✅ PH_TO_UAE route detected - classification set to GENERAL');
+    } else if (isUaeToPh) {
+      if (verificationData.shipment_classification !== undefined) {
+        const normalizedClass = normalizeClass(verificationData.shipment_classification);
+        if (normalizedClass === 'FLOMIC' || normalizedClass === 'COMMERCIAL') {
+          invoiceRequest.verification.shipment_classification = normalizedClass;
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: 'For UAE_TO_PH shipments, shipment_classification must be either FLOMIC or COMMERCIAL'
+          });
+        }
+      } else {
+        return res.status(400).json({
+          success: false,
+          error: 'shipment_classification is required for UAE_TO_PH shipments (must be FLOMIC or COMMERCIAL)'
+        });
+      }
+    } else if (verificationData.shipment_classification !== undefined) {
+      invoiceRequest.verification.shipment_classification = normalizeClass(verificationData.shipment_classification);
+    }
+
+    // Validate and handle actual_weight (required)
+    if (verificationData.actual_weight === undefined || verificationData.actual_weight === null || verificationData.actual_weight === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'actual_weight is required'
+      });
+    }
+    const actualWeight = parseFloat(verificationData.actual_weight);
+    if (isNaN(actualWeight) || actualWeight < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'actual_weight must be a positive number'
+      });
+    }
+    invoiceRequest.verification.actual_weight = toDecimal128(actualWeight);
+
+    // Validate and handle volumetric_weight (required)
+    if (verificationData.volumetric_weight === undefined || verificationData.volumetric_weight === null || verificationData.volumetric_weight === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'volumetric_weight is required'
+      });
+    }
+    const volumetricWeight = parseFloat(verificationData.volumetric_weight);
+    if (isNaN(volumetricWeight) || volumetricWeight < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'volumetric_weight must be a positive number'
+      });
+    }
+    invoiceRequest.verification.volumetric_weight = toDecimal128(volumetricWeight);
+
+    // Calculate chargeable_weight = max(actual_weight, volumetric_weight)
+    let chargeableWeight;
+    if (verificationData.chargeable_weight !== undefined && verificationData.chargeable_weight !== null && verificationData.chargeable_weight !== '') {
+      chargeableWeight = parseFloat(verificationData.chargeable_weight);
+      if (isNaN(chargeableWeight) || chargeableWeight <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'chargeable_weight must be a positive number greater than 0'
+        });
+      }
+    } else {
+      chargeableWeight = Math.max(actualWeight, volumetricWeight);
+      console.log(`✅ Auto-calculated chargeable_weight: ${chargeableWeight} kg (Actual: ${actualWeight} kg, Volumetric: ${volumetricWeight} kg)`);
+    }
+    invoiceRequest.verification.chargeable_weight = toDecimal128(chargeableWeight);
+
+    // Handle total_vm (for backward compatibility - same as volumetric_weight)
+    if (verificationData.total_vm !== undefined && verificationData.total_vm !== null && verificationData.total_vm !== '') {
+      invoiceRequest.verification.total_vm = toDecimal128(verificationData.total_vm);
+    } else {
+      invoiceRequest.verification.total_vm = invoiceRequest.verification.volumetric_weight;
+    }
+
+    // Handle special_rate: Updates both verification.amount and verification.calculated_rate
+    if (verificationData.special_rate !== undefined && verificationData.special_rate !== null && verificationData.special_rate !== '') {
+      const specialRateValue = parseFloat(verificationData.special_rate);
+      if (isNaN(specialRateValue) || specialRateValue < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'special_rate must be a positive number'
+        });
+      }
+      invoiceRequest.verification.amount = toDecimal128(specialRateValue);
+      invoiceRequest.verification.calculated_rate = toDecimal128(specialRateValue);
+      console.log(`✅ Special rate applied: ${specialRateValue} (updated both verification.amount and verification.calculated_rate)`);
+    } else if (verificationData.calculated_rate !== undefined && verificationData.calculated_rate !== null && verificationData.calculated_rate !== '') {
+      invoiceRequest.verification.calculated_rate = toDecimal128(verificationData.calculated_rate);
+    }
+
+    // Auto-determine weight_type based on actual_weight and volumetric_weight comparison
+    if (actualWeight >= volumetricWeight) {
+      invoiceRequest.verification.weight_type = 'ACTUAL';
+    } else {
+      invoiceRequest.verification.weight_type = 'VOLUMETRIC';
+    }
+    console.log(`✅ Auto-determined weight type: ${invoiceRequest.verification.weight_type} (Actual: ${actualWeight} kg, Volumetric: ${volumetricWeight} kg, Chargeable: ${chargeableWeight} kg)`);
+
+    // Handle number_of_boxes
+    if (verificationData.number_of_boxes !== undefined) {
+      const numBoxes = parseInt(verificationData.number_of_boxes);
+      if (isNaN(numBoxes) || numBoxes < 1) {
+        return res.status(400).json({
+          success: false,
+          error: 'number_of_boxes must be a number greater than or equal to 1'
+        });
+      }
+      invoiceRequest.verification.number_of_boxes = numBoxes;
+    } else {
+      if (Array.isArray(invoiceRequest.verification.boxes) && invoiceRequest.verification.boxes.length > 0) {
+        invoiceRequest.verification.number_of_boxes = invoiceRequest.verification.boxes.length;
+        console.log(`✅ Auto-synced number_of_boxes with boxes array length: ${invoiceRequest.verification.number_of_boxes}`);
+      } else {
+        invoiceRequest.verification.number_of_boxes = 1;
+      }
+    }
+
+    // Auto-set total_kg = chargeable_weight (for Finance invoice generation)
+    let totalKg;
+    if (verificationData.total_kg !== undefined && verificationData.total_kg !== null && verificationData.total_kg !== '') {
+      totalKg = parseFloat(verificationData.total_kg);
+      if (isNaN(totalKg) || totalKg < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'total_kg must be a positive number'
+        });
+      }
+      console.log(`✅ Using manually provided total_kg: ${totalKg} kg`);
+    } else {
+      totalKg = chargeableWeight;
+      console.log(`✅ Auto-set total_kg = chargeable_weight: ${totalKg} kg (for Finance invoice generation)`);
+    }
+    invoiceRequest.verification.total_kg = toDecimal128(totalKg);
+
+    // Auto-determine rate_bracket based on total_kg (for PH_TO_UAE service)
+    if (isPhToUae) {
+      let calculatedRateBracket = null;
+      
+      if (totalKg <= 5) {
+        calculatedRateBracket = '0-5';
+      } else if (totalKg <= 10) {
+        calculatedRateBracket = '5-10';
+      } else if (totalKg <= 20) {
+        calculatedRateBracket = '10-20';
+      } else if (totalKg <= 30) {
+        calculatedRateBracket = '20-30';
+      } else if (totalKg <= 50) {
+        calculatedRateBracket = '30-50';
+      } else {
+        calculatedRateBracket = '50+';
+      }
+      
+      if (verificationData.rate_bracket !== undefined && verificationData.rate_bracket !== null && verificationData.rate_bracket !== '') {
+        invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
+        console.log(`✅ Using manually provided rate_bracket: ${verificationData.rate_bracket}`);
+      } else {
+        invoiceRequest.verification.rate_bracket = calculatedRateBracket;
+        console.log(`✅ Auto-determined rate_bracket based on total_kg (${totalKg} kg): ${calculatedRateBracket}`);
+      }
+    } else if (verificationData.rate_bracket !== undefined) {
+      invoiceRequest.verification.rate_bracket = verificationData.rate_bracket;
+    }
+
+    // Update service_code from verification data if provided
+    if (verificationData.service_code !== undefined && verificationData.service_code !== null && verificationData.service_code !== '') {
+      invoiceRequest.service_code = verificationData.service_code;
+      invoiceRequest.verification.service_code = verificationData.service_code;
+      console.log(`✅ Updated service_code from verification: ${verificationData.service_code}`);
+    }
+
+    // Handle insurance and declared_value
+    const isInsuredFromDatabase = invoiceRequest.insured === true ||
+                                   invoiceRequest.booking_data?.insured === true ||
+                                   invoiceRequest.booking_snapshot?.insured === true ||
+                                   invoiceRequest.booking_snapshot?.sender?.insured === true ||
+                                   invoiceRequest.booking_data?.sender?.insured === true;
+    
+    if (verificationData.insured !== undefined) {
+      invoiceRequest.verification.insured = verificationData.insured === true || verificationData.insured === 'true';
+    }
+    
+    const isUaeToPinas = serviceCode.includes('UAE_TO_PINAS') || serviceCode.includes('UAE_TO_PH');
+    
+    if (verificationData.declared_value !== undefined && verificationData.declared_value !== null && verificationData.declared_value !== '') {
+      const declaredValueNum = parseFloat(verificationData.declared_value);
+      if (isNaN(declaredValueNum) || declaredValueNum < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'declared_value must be a positive number'
+        });
+      }
+      invoiceRequest.verification.declared_value = toDecimal128(declaredValueNum);
+      invoiceRequest.verification.insured = true;
+    }
+
+    // Validate: If UAE_TO_PH/PINAS + insured (from database) = true, declared_value is REQUIRED
+    if (isUaeToPinas && isInsuredFromDatabase) {
+      const declaredValue = invoiceRequest.verification.declared_value;
+      if (!declaredValue || parseFloat(declaredValue.toString()) <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Declared value is required for UAE to PH/PINAS insured shipments. Please enter a valid declared value (must be greater than 0).'
+        });
+      }
+      const classification = verificationData.shipment_classification || invoiceRequest.verification?.shipment_classification || 'N/A';
+      console.log(`✅ UAE_TO_PH/PINAS + Insured validation passed: declared_value = ${parseFloat(declaredValue.toString())} AED, classification = ${classification}`);
+    }
+
+    // Update other verification fields (excluding fields handled separately above)
+    Object.keys(verificationData).forEach(key => {
+      if (verificationData[key] !== undefined && 
+          verificationData[key] !== null &&
+          key !== 'boxes' && 
+          key !== 'listed_commodities' &&
+          key !== 'total_vm' && 
+          key !== 'weight' && 
+          key !== 'actual_weight' && 
+          key !== 'volumetric_weight' && 
+          key !== 'chargeable_weight' &&
+          key !== 'weight_type' &&
+          key !== 'rate_bracket' &&
+          key !== 'calculated_rate' &&
+          key !== 'shipment_classification' &&
+          key !== 'number_of_boxes' &&
+          key !== 'total_kg' &&
+          key !== 'service_code' &&
+          key !== 'declared_value' &&
+          key !== 'insured' &&
+          key !== 'verified_by_employee_id' &&
+          key !== 'verification_notes') {
+        // Handle Decimal128 fields
+        if (key === 'amount' || key === 'volume_cbm') {
+          invoiceRequest.verification[key] = toDecimal128(verificationData[key]);
+        } else {
+          invoiceRequest.verification[key] = verificationData[key];
+        }
+      }
+    });
+
+    // Update main weight field with chargeable weight
+    if (verificationData.chargeable_weight !== undefined && verificationData.chargeable_weight !== null && verificationData.chargeable_weight !== '') {
+      invoiceRequest.weight = toDecimal128(verificationData.chargeable_weight);
+    } else if (verificationData.weight !== undefined && verificationData.weight !== null && verificationData.weight !== '') {
+      invoiceRequest.weight = toDecimal128(verificationData.weight);
+    }
+
+    // If PH_TO_UAE, force classification to GENERAL on the request object too
+    if (isPhToUae) {
+      normalizePhToUaeClassification(invoiceRequest);
+    }
+
+    // Update verification metadata
+    // Keep original verified_at, but update verified_by_employee_id and add reverification tracking
+    invoiceRequest.verification.verified_by_employee_id = verifiedByEmployeeId;
+    invoiceRequest.verification.reverified_at = new Date();
+    invoiceRequest.verification.reverified_by_employee_id = verifiedByEmployeeId;
+    
+    // Update verification_notes if provided
+    if (verificationData.verification_notes !== undefined) {
+      invoiceRequest.verification.verification_notes = verificationData.verification_notes;
+    }
+    
+    // IMPORTANT: Keep status as VERIFIED (do NOT change it)
+    // The status should remain VERIFIED after reverification
+    invoiceRequest.status = 'VERIFIED';
+    
+    await invoiceRequest.save();
+
+    // Resync EMPOST shipment with updated verification data
+    // Since verification data has changed (weights, amounts, etc.), we need to resync
+    try {
+      const empostAPI = require('../services/empost-api');
+      console.log('🔄 Resyncing EMPOST shipment with updated verification data...');
+      
+      const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
+      
+      if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
+        // Update UHAWB if it changed or if it didn't exist before
+        if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb !== shipmentResult.data.uhawb) {
+          invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
+          await invoiceRequest.save();
+          console.log('✅ EMPOST shipment resynced with UHAWB:', shipmentResult.data.uhawb);
+        } else {
+          console.log('✅ EMPOST shipment resynced (UHAWB unchanged):', shipmentResult.data.uhawb);
+        }
+      }
+    } catch (empostError) {
+      console.error('❌ Failed to resync EMPOST shipment (non-critical, will retry later):', empostError.message);
+      // Don't fail the reverification if EMPOST resync fails - changes are saved locally
+    }
+
+    console.log('✅ Reverification completed successfully:', {
+      id: invoiceRequestId,
+      verified_by: verifiedByEmployeeId,
+      reverified_at: invoiceRequest.verification.reverified_at
+    });
+
+    res.json({
+      success: true,
+      data: normalizeInvoiceRequest(invoiceRequest),
+      message: 'Reverification completed successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error reverifying verification:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Request body:', req.body);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to reverify verification details',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
 // Delete invoice request
 router.delete('/:id', async (req, res) => {
   try {

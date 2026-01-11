@@ -294,27 +294,378 @@ function formatBookings(bookings) {
   });
 }
 
+/**
+ * Decode HTML entities in base64 image strings
+ * Fixes issue where / is encoded as &#x2F; or &#47;
+ */
+function decodeImageField(field) {
+  if (!field || typeof field !== 'string') return field;
+  
+  // Decode common HTML entity encodings
+  return field
+    .replace(/&#x2F;/g, '/')        // Hex encoding: &#x2F; -> /
+    .replace(/&#47;/g, '/')         // Decimal encoding: &#47; -> /
+    .replace(/&#x5C;/g, '\\')       // Hex encoding: &#x5C; -> \
+    .replace(/&#92;/g, '\\')        // Decimal encoding: &#92; -> \
+    .replace(/&amp;/g, '&')         // &amp; -> &
+    .replace(/&lt;/g, '<')          // &lt; -> <
+    .replace(/&gt;/g, '>')          // &gt; -> >
+    .replace(/&quot;/g, '"')        // &quot; -> "
+    .replace(/&#x27;/g, "'")        // Hex encoding: &#x27; -> '
+    .replace(/&#39;/g, "'");        // Decimal encoding: &#39; -> '
+}
+
+/**
+ * Generate unique reference number
+ * Format: KNX followed by alphanumeric string (e.g., KNXMJO699KQ)
+ */
+async function generateReferenceNumber() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let referenceNumber;
+  let isUnique = false;
+  let attempts = 0;
+
+  while (!isUnique && attempts < 100) {
+    let ref = 'KNX';
+    for (let i = 0; i < 8; i++) {
+      ref += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    referenceNumber = ref;
+
+    // Check if reference number already exists
+    const existing = await Booking.findOne({ referenceNumber });
+    if (!existing) {
+      isUnique = true;
+    } else {
+      attempts++;
+    }
+  }
+
+  // Fallback: use timestamp if all attempts failed
+  if (!isUnique) {
+    referenceNumber = `KNX${Date.now().toString().slice(-10)}`;
+  }
+
+  return referenceNumber;
+}
+
+/**
+ * Validate Sales booking request body
+ */
+function validateSalesBooking(req) {
+  const errors = [];
+  const data = req.body;
+
+  // Required top-level fields
+  if (!data.service || !['uae-to-pinas', 'ph-to-uae'].includes(data.service)) {
+    errors.push('service must be "uae-to-pinas" or "ph-to-uae"');
+  }
+  if (!data.service_code || !['UAE_TO_PH', 'PH_TO_UAE'].includes(data.service_code)) {
+    errors.push('service_code must be "UAE_TO_PH" or "PH_TO_UAE"');
+  }
+  if (!data.source || data.source !== 'sales') {
+    errors.push('source must be "sales"');
+  }
+  if (!data.created_by_employee_id) {
+    errors.push('created_by_employee_id is required');
+  }
+
+  // Determine service type
+  const isUaeToPh = data.service === 'uae-to-pinas' || data.service_code === 'UAE_TO_PH';
+  const isPhToUae = data.service === 'ph-to-uae' || data.service_code === 'PH_TO_UAE';
+
+  // Validate service and service_code match
+  if ((isUaeToPh && data.service_code !== 'UAE_TO_PH') || (isPhToUae && data.service_code !== 'PH_TO_UAE')) {
+    errors.push('service and service_code must match (uae-to-pinas/UAE_TO_PH or ph-to-uae/PH_TO_UAE)');
+  }
+
+  // Validate sender
+  if (!data.sender) {
+    errors.push('sender is required');
+  } else {
+    const sender = data.sender;
+    if (!sender.firstName) errors.push('sender.firstName is required');
+    if (!sender.lastName) errors.push('sender.lastName is required');
+    
+    // Validate sender country based on service type
+    if (isUaeToPh && sender.country !== 'UNITED ARAB EMIRATES') {
+      errors.push('sender.country must be "UNITED ARAB EMIRATES" for UAE_TO_PH service');
+    } else if (isPhToUae && sender.country !== 'PHILIPPINES') {
+      errors.push('sender.country must be "PHILIPPINES" for PH_TO_UAE service');
+    }
+    
+    if (!sender.address || !sender.addressLine1) {
+      errors.push('sender.address and sender.addressLine1 are required');
+    }
+    
+    // Validate sender delivery option based on service type
+    if (isUaeToPh && !['pickup', 'warehouse'].includes(sender.deliveryOption)) {
+      errors.push('sender.deliveryOption must be "pickup" or "warehouse" for UAE_TO_PH service');
+    } else if (isPhToUae && !['pickup', 'warehouse'].includes(sender.deliveryOption)) {
+      errors.push('sender.deliveryOption must be "pickup" or "warehouse" for PH_TO_UAE service');
+    }
+    
+    if (!sender.phone && !sender.phoneNumber && !sender.contactNo) {
+      errors.push('sender.phone is required');
+    }
+  }
+
+  // Validate receiver
+  if (!data.receiver) {
+    errors.push('receiver is required');
+  } else {
+    const receiver = data.receiver;
+    if (!receiver.firstName) errors.push('receiver.firstName is required');
+    if (!receiver.lastName) errors.push('receiver.lastName is required');
+    
+    // Validate receiver country based on service type
+    if (isUaeToPh && receiver.country !== 'PHILIPPINES') {
+      errors.push('receiver.country must be "PHILIPPINES" for UAE_TO_PH service');
+    } else if (isPhToUae && receiver.country !== 'UNITED ARAB EMIRATES') {
+      errors.push('receiver.country must be "UNITED ARAB EMIRATES" for PH_TO_UAE service');
+    }
+    
+    if (!receiver.address || !receiver.addressLine1) {
+      errors.push('receiver.address and receiver.addressLine1 are required');
+    }
+    
+    // Validate receiver delivery option
+    if (!['pickup', 'delivery'].includes(receiver.deliveryOption)) {
+      errors.push('receiver.deliveryOption must be "pickup" or "delivery"');
+    }
+    
+    if (!receiver.phone && !receiver.phoneNumber && !receiver.contactNo) {
+      errors.push('receiver.phone is required');
+    }
+  }
+
+  // Validate items
+  if (!data.items || !Array.isArray(data.items) || data.items.length === 0) {
+    errors.push('items array is required and must contain at least one item');
+  } else {
+    data.items.forEach((item, index) => {
+      if (!item.commodity && !item.name) {
+        errors.push(`items[${index}].commodity or items[${index}].name is required`);
+      }
+      if (!item.qty && !item.quantity) {
+        errors.push(`items[${index}].qty or items[${index}].quantity is required`);
+      }
+    });
+  }
+
+  // Validate identity documents
+  // For UAE_TO_PH: EID front/back and Philippines ID front/back are required
+  // For PH_TO_UAE: Philippines ID front/back are required (EID optional)
+  if (!data.identityDocuments) {
+    errors.push('identityDocuments is required');
+  } else {
+    const idDocs = data.identityDocuments;
+    if (isUaeToPh) {
+      // UAE to PH requires EID and Philippines ID
+      if (!idDocs.eidFrontImage) errors.push('identityDocuments.eidFrontImage is required for UAE_TO_PH');
+      if (!idDocs.eidBackImage) errors.push('identityDocuments.eidBackImage is required for UAE_TO_PH');
+      if (!idDocs.philippinesIdFront) errors.push('identityDocuments.philippinesIdFront is required for UAE_TO_PH');
+      if (!idDocs.philippinesIdBack) errors.push('identityDocuments.philippinesIdBack is required for UAE_TO_PH');
+    } else if (isPhToUae) {
+      // PH to UAE: Requires Philippines ID (EID is optional)
+      if (!idDocs.philippinesIdFront) errors.push('identityDocuments.philippinesIdFront is required for PH_TO_UAE');
+      if (!idDocs.philippinesIdBack) errors.push('identityDocuments.philippinesIdBack is required for PH_TO_UAE');
+      // EID is optional for PH_TO_UAE (can be null/undefined)
+    }
+  }
+
+  // Validate insurance
+  if (data.insured === true && (!data.declaredAmount || data.declaredAmount <= 0)) {
+    errors.push('declaredAmount must be a positive number when insured is true');
+  }
+  if (data.insured === false && data.declaredAmount !== null && data.declaredAmount !== undefined) {
+    // Allow declaredAmount to be null/undefined when not insured, but if provided, it should be null
+    if (data.declaredAmount !== null) {
+      errors.push('declaredAmount must be null when insured is false');
+    }
+  }
+
+  // Validate email format if provided
+  if (data.sender?.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.sender.email)) {
+    errors.push('sender.email must be a valid email format');
+  }
+  if (data.receiver?.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.receiver.email)) {
+    errors.push('receiver.email must be a valid email format');
+  }
+
+  // Validate AWB format if provided (optional field)
+  // AWB pattern: [A-Z]{3}[0-9]{1}[A-Z]{2}[0-9]{1}[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{1}[A-Z]{1} (15 characters)
+  if (data.awb || data.awb_number || data.tracking_code) {
+    const awbValue = data.awb || data.awb_number || data.tracking_code;
+    const awbPattern = /^[A-Z]{3}[0-9]{1}[A-Z]{2}[0-9]{1}[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{1}[A-Z]{1}$/;
+    if (awbValue && !awbPattern.test(awbValue.toUpperCase())) {
+      errors.push('awb must follow the format: 3 letters, 1 digit, 2 letters, 1 digit, 2 letters, 2 digits, 2 letters, 1 digit, 1 letter (15 characters total, e.g., PHL2VN3KT28US9H)');
+    }
+  }
+
+  return errors;
+}
+
 // Create new booking
 router.post('/', async (req, res) => {
   try {
     const bookingData = req.body;
-    
-    // Create booking
-    const booking = new Booking(bookingData);
-    await booking.save();
-    
-    // Sync client in background (don't wait for it to complete)
-    syncClientFromBooking(booking).catch(err => {
-      console.error('[CLIENT_SYNC] Background client sync failed:', err);
-    });
-    
-    res.status(201).json({
-      success: true,
-      data: booking,
-      message: 'Booking created successfully'
-    });
+
+    // Check if this is a Sales booking (source: "sales")
+    const isSalesBooking = bookingData.source === 'sales';
+
+    if (isSalesBooking) {
+      // Validate Sales booking
+      const validationErrors = validateSalesBooking(req);
+      if (validationErrors.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation error',
+          details: validationErrors
+        });
+      }
+
+      // Generate unique reference number
+      const referenceNumber = await generateReferenceNumber();
+
+      // Normalize review_status: convert 'pending' to 'not reviewed' (valid enum values: 'not reviewed', 'reviewed', 'rejected')
+      let reviewStatus = bookingData.review_status || 'not reviewed';
+      if (reviewStatus === 'pending') {
+        reviewStatus = 'not reviewed';
+      }
+      if (!['not reviewed', 'reviewed', 'rejected'].includes(reviewStatus)) {
+        reviewStatus = 'not reviewed'; // Default to 'not reviewed' if invalid value
+      }
+
+      // Normalize sender data
+      const sender = {
+        firstName: bookingData.sender.firstName,
+        lastName: bookingData.sender.lastName,
+        fullName: bookingData.sender.fullName || `${bookingData.sender.firstName} ${bookingData.sender.lastName}`,
+        name: bookingData.sender.name || bookingData.sender.fullName || `${bookingData.sender.firstName} ${bookingData.sender.lastName}`,
+        country: bookingData.sender.country,
+        address: bookingData.sender.address || bookingData.sender.addressLine1,
+        addressLine1: bookingData.sender.addressLine1 || bookingData.sender.address,
+        completeAddress: bookingData.sender.completeAddress || bookingData.sender.addressLine1 || bookingData.sender.address,
+        deliveryOption: bookingData.sender.deliveryOption,
+        phone: bookingData.sender.phone || bookingData.sender.phoneNumber || bookingData.sender.contactNo,
+        phoneNumber: bookingData.sender.phoneNumber || bookingData.sender.phone || bookingData.sender.contactNo,
+        contactNo: bookingData.sender.contactNo || bookingData.sender.phone || bookingData.sender.phoneNumber,
+        email: bookingData.sender.email || bookingData.sender.emailAddress || null,
+        emailAddress: bookingData.sender.emailAddress || bookingData.sender.email || null,
+        agentName: bookingData.sender.agentName || null
+      };
+
+      // Normalize receiver data
+      const receiver = {
+        firstName: bookingData.receiver.firstName,
+        lastName: bookingData.receiver.lastName,
+        fullName: bookingData.receiver.fullName || `${bookingData.receiver.firstName} ${bookingData.receiver.lastName}`,
+        name: bookingData.receiver.name || bookingData.receiver.fullName || `${bookingData.receiver.firstName} ${bookingData.receiver.lastName}`,
+        country: bookingData.receiver.country,
+        address: bookingData.receiver.address || bookingData.receiver.addressLine1,
+        addressLine1: bookingData.receiver.addressLine1 || bookingData.receiver.address,
+        completeAddress: bookingData.receiver.completeAddress || bookingData.receiver.addressLine1 || bookingData.receiver.address,
+        deliveryOption: bookingData.receiver.deliveryOption,
+        phone: bookingData.receiver.phone || bookingData.receiver.phoneNumber || bookingData.receiver.contactNo,
+        phoneNumber: bookingData.receiver.phoneNumber || bookingData.receiver.phone || bookingData.receiver.contactNo,
+        contactNo: bookingData.receiver.contactNo || bookingData.receiver.phone || bookingData.receiver.phoneNumber,
+        email: bookingData.receiver.email || bookingData.receiver.emailAddress || null,
+        emailAddress: bookingData.receiver.emailAddress || bookingData.receiver.email || null
+      };
+
+      // Normalize items
+      const items = bookingData.items.map(item => ({
+        commodity: item.commodity || item.name,
+        name: item.name || item.commodity,
+        description: item.description || null,
+        qty: item.qty || item.quantity,
+        quantity: item.quantity || item.qty
+      }));
+
+      // Prepare identity documents (base64 images)
+      // Decode HTML entities to ensure images are stored correctly (e.g., &#x2F; -> /)
+      // Include all provided documents (some may be null/undefined for PH_TO_UAE)
+      const identityDocuments = {
+        eidFrontImage: bookingData.identityDocuments.eidFrontImage ? decodeImageField(bookingData.identityDocuments.eidFrontImage) : null,
+        eidBackImage: bookingData.identityDocuments.eidBackImage ? decodeImageField(bookingData.identityDocuments.eidBackImage) : null,
+        philippinesIdFront: bookingData.identityDocuments.philippinesIdFront ? decodeImageField(bookingData.identityDocuments.philippinesIdFront) : null,
+        philippinesIdBack: bookingData.identityDocuments.philippinesIdBack ? decodeImageField(bookingData.identityDocuments.philippinesIdBack) : null
+      };
+
+      // Extract AWB if provided from frontend (optional)
+      const awb = bookingData.awb || bookingData.awb_number || bookingData.tracking_code;
+      const awbValue = awb ? awb.toUpperCase().trim() : null;
+
+      // Prepare booking data
+      const salesBookingData = {
+        service: bookingData.service,
+        service_code: bookingData.service_code,
+        source: bookingData.source,
+        status: bookingData.status || 'pending',
+        review_status: reviewStatus, // Valid values: 'not reviewed', 'reviewed', 'rejected'
+        sender: sender,
+        receiver: receiver,
+        items: items,
+        identityDocuments: identityDocuments,
+        insured: bookingData.insured || false,
+        declaredAmount: bookingData.insured ? (bookingData.declaredAmount || null) : null,
+        created_by_employee_id: bookingData.created_by_employee_id,
+        referenceNumber: referenceNumber,
+        number_of_boxes: bookingData.number_of_boxes || items.length || 1
+      };
+
+      // Add AWB fields if provided from frontend
+      if (awbValue) {
+        salesBookingData.awb = awbValue;
+        salesBookingData.awb_number = awbValue;
+        salesBookingData.tracking_code = awbValue;
+      }
+
+      // Create booking
+      const booking = new Booking(salesBookingData);
+      await booking.save();
+
+      // Sync client in background (don't wait for it to complete)
+      syncClientFromBooking(booking).catch(err => {
+        console.error('[CLIENT_SYNC] Background client sync failed:', err);
+      });
+
+      res.status(201).json({
+        success: true,
+        data: booking,
+        message: 'Sales booking created successfully'
+      });
+    } else {
+      // Regular booking (customer-created or other sources)
+      // Create booking
+      const booking = new Booking(bookingData);
+      await booking.save();
+
+      // Sync client in background (don't wait for it to complete)
+      syncClientFromBooking(booking).catch(err => {
+        console.error('[CLIENT_SYNC] Background client sync failed:', err);
+      });
+
+      res.status(201).json({
+        success: true,
+        data: booking,
+        message: 'Booking created successfully'
+      });
+    }
   } catch (error) {
     console.error('Error creating booking:', error);
+    
+    // Handle validation errors
+    if (error.name === 'ValidationError') {
+      const validationErrors = Object.values(error.errors).map(err => err.message);
+      return res.status(400).json({
+        success: false,
+        error: 'Validation error',
+        details: validationErrors
+      });
+    }
+
     res.status(500).json({
       success: false,
       error: 'Failed to create booking',
@@ -1935,31 +2286,16 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
     // Calculate number of boxes
     const numberOfBoxes = booking.number_of_boxes || verificationBoxes.length || items.length || 1;
     
-    // Capture booking snapshot for audit/debug (remove mongoose internals)
-    const bookingSnapshot = booking.toObject ? booking.toObject() : booking;
-    if (bookingSnapshot && bookingSnapshot.__v !== undefined) {
-      delete bookingSnapshot.__v;
-    }
-    if (bookingSnapshot && bookingSnapshot._id) {
-      bookingSnapshot._id = bookingSnapshot._id.toString();
-    }
-    
-    // Extract identity documents from booking
-    // Check both booking.identityDocuments object and root level fields
+    // Extract identity documents METADATA ONLY (NO base64 images)
+    // Images are stored ONLY in Booking collection and fetched from there for PDF generation
+    // This prevents MongoDB 16MB document size limit issues
     const bookingIdentityDocs = booking.identityDocuments || {};
     const identityDocuments = {
-      // Check nested in identityDocuments object first
-      eidFrontImage: bookingIdentityDocs.eidFrontImage || bookingIdentityDocs.eidFront || bookingIdentityDocs.eid_front || bookingIdentityDocs.emiratesIdFront || null,
-      eidBackImage: bookingIdentityDocs.eidBackImage || bookingIdentityDocs.eidBack || bookingIdentityDocs.eid_back || bookingIdentityDocs.emiratesIdBack || null,
-      philippinesIdFront: bookingIdentityDocs.philippinesIdFront || bookingIdentityDocs.philippines_id_front || bookingIdentityDocs.phIdFront || null,
-      philippinesIdBack: bookingIdentityDocs.philippinesIdBack || bookingIdentityDocs.philippines_id_back || bookingIdentityDocs.phIdBack || null,
-      // Also check root level fields
-      ...(booking.eidFrontImage ? { eidFrontImage: booking.eidFrontImage } : {}),
-      ...(booking.eidBackImage ? { eidBackImage: booking.eidBackImage } : {}),
-      ...(booking.philippinesIdFront ? { philippinesIdFront: booking.philippinesIdFront } : {}),
-      ...(booking.philippinesIdBack ? { philippinesIdBack: booking.philippinesIdBack } : {}),
-      // Include any other identity document fields
-      ...bookingIdentityDocs
+      // Store ONLY metadata fields (not base64 images)
+      eidFrontImageFirstName: bookingIdentityDocs.eidFrontImageFirstName || booking.eidFrontImageFirstName || null,
+      eidFrontImageLastName: bookingIdentityDocs.eidFrontImageLastName || booking.eidFrontImageLastName || null,
+      // DO NOT include base64 image fields: eidFrontImage, eidBackImage, philippinesIdFront, philippinesIdBack
+      // Images are fetched from Booking collection when needed for PDF generation
     };
     
     // Remove null/undefined/empty values
@@ -1969,30 +2305,95 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       }
     });
 
-    // Create booking_data with all booking details EXCEPT identityDocuments
+    // Capture booking snapshot for audit/debug (exclude large image fields to avoid MongoDB 16MB limit)
+    // First get the snapshot, then clean it
+    const bookingSnapshotTemp = booking.toObject ? booking.toObject() : { ...booking };
+    if (bookingSnapshotTemp && bookingSnapshotTemp.__v !== undefined) {
+      delete bookingSnapshotTemp.__v;
+    }
+    if (bookingSnapshotTemp && bookingSnapshotTemp._id) {
+      bookingSnapshotTemp._id = bookingSnapshotTemp._id.toString();
+    }
+    
+    // Remove large image fields from snapshot to prevent MongoDB size limit issues
+    const fieldsToExclude = [
+      'identityDocuments', 'images', 'selfie', 'customerImage', 'customerImages',
+      'eidFrontImage', 'eidBackImage', 'philippinesIdFront', 'philippinesIdBack',
+      'eid_front_image', 'eid_back_image', 'philippines_id_front', 'philippines_id_back',
+      'emiratesIdFront', 'emiratesIdBack', 'phIdFront', 'phIdBack'
+    ];
+    
+    const bookingSnapshot = { ...bookingSnapshotTemp };
+    fieldsToExclude.forEach(field => {
+      if (bookingSnapshot[field] !== undefined) {
+        delete bookingSnapshot[field];
+      }
+    });
+    
+    // Also remove from nested sender/receiver objects if they contain large image data
+    if (bookingSnapshot.sender) {
+      const cleanSender = { ...bookingSnapshot.sender };
+      fieldsToExclude.forEach(field => {
+        if (cleanSender[field] !== undefined) {
+          delete cleanSender[field];
+        }
+      });
+      bookingSnapshot.sender = cleanSender;
+    }
+    if (bookingSnapshot.receiver) {
+      const cleanReceiver = { ...bookingSnapshot.receiver };
+      fieldsToExclude.forEach(field => {
+        if (cleanReceiver[field] !== undefined) {
+          delete cleanReceiver[field];
+        }
+      });
+      bookingSnapshot.receiver = cleanReceiver;
+    }
+    
+    // Create booking_data with all booking details EXCEPT identityDocuments and large images
     // This will be used for EMPOST API and other integrations
     const bookingData = { ...bookingSnapshot };
     
-    // Remove identityDocuments and related sensitive fields
-    if (bookingData.identityDocuments !== undefined) {
-      delete bookingData.identityDocuments;
-    }
-    if (bookingData.images !== undefined) {
-      delete bookingData.images;
-    }
-    if (bookingData.selfie !== undefined) {
-      delete bookingData.selfie;
-    }
-    
-    // Convert _id to string if present
-    if (bookingData._id) {
-      bookingData._id = bookingData._id.toString();
+    // Ensure sender and receiver objects are included (without large images)
+    // Use cleaned versions from bookingSnapshot if available, otherwise clean the originals
+    if (bookingSnapshot.sender) {
+      bookingData.sender = bookingSnapshot.sender;
+    } else {
+      const cleanSender = { ...sender };
+      fieldsToExclude.forEach(field => {
+        if (cleanSender[field] !== undefined) {
+          delete cleanSender[field];
+        }
+      });
+      bookingData.sender = cleanSender;
     }
     
-    // Ensure sender and receiver objects are included (they're needed for EMPOST)
-    bookingData.sender = sender;
-    bookingData.receiver = receiver;
+    if (bookingSnapshot.receiver) {
+      bookingData.receiver = bookingSnapshot.receiver;
+    } else {
+      const cleanReceiver = { ...receiver };
+      fieldsToExclude.forEach(field => {
+        if (cleanReceiver[field] !== undefined) {
+          delete cleanReceiver[field];
+        }
+      });
+      bookingData.receiver = cleanReceiver;
+    }
+    
     bookingData.items = items;
+    
+    // Limit items to essential data (no large image fields)
+    if (bookingData.items && Array.isArray(bookingData.items)) {
+      bookingData.items = bookingData.items.map(item => {
+        const cleanItem = { ...item };
+        fieldsToExclude.forEach(field => {
+          if (cleanItem[field] !== undefined) {
+            delete cleanItem[field];
+          }
+        });
+        return cleanItem;
+      });
+    }
     
     // Extract insurance data with fallbacks (check both top-level and sender object)
     const insuredRaw = booking.insured ?? booking.insurance ?? booking.isInsured ?? booking.is_insured 
@@ -2036,12 +2437,15 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
       
-      // Identity documents (for PDF generation)
+      // Identity documents METADATA ONLY (NO base64 images)
+      // Images are stored ONLY in Booking collection and fetched from there for PDF generation
+      // This prevents MongoDB 16MB document size limit issues
       identityDocuments: Object.keys(identityDocuments).length > 0 ? identityDocuments : {},
       
-      // Customer images
-      customerImage: booking.customerImage || booking.customer_image || '',
-      customerImages: Array.isArray(booking.customerImages) ? booking.customerImages : (booking.customer_images || []),
+      // DO NOT store customer images in InvoiceRequest (they're in Booking collection)
+      // Images are fetched from Booking collection when needed for PDF generation
+      customerImage: '', // Empty - images are in Booking collection
+      customerImages: [], // Empty - images are in Booking collection
       
       // Booking snapshot (full snapshot for audit/debug)
       booking_snapshot: bookingSnapshot,

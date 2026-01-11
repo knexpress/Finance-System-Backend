@@ -130,6 +130,7 @@ const transformInvoice = (invoice) => {
     pickup_charge: convertDecimal128(invoiceObj.pickup_charge),
     insurance_charge: convertDecimal128(invoiceObj.insurance_charge),
     base_amount: convertDecimal128(invoiceObj.base_amount),
+    base_rate: convertDecimal128(invoiceObj.base_rate), // CRITICAL: Convert base_rate from Decimal128 to number
     tax_amount: convertDecimal128(invoiceObj.tax_amount),
     total_amount: convertDecimal128(invoiceObj.total_amount),
     total_amount_cod: convertDecimal128(invoiceObj.total_amount_cod), // PH_TO_UAE COD Invoice total
@@ -1945,44 +1946,297 @@ router.put('/:id', async (req, res) => {
   try {
     const invoiceId = req.params.id;
     const updateData = req.body;
+    const regenerate = updateData.regenerate === true;
 
-    // Validate pickup charge if provided - accept 0 as valid
-    if (updateData.pickup_charge !== undefined && updateData.pickup_charge !== null) {
-      const pickupChargeNum = typeof updateData.pickup_charge === 'object' && updateData.pickup_charge.toString
-        ? parseFloat(updateData.pickup_charge.toString())
-        : parseFloat(updateData.pickup_charge);
-      if (isNaN(pickupChargeNum) || pickupChargeNum < 0) {
-        return res.status(400).json({
-          success: false,
-          error: 'Pickup charge must be 0 or greater'
-        });
+    // Helper function to parse Decimal128 or number values
+    const parseDecimal = (value) => {
+      if (value === null || value === undefined || value === '') return undefined;
+      if (typeof value === 'object' && value.toString) {
+        return parseFloat(value.toString());
       }
-      // pickupChargeNum === 0 is valid ✅
+      return parseFloat(value);
+    };
+
+    // Helper function to convert to Decimal128
+    const toDecimal128 = (value) => {
+      if (value === null || value === undefined || value === '') return undefined;
+      const num = parseDecimal(value);
+      if (isNaN(num)) return undefined;
+      return mongoose.Types.Decimal128.fromString(num.toFixed(2));
+    };
+
+    // Validate and prepare update fields
+    const preparedUpdate = {};
+
+    // ========================================
+    // VALIDATION AND FIELD PREPARATION
+    // ========================================
+
+    // Invoice Header Fields
+    if (updateData.invoice_id !== undefined) {
+      preparedUpdate.invoice_id = String(updateData.invoice_id).trim();
     }
-    
-    // Validate delivery charge if provided - accept 0 as valid
-    if (updateData.delivery_charge !== undefined && updateData.delivery_charge !== null) {
-      const deliveryChargeNum = typeof updateData.delivery_charge === 'object' && updateData.delivery_charge.toString
-        ? parseFloat(updateData.delivery_charge.toString())
-        : parseFloat(updateData.delivery_charge);
-      if (isNaN(deliveryChargeNum) || deliveryChargeNum < 0) {
-        return res.status(400).json({
-          success: false,
-          error: 'Delivery charge must be 0 or greater'
-        });
-      }
-      // deliveryChargeNum === 0 is valid ✅ (indicates free delivery)
+    if (updateData.batch_number !== undefined) {
+      preparedUpdate.batch_number = String(updateData.batch_number).trim();
     }
-    
-    // Validate insurance option if provided - only 'none' or 'percent' are allowed
-    if (updateData.insurance_option !== undefined && updateData.insurance_option !== null) {
-      const normalizedInsuranceOption = String(updateData.insurance_option).toLowerCase();
-      if (!['none', 'percent'].includes(normalizedInsuranceOption)) {
+    if (updateData.awb_number !== undefined) {
+      preparedUpdate.awb_number = String(updateData.awb_number).trim();
+    }
+    if (updateData.issue_date !== undefined) {
+      const issueDate = new Date(updateData.issue_date);
+      if (isNaN(issueDate.getTime())) {
         return res.status(400).json({
           success: false,
-          error: 'Invalid insurance option. Only "none" or "percent" are allowed. Fixed amount insurance option has been removed.'
+          error: 'Invalid issue_date format'
         });
       }
+      preparedUpdate.issue_date = issueDate;
+    }
+    if (updateData.due_date !== undefined) {
+      const dueDate = new Date(updateData.due_date);
+      if (isNaN(dueDate.getTime())) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid due_date format'
+        });
+      }
+      preparedUpdate.due_date = dueDate;
+    }
+
+    // Validate due_date is after issue_date if both provided
+    if (preparedUpdate.due_date && preparedUpdate.issue_date) {
+      if (preparedUpdate.due_date < preparedUpdate.issue_date) {
+        return res.status(400).json({
+          success: false,
+          error: 'due_date must be after issue_date'
+        });
+      }
+    }
+
+    // Receiver Information Fields (required if provided)
+    if (updateData.receiver_name !== undefined) {
+      if (!updateData.receiver_name || !String(updateData.receiver_name).trim()) {
+        return res.status(400).json({
+          success: false,
+          error: 'receiver_name cannot be empty'
+        });
+      }
+      preparedUpdate.receiver_name = String(updateData.receiver_name).trim();
+    }
+    if (updateData.receiver_address !== undefined) {
+      if (!updateData.receiver_address || !String(updateData.receiver_address).trim()) {
+        return res.status(400).json({
+          success: false,
+          error: 'receiver_address cannot be empty'
+        });
+      }
+      preparedUpdate.receiver_address = String(updateData.receiver_address).trim();
+    }
+    if (updateData.receiver_phone !== undefined) {
+      if (!updateData.receiver_phone || !String(updateData.receiver_phone).trim()) {
+        return res.status(400).json({
+          success: false,
+          error: 'receiver_phone cannot be empty'
+        });
+      }
+      preparedUpdate.receiver_phone = String(updateData.receiver_phone).trim();
+    }
+    if (updateData.customer_trn !== undefined) {
+      preparedUpdate.customer_trn = updateData.customer_trn ? String(updateData.customer_trn).trim() : null;
+    }
+
+    // Shipment Details Fields
+    if (updateData.number_of_boxes !== undefined) {
+      const numBoxes = parseInt(updateData.number_of_boxes);
+      if (isNaN(numBoxes) || numBoxes < 1) {
+        return res.status(400).json({
+          success: false,
+          error: 'number_of_boxes must be a positive integer'
+        });
+      }
+      preparedUpdate.number_of_boxes = numBoxes;
+    }
+
+    // CRITICAL: Update weight_kg in direct invoice field
+    if (updateData.weight_kg !== undefined) {
+      const weightKg = parseDecimal(updateData.weight_kg);
+      if (isNaN(weightKg) || weightKg <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'weight_kg must be a positive number'
+        });
+      }
+      preparedUpdate.weight_kg = weightKg;
+    }
+
+    // CRITICAL: Update weight_type in direct invoice field
+    if (updateData.weight_type !== undefined) {
+      const weightType = String(updateData.weight_type).toUpperCase();
+      if (!['ACTUAL', 'VOLUMETRIC'].includes(weightType)) {
+        return res.status(400).json({
+          success: false,
+          error: 'weight_type must be either "ACTUAL" or "VOLUMETRIC"'
+        });
+      }
+      preparedUpdate.weight_type = weightType;
+    }
+
+    // CRITICAL: Update base_rate in direct invoice field (displays as "Rate" in invoice)
+    if (updateData.base_rate !== undefined) {
+      const baseRate = parseDecimal(updateData.base_rate);
+      if (isNaN(baseRate) || baseRate < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'base_rate must be a non-negative number'
+        });
+      }
+      preparedUpdate.base_rate = toDecimal128(baseRate);
+    }
+
+    if (updateData.service_code !== undefined) {
+      preparedUpdate.service_code = String(updateData.service_code).trim().toUpperCase();
+    }
+
+    // Charges Fields - Validate numeric values
+    if (updateData.amount !== undefined) {
+      const amount = parseDecimal(updateData.amount);
+      if (isNaN(amount) || amount < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'amount must be a non-negative number'
+        });
+      }
+      preparedUpdate.amount = toDecimal128(amount);
+    }
+
+    if (updateData.pickup_charge !== undefined) {
+      const pickupCharge = parseDecimal(updateData.pickup_charge);
+      if (isNaN(pickupCharge) || pickupCharge < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'pickup_charge must be 0 or greater'
+        });
+      }
+      preparedUpdate.pickup_charge = toDecimal128(pickupCharge);
+    }
+
+    if (updateData.delivery_charge !== undefined) {
+      const deliveryCharge = parseDecimal(updateData.delivery_charge);
+      if (isNaN(deliveryCharge) || deliveryCharge < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'delivery_charge must be 0 or greater'
+        });
+      }
+      preparedUpdate.delivery_charge = toDecimal128(deliveryCharge);
+    }
+
+    if (updateData.insurance_charge !== undefined) {
+      const insuranceCharge = parseDecimal(updateData.insurance_charge);
+      if (isNaN(insuranceCharge) || insuranceCharge < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'insurance_charge must be 0 or greater'
+        });
+      }
+      preparedUpdate.insurance_charge = toDecimal128(insuranceCharge);
+    }
+
+    if (updateData.tax_rate !== undefined) {
+      const taxRate = parseDecimal(updateData.tax_rate);
+      if (isNaN(taxRate) || taxRate < 0 || taxRate > 100) {
+        return res.status(400).json({
+          success: false,
+          error: 'tax_rate must be between 0 and 100'
+        });
+      }
+      preparedUpdate.tax_rate = taxRate;
+    }
+
+    // CRITICAL: Manual fields - use provided values directly (NO auto-calculation)
+    if (updateData.tax_amount !== undefined) {
+      const taxAmount = parseDecimal(updateData.tax_amount);
+      if (isNaN(taxAmount) || taxAmount < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'tax_amount must be a non-negative number'
+        });
+      }
+      preparedUpdate.tax_amount = toDecimal128(taxAmount);
+    }
+
+    if (updateData.subtotal !== undefined) {
+      const subtotal = parseDecimal(updateData.subtotal);
+      if (isNaN(subtotal) || subtotal < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'subtotal must be a non-negative number'
+        });
+      }
+      preparedUpdate.base_amount = toDecimal128(subtotal); // Store subtotal as base_amount
+    }
+
+    // CRITICAL: Manual total field - use provided value directly (NO auto-calculation)
+    if (updateData.total !== undefined) {
+      const total = parseDecimal(updateData.total);
+      if (isNaN(total) || total < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'total must be a non-negative number'
+        });
+      }
+      preparedUpdate.total_amount = toDecimal128(total);
+    }
+
+    // Notes and Agent Fields
+    if (updateData.notes !== undefined) {
+      preparedUpdate.notes = updateData.notes ? String(updateData.notes).trim() : null;
+    }
+
+    if (updateData.agent_name !== undefined) {
+      // Store agent_name - may need to map to appropriate field in schema
+      // For now, we'll store it in notes or a custom field if schema supports it
+      // Note: Invoice schema may not have agent_name field directly
+      // This will be handled based on your schema structure
+      // TODO: Add agent_name field to Invoice schema if needed, or store in notes
+    }
+
+    // Customer Information Fields (customer_name, customer_phone, customer_email, origin_place)
+    // Note: These fields are not directly in the Invoice schema but may be in client_id reference
+    // For now, we'll validate them but they may need to be updated in the Client model separately
+    // TODO: If these fields should be stored in the invoice, add them to the Invoice schema
+    if (updateData.customer_name !== undefined) {
+      // Validate but note that this may need to update the Client model
+      if (!updateData.customer_name || !String(updateData.customer_name).trim()) {
+        return res.status(400).json({
+          success: false,
+          error: 'customer_name cannot be empty'
+        });
+      }
+      // Note: This field may need to be updated in the Client model via client_id
+    }
+
+    if (updateData.customer_phone !== undefined) {
+      // Validate but note that this may need to update the Client model
+      // Note: This field may need to be updated in the Client model via client_id
+    }
+
+    // Email validation
+    if (updateData.customer_email !== undefined && updateData.customer_email) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(String(updateData.customer_email))) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid customer_email format'
+        });
+      }
+      // Note: customer_email may need to be stored in client_id or a custom field
+      // This depends on your schema structure
+    }
+
+    if (updateData.origin_place !== undefined) {
+      // Validate but note that this may need to update the Client model or InvoiceRequest
+      // Note: This field may need to be updated in the Client model or InvoiceRequest via request_id
     }
 
     const invoice = await Invoice.findById(invoiceId);
@@ -1993,10 +2247,64 @@ router.put('/:id', async (req, res) => {
       });
     }
 
+    // Merge preparedUpdate into updateData BEFORE PH TO UAE logic
+    // This ensures all validated and converted values are available
+    Object.assign(updateData, preparedUpdate);
+
     // Determine service route
     const serviceCode = invoice.service_code || updateData.service_code || '';
     const normalizedServiceCode = serviceCode.toUpperCase();
     const isPhToUae = normalizedServiceCode.includes('PH_TO_UAE');
+    const isUaeToPh = normalizedServiceCode.includes('UAE_TO_PH') || normalizedServiceCode.includes('UAE_TO_PINAS');
+
+    // ========================================
+    // REGENERATE LOGIC (if regenerate: true)
+    // ========================================
+    if (regenerate) {
+      console.log('🔄 Regenerating invoice based on provided data...');
+
+      // Get values for regeneration
+      const weightKg = preparedUpdate.weight_kg !== undefined 
+        ? preparedUpdate.weight_kg 
+        : (invoice.weight_kg || 0);
+      const baseRate = preparedUpdate.base_rate !== undefined
+        ? parseDecimal(preparedUpdate.base_rate)
+        : (invoice.base_rate ? parseDecimal(invoice.base_rate) : 0);
+
+      // Recalculate shipping charge (amount) if not manually provided
+      if (updateData.amount === undefined && weightKg > 0 && baseRate > 0) {
+        const calculatedAmount = weightKg * baseRate;
+        preparedUpdate.amount = toDecimal128(calculatedAmount);
+        console.log(`✅ Regenerated amount: ${calculatedAmount} AED (${weightKg} kg × ${baseRate} AED/kg)`);
+      }
+
+      // Note: Pickup, delivery, and insurance charges would be recalculated based on
+      // delivery options and service type, but since the frontend sends all values manually,
+      // we'll use the provided values if available, otherwise keep existing values
+      
+      // Recalculate subtotal from charges (for reference, but use manual total if provided)
+      if (updateData.subtotal === undefined) {
+        const shippingCharge = preparedUpdate.amount 
+          ? parseDecimal(preparedUpdate.amount)
+          : (invoice.amount ? parseDecimal(invoice.amount) : 0);
+        const pickupCharge = preparedUpdate.pickup_charge
+          ? parseDecimal(preparedUpdate.pickup_charge)
+          : (invoice.pickup_charge ? parseDecimal(invoice.pickup_charge) : 0);
+        const deliveryCharge = preparedUpdate.delivery_charge
+          ? parseDecimal(preparedUpdate.delivery_charge)
+          : (invoice.delivery_charge ? parseDecimal(invoice.delivery_charge) : 0);
+        const insuranceCharge = preparedUpdate.insurance_charge
+          ? parseDecimal(preparedUpdate.insurance_charge)
+          : (invoice.insurance_charge ? parseDecimal(invoice.insurance_charge) : 0);
+        
+        const calculatedSubtotal = shippingCharge + pickupCharge + deliveryCharge + insuranceCharge;
+        preparedUpdate.base_amount = toDecimal128(calculatedSubtotal);
+        console.log(`✅ Regenerated subtotal: ${calculatedSubtotal} AED`);
+      }
+
+      // CRITICAL: Do NOT recalculate tax_amount or total - use manual values if provided
+      // If not provided, they will be calculated below (but only if not manually set)
+    }
 
     // Handle separate COD and Tax invoice edits for PH TO UAE
     if (isPhToUae && updateData.invoice_type) {
@@ -2064,8 +2372,14 @@ router.put('/:id', async (req, res) => {
         updateData.cod_delivery_charge = mongoose.Types.Decimal128.fromString(codDeliveryCharge.toFixed(2));
         updateData.total_amount_cod = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
         updateData.tax_rate = 0;
-        updateData.tax_amount = mongoose.Types.Decimal128.fromString('0.00');
-        updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
+        // Use manual tax_amount if provided, otherwise set to 0 for COD
+        if (updateData.tax_amount === undefined) {
+          updateData.tax_amount = mongoose.Types.Decimal128.fromString('0.00');
+        }
+        // Use manual total if provided, otherwise use totalAmountCod
+        if (updateData.total_amount === undefined) {
+          updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
+        }
         updateData.base_amount = mongoose.Types.Decimal128.fromString(totalAmountCod.toFixed(2));
         
         // Explicitly preserve amount (shipping charge) - do not update it
@@ -2186,8 +2500,14 @@ router.put('/:id', async (req, res) => {
           // If amount not provided, preserve existing amount from invoice
           updateData.amount = invoice.amount;
         }
-        updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
-        updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountTaxInvoice.toFixed(2));
+        // Use manual tax_amount if provided, otherwise use calculated value
+        if (updateData.tax_amount === undefined) {
+          updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
+        }
+        // Use manual total if provided, otherwise use totalAmountTaxInvoice
+        if (updateData.total_amount === undefined) {
+          updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmountTaxInvoice.toFixed(2));
+        }
         updateData.base_amount = mongoose.Types.Decimal128.fromString(deliveryCharge.toFixed(2)); // Subtotal = delivery charge only
 
         console.log('✅ Tax Invoice Edit Applied:');
@@ -2230,14 +2550,18 @@ router.put('/:id', async (req, res) => {
 
     // Recalculate totals if base_amount, delivery_charge, or tax_rate changes
     // Note: invoice.amount is shipping charge only, invoice.base_amount is subtotal
-    const needsRecalculation = updateData.base_amount !== undefined || 
+    // CRITICAL: Only recalculate if manual values are NOT provided
+    const hasManualTaxAmount = updateData.tax_amount !== undefined;
+    const hasManualTotal = updateData.total !== undefined;
+    const needsRecalculation = (updateData.base_amount !== undefined || 
                                 updateData.delivery_charge !== undefined || 
                                 updateData.tax_rate !== undefined ||
                                 updateData.pickup_charge !== undefined ||
                                 updateData.insurance_charge !== undefined ||
-                                updateData.delivery_base_amount !== undefined;
+                                updateData.delivery_base_amount !== undefined) &&
+                                (!hasManualTaxAmount || !hasManualTotal); // Only recalculate if manual values not provided
     
-    if (needsRecalculation) {
+    if (needsRecalculation && (!hasManualTaxAmount || !hasManualTotal)) {
       // Determine service route for classification logic (needed for insurance and tax calculations)
       const serviceCode = invoice.service_code || updateData.service_code || '';
       const normalizedServiceCode = serviceCode.toUpperCase();
@@ -2373,21 +2697,33 @@ router.put('/:id', async (req, res) => {
       
       taxAmount = Math.round(taxAmount * 100) / 100;
       
+      // CRITICAL: Use manual values if provided, otherwise calculate
+      if (!hasManualTaxAmount) {
+        updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
+      } else {
+        // Use manual tax_amount value (already in preparedUpdate)
+        console.log('✅ Using manual tax_amount value:', parseDecimal(updateData.tax_amount));
+      }
+      
       // Calculate total amount
       // For UAE to PH Flomic/Personal: Base amount already includes tax, so total = baseAmount (original)
       // For all other invoices: VAT is added on top, so total = subtotal + tax
-      let totalAmount;
-      if (isUaeToPh && isFlomicOrPersonal && taxRate > 0) {
-        // Base amount already includes tax - total equals original baseAmountValue
-        totalAmount = Math.round(baseAmountValue * 100) / 100;
-        console.log('✅ Base amount includes tax (UAE to PH Flomic/Personal) - Total = Original Base Amount');
+      if (!hasManualTotal) {
+        let totalAmount;
+        if (isUaeToPh && isFlomicOrPersonal && taxRate > 0) {
+          // Base amount already includes tax - total equals original baseAmountValue
+          totalAmount = Math.round(baseAmountValue * 100) / 100;
+          console.log('✅ Base amount includes tax (UAE to PH Flomic/Personal) - Total = Original Base Amount');
+        } else {
+          // VAT added on top - total = subtotal + tax
+          const finalTaxAmount = hasManualTaxAmount ? parseDecimal(updateData.tax_amount) : taxAmount;
+          totalAmount = Math.round((baseAmountValue + finalTaxAmount) * 100) / 100;
+        }
+        updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2));
       } else {
-        // VAT added on top - total = subtotal + tax
-        totalAmount = Math.round((baseAmountValue + taxAmount) * 100) / 100;
+        // Use manual total value (already in preparedUpdate)
+        console.log('✅ Using manual total value:', parseDecimal(updateData.total_amount));
       }
-      
-      updateData.tax_amount = mongoose.Types.Decimal128.fromString(taxAmount.toFixed(2));
-      updateData.total_amount = mongoose.Types.Decimal128.fromString(totalAmount.toFixed(2));
       
       console.log('📊 Invoice Update - Tax Recalculation:');
       const subtotalDisplay = (isUaeToPh && isFlomicOrPersonal && taxRate > 0) ? subtotalForUpdate : baseAmountValue;
@@ -2398,6 +2734,11 @@ router.put('/:id', async (req, res) => {
       console.log(`   Total Amount: ${totalAmount.toFixed(2)} AED`);
     }
 
+    // Remove regenerate flag and invoice_type from updateData (not database fields)
+    delete updateData.regenerate;
+    delete updateData.invoice_type;
+
+    // Apply all updates to invoice
     Object.assign(invoice, updateData);
     await invoice.save();
 

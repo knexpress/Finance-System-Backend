@@ -585,6 +585,16 @@ const invoiceSchema = new mongoose.Schema({
     type: Number,
     required: false,
   },
+  weight_type: {
+    type: String,
+    required: false,
+    enum: ['ACTUAL', 'VOLUMETRIC'],
+  },
+  base_rate: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: false,
+    // Base rate per kilogram (displays as "Rate" in invoice template)
+  },
   volume_cbm: {
     type: Number,
     required: false,
