@@ -338,6 +338,36 @@ router.get('/', async (req, res) => {
               try {
                 await Invoice.findByIdAndUpdate(transformed._id, { request_id: invoiceRequest._id });
                 console.log(`  ✅ Updated invoice request_id in database: ${invoiceRequest._id}`);
+                
+                // Re-fetch the updated invoice to get all details with the new request_id
+                const updatedInvoice = await Invoice.findById(transformed._id)
+                  .populate('request_id', REQUEST_POPULATE_FIELDS)
+                  .populate('client_id', 'company_name contact_name email phone')
+                  .populate('created_by', 'full_name email department_id')
+                  .lean();
+                
+                if (updatedInvoice) {
+                  // Re-transform with the updated invoice data to ensure all fields are included
+                  const reTransformed = transformInvoice(updatedInvoice);
+                  
+                  // Merge the populated fields we already set
+                  Object.assign(transformed, reTransformed);
+                  
+                  // Ensure request_id contains the full invoice request data
+                  if (updatedInvoice.request_id) {
+                    const updatedRequestObj = typeof updatedInvoice.request_id === 'object' 
+                      ? updatedInvoice.request_id 
+                      : invoiceRequestObj;
+                    transformed.request_id = {
+                      ...updatedRequestObj,
+                      ...invoiceRequestObj,
+                      verification: mergedVerification,
+                      number_of_boxes: transformed.number_of_boxes
+                    };
+                  }
+                  
+                  console.log(`  ✅ Re-fetched and updated invoice with all details`);
+                }
               } catch (updateError) {
                 console.error(`  ⚠️ Failed to update invoice request_id:`, updateError.message);
               }
@@ -528,6 +558,36 @@ router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
             try {
               await Invoice.findByIdAndUpdate(transformed._id, { request_id: invoiceRequest._id });
               console.log(`  ✅ Updated invoice request_id in database: ${invoiceRequest._id}`);
+              
+              // Re-fetch the updated invoice to get all details with the new request_id
+              const updatedInvoice = await Invoice.findById(transformed._id)
+                .populate('request_id', REQUEST_POPULATE_FIELDS)
+                .populate('client_id', 'company_name contact_name email phone')
+                .populate('created_by', 'full_name email department_id')
+                .lean();
+              
+              if (updatedInvoice) {
+                // Re-transform with the updated invoice data to ensure all fields are included
+                const reTransformed = transformInvoice(updatedInvoice);
+                
+                // Merge the populated fields we already set
+                Object.assign(transformed, reTransformed);
+                
+                // Ensure request_id contains the full invoice request data
+                if (updatedInvoice.request_id) {
+                  const updatedRequestObj = typeof updatedInvoice.request_id === 'object' 
+                    ? updatedInvoice.request_id 
+                    : invoiceRequestObj;
+                  transformed.request_id = {
+                    ...updatedRequestObj,
+                    ...invoiceRequestObj,
+                    verification: mergedVerification,
+                    number_of_boxes: transformed.number_of_boxes
+                  };
+                }
+                
+                console.log(`  ✅ Re-fetched and updated invoice with all details`);
+              }
             } catch (updateError) {
               console.error(`  ⚠️ Failed to update invoice request_id:`, updateError.message);
             }
@@ -3005,10 +3065,27 @@ router.post('/:invoiceId/cancel', validateObjectIdParam('invoiceId'), async (req
     session.endSession();
     
     // Fetch updated invoice for response
+    // Note: request_id may reference InvoiceRequest, but schema references ShipmentRequest
+    // So we fetch the invoice first, then manually populate request_id if it exists
     const updatedInvoice = await Invoice.findById(invoiceId)
-      .populate('request_id', REQUEST_POPULATE_FIELDS)
       .populate('client_id', 'company_name contact_name email phone')
       .populate('created_by', 'full_name email department_id');
+    
+    // Manually populate request_id if it exists (to avoid strictPopulate error)
+    // The schema references 'ShipmentRequest' but actual data uses 'InvoiceRequest'
+    if (updatedInvoice && updatedInvoice.request_id) {
+      try {
+        const invoiceRequest = await InvoiceRequest.findById(updatedInvoice.request_id)
+          .select(REQUEST_POPULATE_FIELDS)
+          .lean();
+        if (invoiceRequest) {
+          updatedInvoice.request_id = invoiceRequest;
+        }
+      } catch (populateError) {
+        console.warn('⚠️ Could not populate request_id:', populateError.message);
+        // Continue without populating request_id
+      }
+    }
     
     res.json({
       success: true,

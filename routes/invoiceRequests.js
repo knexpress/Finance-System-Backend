@@ -2944,7 +2944,6 @@ router.post('/:id/cancel', async (req, res) => {
     // 1. Find the invoice request
     const invoiceRequest = await InvoiceRequest.findById(id)
       .populate('booking_id')
-      .populate('request_id')
       .populate('created_by_employee_id', 'full_name email')
       .session(session);
     

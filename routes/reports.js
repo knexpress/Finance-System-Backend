@@ -69,18 +69,43 @@ router.get('/', async (req, res) => {
       
       if (reportData && reportData.invoice_id) {
         try {
-          // Find the invoice request that has this invoice_id
-          const invoiceRequest = await InvoiceRequest.findOne({ _id: reportData.invoice_id });
+          // reportData.invoice_id is an invoice number string (e.g., "INV-000290"), not an ObjectId
+          // First, find the Invoice by invoice_id or invoice_number
+          const invoice = await Invoice.findOne({
+            $or: [
+              { invoice_id: reportData.invoice_id },
+              { invoice_number: reportData.invoice_id }
+            ]
+          });
           
-          if (invoiceRequest) {
-            // Update the report data with current delivery_status
-            reportData.current_status = invoiceRequest.delivery_status;
-            reportData.cargo_details = reportData.cargo_details || {};
-            reportData.cargo_details.delivery_status = invoiceRequest.delivery_status;
+          if (invoice && invoice.request_id) {
+            // Then find the InvoiceRequest using the request_id from the Invoice
+            const invoiceRequest = await InvoiceRequest.findById(invoice.request_id);
             
-            // Save the updated report
-            await report.save();
-            console.log(`✅ Updated report ${report._id} with delivery_status: ${invoiceRequest.delivery_status}`);
+            if (invoiceRequest) {
+              // Update the report data with current delivery_status
+              reportData.current_status = invoiceRequest.delivery_status;
+              reportData.cargo_details = reportData.cargo_details || {};
+              reportData.cargo_details.delivery_status = invoiceRequest.delivery_status;
+              
+              // Save the updated report
+              await report.save();
+              console.log(`✅ Updated report ${report._id} with delivery_status: ${invoiceRequest.delivery_status}`);
+            }
+          } else {
+            // Fallback: Try to find InvoiceRequest directly by invoice_number
+            const invoiceRequest = await InvoiceRequest.findOne({ 
+              invoice_number: reportData.invoice_id 
+            });
+            
+            if (invoiceRequest) {
+              reportData.current_status = invoiceRequest.delivery_status;
+              reportData.cargo_details = reportData.cargo_details || {};
+              reportData.cargo_details.delivery_status = invoiceRequest.delivery_status;
+              
+              await report.save();
+              console.log(`✅ Updated report ${report._id} with delivery_status (via invoice_number): ${invoiceRequest.delivery_status}`);
+            }
           }
         } catch (error) {
           console.error(`❌ Error updating report ${report._id}:`, error);
