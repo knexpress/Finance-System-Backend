@@ -168,10 +168,18 @@ function buildStatusQuery(status) {
   // A booking is "not reviewed" if:
   // 1. BOTH reviewed_at AND reviewed_by_employee_id are missing/null, OR
   // 2. review_status is explicitly set to "not reviewed" or similar values
+  // Optimized query structure to use indexes more efficiently
   if (normalized === 'not_reviewed') {
     return {
       $or: [
-        // Case 1: Both reviewed_at and reviewed_by_employee_id are missing/null
+        // Case 1: review_status is explicitly set to "not reviewed" or similar (use index first)
+        // This is checked first as it can use the review_status index
+        { review_status: { $in: ['not reviewed', 'not_reviewed', 'pending', 'notreviewed', 'Not Reviewed'] } },
+        { review_status: { $exists: false } },
+        { review_status: null },
+        { review_status: '' },
+        // Case 2: Both reviewed_at and reviewed_by_employee_id are missing/null
+        // This uses the compound index { reviewed_at: 1, reviewed_by_employee_id: 1 }
         {
           $and: [
             {
@@ -187,12 +195,7 @@ function buildStatusQuery(status) {
               ]
             }
           ]
-        },
-        // Case 2: review_status is explicitly set to "not reviewed" or similar
-        { review_status: { $exists: false } },
-        { review_status: null },
-        { review_status: '' },
-        { review_status: { $in: ['not reviewed', 'not_reviewed', 'pending', 'notreviewed', 'Not Reviewed'] } }
+        }
       ]
     };
   }
@@ -257,9 +260,74 @@ function buildAwbQuery(awb) {
 }
 
 /**
- * Format bookings to include OTP info and normalized review_status
+ * Format bookings to include OTP info, normalized review_status, and batch_number from invoices
  */
-function formatBookings(bookings) {
+async function formatBookings(bookings) {
+  // Get all booking IDs to find related invoices
+  const bookingIds = bookings.map(b => {
+    const id = b._id?.toString() || b._id;
+    return id ? (typeof id === 'string' ? id : id.toString()) : null;
+  }).filter(Boolean);
+  
+  if (bookingIds.length === 0) {
+    // If no valid booking IDs, return formatted bookings without batch_number lookup
+    return bookings.map(booking => {
+      const otpInfo = {
+        otp: booking.otpVerification?.otp || booking.otp || null,
+        verified: booking.otpVerification?.verified || booking.verified || false,
+        verifiedAt: booking.otpVerification?.verifiedAt || booking.verifiedAt || null,
+        phoneNumber: booking.otpVerification?.phoneNumber || booking.phoneNumber || null
+      };
+      const agentName = booking.sender?.agentName || booking.agentName || null;
+      const normalizedReviewStatus = booking.review_status || 'not reviewed';
+      
+      return {
+        ...booking,
+        review_status: normalizedReviewStatus,
+        otpInfo: otpInfo,
+        agentName: agentName,
+        batch_number: booking.batch_number || booking.batch_no || null,
+        sender: booking.sender ? {
+          ...booking.sender,
+          agentName: booking.sender.agentName || null
+        } : null,
+        otpVerification: booking.otpVerification || null
+      };
+    });
+  }
+  
+  // Find all invoice requests that reference these bookings (using booking_id field)
+  const invoiceRequests = await InvoiceRequest.find({
+    booking_id: { $in: bookingIds }
+  }).select('_id booking_id').lean();
+  
+  // Create a map of booking ID to invoice request ID
+  const bookingToInvoiceRequestMap = new Map();
+  invoiceRequests.forEach(invReq => {
+    const bookingId = invReq.booking_id?.toString();
+    if (bookingId) {
+      bookingToInvoiceRequestMap.set(bookingId, invReq._id.toString());
+    }
+  });
+  
+  // Get all invoice request IDs
+  const invoiceRequestIds = Array.from(bookingToInvoiceRequestMap.values());
+  
+  // Find all invoices that reference these invoice requests (Invoice.request_id = InvoiceRequest._id)
+  const invoices = invoiceRequestIds.length > 0 ? await Invoice.find({
+    request_id: { $in: invoiceRequestIds }
+  }).select('request_id batch_number').lean() : [];
+  
+  // Create a map of invoice request ID to invoice batch_number
+  const invoiceRequestToBatchMap = new Map();
+  invoices.forEach(invoice => {
+    const requestId = invoice.request_id?.toString();
+    if (requestId && invoice.batch_number) {
+      invoiceRequestToBatchMap.set(requestId, invoice.batch_number);
+    }
+  });
+  
+  // Format bookings with batch_number
   return bookings.map(booking => {
     // Extract OTP from otpVerification object for easy access
     const otpInfo = {
@@ -275,6 +343,12 @@ function formatBookings(bookings) {
     // Normalize review_status - ensure it's always present and properly formatted
     const normalizedReviewStatus = booking.review_status || 'not reviewed';
     
+    // Get batch_number from invoice
+    const bookingId = booking._id?.toString() || booking._id;
+    const bookingIdStr = bookingId ? (typeof bookingId === 'string' ? bookingId : bookingId.toString()) : null;
+    const invoiceRequestId = bookingIdStr ? bookingToInvoiceRequestMap.get(bookingIdStr) : null;
+    const batchNumber = invoiceRequestId ? invoiceRequestToBatchMap.get(invoiceRequestId) : null;
+    
     return {
       ...booking,
       // Ensure review_status is always present and normalized
@@ -283,6 +357,8 @@ function formatBookings(bookings) {
       otpInfo: otpInfo,
       // Include agentName at top level for easy access
       agentName: agentName,
+      // Include batch_number from invoices collection (prioritize invoice batch_number, then booking's own batch_number)
+      batch_number: batchNumber || booking.batch_number || booking.batch_no || null,
       // Ensure sender object includes agentName
       sender: booking.sender ? {
         ...booking.sender,
@@ -1202,7 +1278,7 @@ router.get('/search-awb', auth, async (req, res) => {
       .lean();
 
     // Format bookings using the existing formatter
-    const formattedBookings = formatBookings(bookings);
+    const formattedBookings = await formatBookings(bookings);
 
     return res.json({
       success: true,
@@ -1295,7 +1371,7 @@ router.get('/', async (req, res) => {
       // Return pagination info
       return res.json({ 
         success: true, 
-        data: formatBookings(bookings), 
+        data: await formatBookings(bookings), 
         pagination: { 
           page: pageNum, 
           limit: limitNum, 
@@ -1306,7 +1382,7 @@ router.get('/', async (req, res) => {
     }
     
     // Format bookings
-    const formattedBookings = formatBookings(bookings);
+    const formattedBookings = await formatBookings(bookings);
     
     // Debug: Log first booking structure and check for image fields (only if no filters)
     // Note: This debug code only runs when filters are present (since we return early when no filters)
@@ -1401,17 +1477,22 @@ router.get('/status/:reviewStatus', async (req, res) => {
       }
     }
     
-    // For "not reviewed" status, always fetch ALL bookings (no pagination)
-    // For other statuses, use pagination unless all=true or AWB filter is present
+    // Use pagination for all statuses to improve performance
+    // Only skip pagination if explicitly requested with all=true AND no AWB filter
     const normalizedStatus = normalizeStatus(reviewStatus);
     const isNotReviewed = normalizedStatus === 'not_reviewed';
-    const shouldGetAll = isNotReviewed || hasAwbFilter || getAll;
+    const shouldGetAll = hasAwbFilter || getAll; // Removed isNotReviewed from shouldGetAll
     
     let bookings;
     let total;
     
+    // Get pagination parameters
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const skip = (page - 1) * limit;
+    
     if (shouldGetAll) {
-      // Filter full database - no pagination, return ALL matching results
+      // Only for AWB filter or explicit all=true - fetch all matching results
       // Use lightweight projection to exclude heavy data
       bookings = await Booking.find(query)
         .select(LIGHTWEIGHT_PROJECTION)
@@ -1420,22 +1501,20 @@ router.get('/status/:reviewStatus', async (req, res) => {
       // No limit applied - get all results
       total = bookings.length;
       
-      const filterInfo = hasAwbFilter ? 'with AWB filter' : (isNotReviewed ? '(all not reviewed)' : 'without AWB filter (all=true)');
+      const filterInfo = hasAwbFilter ? 'with AWB filter' : 'without AWB filter (all=true)';
       console.log(`📊 Fetched ${total} bookings by status "${reviewStatus}" ${filterInfo}`);
     } else {
-      // Use pagination for other statuses
-      const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
-      const skip = (page - 1) * limit;
-      
-      // Get total count first
+      // Use pagination for better performance (including "not reviewed" status)
+      // Get total count first (with index hint for better performance)
       total = await Booking.countDocuments(query);
       
       // Use lightweight projection to exclude heavy data
+      // Use compound index hint for optimal performance: { review_status: 1, createdAt: -1 }
+      const sortOrder = { createdAt: -1 };
       bookings = await Booking.find(query)
         .select(LIGHTWEIGHT_PROJECTION)
         .lean()
-        .sort({ createdAt: -1 })
+        .sort(sortOrder)
         .skip(skip)
         .limit(limit);
       
@@ -1444,7 +1523,7 @@ router.get('/status/:reviewStatus', async (req, res) => {
       // Return pagination info
       return res.json({ 
         success: true, 
-        data: formatBookings(bookings), 
+        data: await formatBookings(bookings), 
         pagination: {
           page,
           limit,
@@ -1455,7 +1534,7 @@ router.get('/status/:reviewStatus', async (req, res) => {
     }
     
     // Format bookings
-    const formattedBookings = formatBookings(bookings);
+    const formattedBookings = await formatBookings(bookings);
     
     // Return response - no pagination when fetching all
     res.json({ 
@@ -1486,12 +1565,150 @@ const VALID_SHIPMENT_STATUSES = [
   'DELIVERED'
 ];
 
+/**
+ * Build MongoDB projection object from comma-separated field list
+ * Supports nested fields (e.g., 'sender.completeAddress')
+ * @param {string} fieldsParam - Comma-separated list of field paths
+ * @returns {Object|null} - MongoDB projection object or null if no fields specified
+ */
+function buildProjectionFromFields(fieldsParam) {
+  if (!fieldsParam || !fieldsParam.trim()) {
+    return null; // Return null to indicate no projection (return all fields)
+  }
+
+  const fields = fieldsParam.split(',').map(f => f.trim()).filter(f => f.length > 0);
+  if (fields.length === 0) {
+    return null;
+  }
+
+  const projection = {};
+  fields.forEach(field => {
+    // Always include _id by default (MongoDB requirement)
+    if (field === '_id') {
+      projection._id = 1;
+    } else {
+      // Handle nested fields (e.g., 'sender.completeAddress')
+      projection[field] = 1;
+    }
+  });
+
+  // Always include _id if not explicitly excluded
+  if (projection._id === undefined) {
+    projection._id = 1;
+  }
+
+  return projection;
+}
+
+/**
+ * Filter object to include only specified fields
+ * Supports nested fields (e.g., 'sender.completeAddress')
+ * @param {Object} obj - Object to filter
+ * @param {Array<string>} fields - Array of field paths to include
+ * @returns {Object} - Filtered object
+ */
+function filterFields(obj, fields) {
+  if (!fields || fields.length === 0) {
+    return obj; // Return all fields if no filter specified
+  }
+
+  const filtered = {};
+  fields.forEach(field => {
+    if (field.includes('.')) {
+      // Handle nested fields (e.g., 'sender.completeAddress')
+      const parts = field.split('.');
+      let current = obj;
+      let currentFiltered = filtered;
+
+      // Navigate to the nested object
+      for (let i = 0; i < parts.length - 1; i++) {
+        const part = parts[i];
+        if (current && typeof current === 'object' && current[part]) {
+          if (!currentFiltered[part]) {
+            currentFiltered[part] = {};
+          }
+          current = current[part];
+          currentFiltered = currentFiltered[part];
+        } else {
+          return; // Field path doesn't exist, skip
+        }
+      }
+
+      // Set the final field value
+      const finalField = parts[parts.length - 1];
+      if (current && typeof current === 'object' && current[finalField] !== undefined) {
+        currentFiltered[finalField] = current[finalField];
+      }
+    } else {
+      // Handle top-level fields
+      if (obj[field] !== undefined) {
+        filtered[field] = obj[field];
+      }
+    }
+  });
+
+  return filtered;
+}
+
 // GET /api/bookings/verified-invoices
 // Get all bookings that have verified/completed invoice requests (not rejected/cancelled)
 // This includes bookings even if invoice hasn't been generated yet
 // Shows bookings when invoice request is reviewed (has verification data) and not rejected
+// Supports field selection via ?fields=field1,field2,nested.field parameter
 router.get('/verified-invoices', auth, async (req, res) => {
   try {
+    // Parse fields parameter for field selection
+    const fieldsParam = req.query.fields;
+    const requestedFields = fieldsParam ? fieldsParam.split(',').map(f => f.trim()).filter(f => f.length > 0) : null;
+    const useFieldSelection = requestedFields && requestedFields.length > 0;
+
+    // Build projection for Booking query if fields are specified
+    let bookingProjection = null;
+    if (useFieldSelection) {
+      // Build projection including nested fields that might be needed
+      // We need to fetch sender and receiver even if only specific nested fields are requested
+      const needsSender = requestedFields.some(f => f.startsWith('sender.') || f === 'sender');
+      const needsReceiver = requestedFields.some(f => f.startsWith('receiver.') || f === 'receiver');
+      const needsRequestId = requestedFields.some(f => f.startsWith('request_id.'));
+      const needsBooking = requestedFields.some(f => f.startsWith('booking.'));
+
+      bookingProjection = {
+        _id: 1,
+        converted_to_invoice_request_id: 1, // Always needed for lookup
+        shipment_status: 1,
+        batch_no: 1,
+        createdAt: 1,
+        updatedAt: 1
+      };
+
+      // Add requested top-level fields
+      requestedFields.forEach(field => {
+        if (!field.includes('.')) {
+          bookingProjection[field] = 1;
+        }
+      });
+
+      // Add parent objects if nested fields are requested
+      if (needsSender) {
+        bookingProjection.sender = 1;
+      }
+      if (needsReceiver) {
+        bookingProjection.receiver = 1;
+      }
+      if (needsRequestId || needsBooking) {
+        // These will be populated from invoiceRequest/invoice, not from booking
+      }
+
+      // Always include these fields that are used in the response mapping
+      const requiredFields = ['awb', 'tracking_code', 'awb_number', 'customer_name', 'receiver_name', 
+                             'origin_place', 'destination_place', 'service_code', 'service'];
+      requiredFields.forEach(field => {
+        if (requestedFields.includes(field) || !useFieldSelection) {
+          bookingProjection[field] = 1;
+        }
+      });
+    }
+
     // Find all invoice requests that have been reviewed and not rejected/cancelled
     // Criteria:
     // 1. Status is VERIFIED or COMPLETED, OR
@@ -1507,7 +1724,15 @@ router.get('/verified-invoices', auth, async (req, res) => {
           ]
         }
       ]
-    }).lean();
+    }).select(useFieldSelection ? {
+      _id: 1,
+      tracking_code: 1,
+      invoice_number: 1,
+      service_code: 1,
+      service: 1,
+      awb: 1,
+      awb_number: 1
+    } : {}).lean();
 
     if (verifiedInvoiceRequests.length === 0) {
       return res.json({
@@ -1522,7 +1747,12 @@ router.get('/verified-invoices', auth, async (req, res) => {
     // Find all invoices that reference these invoice requests (optional - invoice may not exist yet)
     const invoices = await Invoice.find({
       request_id: { $in: invoiceRequestIds }
-    }).lean();
+    }).select(useFieldSelection ? {
+      _id: 1,
+      request_id: 1,
+      invoice_id: 1,
+      batch_number: 1
+    } : {}).lean();
 
     // Create a map of invoice request ID to invoice (if invoice exists)
     const invoiceMap = new Map();
@@ -1537,12 +1767,18 @@ router.get('/verified-invoices', auth, async (req, res) => {
     // Include ALL bookings with verified/completed invoice requests, even if invoice doesn't exist yet
     // Note: request_id and booking_id are not in the schema, so we can't populate them
     // The extractServiceCode function will check these fields if they exist as ObjectIds or already populated
-    const bookings = await Booking.find({
+    const bookingQuery = Booking.find({
       converted_to_invoice_request_id: { $in: invoiceRequestIds }
-    }).lean();
+    });
+
+    if (bookingProjection) {
+      bookingQuery.select(bookingProjection);
+    }
+
+    const bookings = await bookingQuery.lean();
 
     // Format response with invoice information
-    const formattedBookings = bookings.map(booking => {
+    let formattedBookings = bookings.map(booking => {
       const invoiceRequestId = booking.converted_to_invoice_request_id?.toString();
       const invoice = invoiceRequestId ? invoiceMap.get(invoiceRequestId) : null;
       const invoiceRequest = verifiedInvoiceRequests.find(
@@ -1555,7 +1791,8 @@ router.get('/verified-invoices', auth, async (req, res) => {
       // Set default shipment_status if missing (default to SHIPMENT_RECEIVED)
       const shipmentStatus = booking.shipment_status || 'SHIPMENT_RECEIVED';
 
-      return {
+      // Build full response object
+      const fullResponse = {
         _id: booking._id,
         tracking_code: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
         awb_number: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
@@ -1565,15 +1802,37 @@ router.get('/verified-invoices', auth, async (req, res) => {
         origin_place: booking.origin_place || booking.origin || null,
         destination_place: booking.destination_place || booking.destination || null,
         shipment_status: shipmentStatus, // Always include, default to SHIPMENT_RECEIVED if missing
-        batch_no: booking.batch_no || null,
+        batch_no: invoice?.batch_number || booking.batch_no || null, // Prioritize batch_number from invoices collection
         invoice_id: invoice?._id || null,
         invoice_number: invoice?.invoice_id || invoiceRequest?.invoice_number || null,
         service_code: serviceCode, // Include normalized service_code (can be null)
+        service: booking.service || invoiceRequest?.service || null,
         sender: booking.sender || null,
         receiver: booking.receiver || null,
+        request_id: invoiceRequest ? {
+          service_code: invoiceRequest.service_code || null,
+          service: invoiceRequest.service || null,
+          awb: invoiceRequest.awb || null,
+          tracking_code: invoiceRequest.tracking_code || null,
+          awb_number: invoiceRequest.awb_number || null
+        } : null,
+        booking: {
+          service_code: booking.service_code || null,
+          service: booking.service || null,
+          awb: booking.awb || null,
+          tracking_code: booking.tracking_code || null,
+          awb_number: booking.awb_number || null
+        },
         createdAt: booking.createdAt,
         updatedAt: booking.updatedAt
       };
+
+      // Apply field filtering if fields parameter was provided
+      if (useFieldSelection) {
+        return filterFields(fullResponse, requestedFields);
+      }
+
+      return fullResponse;
     });
 
     res.json({

@@ -1068,10 +1068,23 @@ const bookingSchema = new mongoose.Schema({
   strict: false, // Allow fields not defined in schema
 });
 
+// Single field indexes
 bookingSchema.index({ review_status: 1 });
 bookingSchema.index({ createdAt: -1 });
 bookingSchema.index({ shipment_status: 1 });
 bookingSchema.index({ batch_no: 1 });
+// Indexes for review-related fields (used in review-requests queries)
+bookingSchema.index({ reviewed_at: 1 });
+bookingSchema.index({ reviewed_by_employee_id: 1 });
+
+// Compound indexes for common query patterns
+// Most common: filter by review_status and sort by createdAt (used in review-requests page)
+bookingSchema.index({ review_status: 1, createdAt: -1 });
+// For "not reviewed" queries that check both reviewed_at and reviewed_by_employee_id
+bookingSchema.index({ reviewed_at: 1, reviewed_by_employee_id: 1 });
+// Alternative compound index for review_status queries with different sort orders
+bookingSchema.index({ review_status: 1, reviewed_at: -1 });
+
 // Indexes for AWB search performance
 bookingSchema.index({ awb: 1 });
 bookingSchema.index({ tracking_code: 1 });
