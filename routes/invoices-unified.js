@@ -436,6 +436,10 @@ router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
     const transformed = transformInvoice(invoice);
     const invoiceObj = invoice.toObject ? invoice.toObject() : invoice;
     
+    // Variables to store InvoiceRequest data for merging later
+    let invoiceRequestObj = null;
+    let existingRequestData = null;
+    
     // Always try to populate fields from InvoiceRequest if request_id exists
     // Note: request_id might be an InvoiceRequest ObjectId, not a ShipmentRequest
     // Also check notes field as fallback (format: "Invoice for request <request_id>")
@@ -530,8 +534,8 @@ router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
           }
 
           // Ensure request_id field includes invoice request details
-          const invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
-          const existingRequestData =
+          invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
+          existingRequestData =
             transformed.request_id && typeof transformed.request_id === 'object'
               ? transformed.request_id
               : {};
@@ -601,6 +605,60 @@ router.get('/:id', validateObjectIdParam('id'), async (req, res) => {
     } catch (error) {
       console.error('⚠️ Error populating fields from InvoiceRequest:', error.message);
       console.error('Error stack:', error.stack);
+    }
+    
+    // Always re-fetch fresh data from database to ensure we have the latest state
+    // This ensures any updates made during the request (or by other processes) are reflected
+    try {
+      const freshInvoice = await Invoice.findById(req.params.id)
+        .populate('request_id', REQUEST_POPULATE_FIELDS)
+        .populate('client_id', 'company_name contact_name email phone')
+        .populate('created_by', 'full_name email department_id')
+        .lean(); // Use lean() to get fresh plain JavaScript objects
+      
+      if (freshInvoice) {
+        // Re-transform with fresh data
+        const freshTransformed = transformInvoice(freshInvoice);
+        
+        // Merge any populated fields we set earlier (like number_of_boxes, etc.)
+        // but prioritize fresh data from database
+        Object.assign(transformed, freshTransformed);
+        
+        // Ensure request_id contains complete data if it exists
+        if (freshInvoice.request_id && typeof freshInvoice.request_id === 'object') {
+          // If we have invoiceRequestObj from earlier, merge it with fresh data
+          if (invoiceRequestObj) {
+            const freshRequestObj = freshInvoice.request_id;
+            const mergedVerification = {
+              ...(freshRequestObj.verification || {}),
+              ...(invoiceRequestObj.verification || {}),
+              ...(existingRequestData?.verification || {})
+            };
+            if (!mergedVerification.number_of_boxes) {
+              mergedVerification.number_of_boxes = transformed.number_of_boxes;
+            }
+            transformed.request_id = {
+              ...freshRequestObj,
+              ...invoiceRequestObj,
+              verification: mergedVerification,
+              number_of_boxes: transformed.number_of_boxes || 
+                               freshRequestObj.number_of_boxes || 
+                               invoiceRequestObj.number_of_boxes
+            };
+          } else {
+            // Use fresh request_id data as-is
+            transformed.request_id = freshInvoice.request_id;
+          }
+        } else if (freshInvoice.request_id) {
+          // request_id exists but is not an object (might be ObjectId), use it as-is
+          transformed.request_id = freshInvoice.request_id;
+        }
+        
+        console.log(`✅ Re-fetched fresh invoice data from database`);
+      }
+    } catch (freshFetchError) {
+      console.error('⚠️ Error re-fetching fresh invoice data:', freshFetchError.message);
+      // Continue with existing transformed data if re-fetch fails
     }
     
     res.json({
