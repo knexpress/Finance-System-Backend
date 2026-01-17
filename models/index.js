@@ -1023,6 +1023,13 @@ const bookingSchema = new mongoose.Schema({
   shipment_status: {
     type: String,
     enum: [
+      // New simplified statuses (primary)
+      'Shipment Received',
+      'Shipment Processing',
+      'Shipment Departed',
+      'Shipment Arrived',
+      'Shipment Delivered',
+      // Legacy statuses (for backward compatibility)
       'SHIPMENT_RECEIVED',
       'SHIPMENT_PROCESSING',
       'DEPARTED_FROM_MANILA',

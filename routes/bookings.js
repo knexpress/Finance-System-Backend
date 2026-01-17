@@ -1687,7 +1687,14 @@ router.get('/status/:reviewStatus', async (req, res) => {
 // These endpoints must be defined BEFORE /:id to ensure proper route matching
 
 // Valid shipment status values
+// New simplified statuses (primary)
 const VALID_SHIPMENT_STATUSES = [
+  'Shipment Received',
+  'Shipment Processing',
+  'Shipment Departed',
+  'Shipment Arrived',
+  'Shipment Delivered',
+  // Legacy statuses (for backward compatibility)
   'SHIPMENT_RECEIVED',
   'SHIPMENT_PROCESSING',
   'DEPARTED_FROM_MANILA',
@@ -1697,6 +1704,25 @@ const VALID_SHIPMENT_STATUSES = [
   'OUT_FOR_DELIVERY',
   'DELIVERED'
 ];
+
+/**
+ * Map old shipment status to new status format
+ * @param {string} oldStatus - Old status value
+ * @returns {string} - New status value
+ */
+function mapOldStatusToNew(oldStatus) {
+  const statusMap = {
+    'SHIPMENT_RECEIVED': 'Shipment Received',
+    'SHIPMENT_PROCESSING': 'Shipment Processing',
+    'DEPARTED_FROM_MANILA': 'Shipment Departed',
+    'IN_TRANSIT_TO_DUBAI': 'Shipment Departed', // Map to Departed
+    'ARRIVED_AT_DUBAI': 'Shipment Arrived',
+    'SHIPMENT_CLEARANCE': 'Shipment Arrived', // Map to Arrived
+    'OUT_FOR_DELIVERY': 'Shipment Arrived', // Map to Arrived
+    'DELIVERED': 'Shipment Delivered'
+  };
+  return statusMap[oldStatus] || oldStatus; // Return as-is if no mapping found
+}
 
 /**
  * Build MongoDB projection object from comma-separated field list
@@ -2005,11 +2031,19 @@ router.put('/batch/shipment-status', auth, async (req, res) => {
       });
     }
 
+    // Normalize shipment_status: trim whitespace
+    const normalizedStatus = shipment_status.trim();
+    
+    // Try to map old status to new format if needed
+    const finalStatus = mapOldStatusToNew(normalizedStatus) || normalizedStatus;
+
     // Validate shipment_status value
-    if (!VALID_SHIPMENT_STATUSES.includes(shipment_status)) {
+    if (!VALID_SHIPMENT_STATUSES.includes(finalStatus)) {
       return res.status(400).json({
         success: false,
-        error: `Invalid shipment_status. Must be one of: ${VALID_SHIPMENT_STATUSES.join(', ')}`
+        error: `Invalid shipment_status. Must be one of: ${VALID_SHIPMENT_STATUSES.join(', ')}`,
+        received: shipment_status,
+        normalized: finalStatus
       });
     }
 
@@ -2033,13 +2067,13 @@ router.put('/batch/shipment-status', auth, async (req, res) => {
         filter: { _id: bookingId },
         update: {
           $set: {
-            shipment_status: shipment_status,
+            shipment_status: finalStatus,
             updatedAt: new Date(),
             ...(batch_no && { batch_no: batch_no })
           },
           $push: {
             shipment_status_history: {
-              status: shipment_status,
+              status: finalStatus,
               updated_at: new Date(),
               updated_by: updatedByValue,
               notes: notes || ''
@@ -2218,11 +2252,19 @@ router.put('/:id/shipment-status', auth, async (req, res) => {
       });
     }
 
+    // Normalize shipment_status: trim whitespace
+    const normalizedStatus = shipment_status.trim();
+    
+    // Try to map old status to new format if needed
+    const finalStatus = mapOldStatusToNew(normalizedStatus) || normalizedStatus;
+
     // Validate shipment_status value
-    if (!VALID_SHIPMENT_STATUSES.includes(shipment_status)) {
+    if (!VALID_SHIPMENT_STATUSES.includes(finalStatus)) {
       return res.status(400).json({
         success: false,
-        error: `Invalid shipment_status. Must be one of: ${VALID_SHIPMENT_STATUSES.join(', ')}`
+        error: `Invalid shipment_status. Must be one of: ${VALID_SHIPMENT_STATUSES.join(', ')}`,
+        received: shipment_status,
+        normalized: finalStatus
       });
     }
 
@@ -2238,15 +2280,15 @@ router.put('/:id/shipment-status', auth, async (req, res) => {
     // Get updated_by from request body or default to user email or 'system'
     const updatedByValue = updated_by || req.user?.email || 'system';
 
-    // Update shipment status
-    booking.shipment_status = shipment_status;
+    // Update shipment status (use normalized/mapped status)
+    booking.shipment_status = finalStatus;
 
     // Add entry to shipment_status_history
     if (!booking.shipment_status_history) {
       booking.shipment_status_history = [];
     }
     booking.shipment_status_history.push({
-      status: shipment_status,
+      status: finalStatus,
       updated_at: new Date(),
       updated_by: updatedByValue,
       notes: notes || ''
