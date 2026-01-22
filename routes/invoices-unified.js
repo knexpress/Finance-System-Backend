@@ -250,20 +250,15 @@ router.get('/', async (req, res) => {
       console.log(`📄 Pagination: page=${page}, limit=${limit}, skip=${skip}`);
     }
     
-    // Build base query with field projection for lightweight list
-    let baseQuery = Invoice.find();
-    
-    // Apply search filter if provided (searches across ALL invoices)
+    // Build base query with search filter if provided
     const searchQuery = buildInvoiceSearchQuery(search);
-    if (searchQuery) {
-      baseQuery = baseQuery.find(searchQuery);
-    }
+    const queryFilter = searchQuery || {};
     
     // Get total count (with search filter if applicable) - do this in parallel
-    const countPromise = baseQuery.clone().countDocuments().maxTimeMS(5000);
+    const countPromise = Invoice.countDocuments(queryFilter).maxTimeMS(5000);
     
     // Build query with minimal populate for list view
-    let query = baseQuery
+    let query = Invoice.find(queryFilter)
       .select(INVOICE_LIST_FIELDS) // Only select essential fields
       .populate('client_id', 'company_name contact_name') // Minimal client data
       .populate('created_by', 'full_name') // Minimal creator data

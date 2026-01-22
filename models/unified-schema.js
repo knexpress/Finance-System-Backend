@@ -1448,7 +1448,7 @@ invoiceSchema.index({ due_date: 1 });
 invoiceSchema.index({ created_by: 1 });
 invoiceSchema.index({ createdAt: -1 }); // Critical for sorting by creation date
 // Search indexes for faster search queries
-invoiceSchema.index({ invoice_id: 1 });
+// Note: invoice_id index is automatically created by unique: true, so we don't need to create it again
 invoiceSchema.index({ awb_number: 1 });
 invoiceSchema.index({ batch_number: 1 });
 invoiceSchema.index({ receiver_name: 1 });
