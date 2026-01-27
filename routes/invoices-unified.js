@@ -5,6 +5,7 @@ const { InvoiceRequest, Booking } = require('../models');
 const empostAPI = require('../services/empost-api');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
+const { reinitiateDeliveryAssignmentForInvoice } = require('../utils/reinitiate-delivery-assignment');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -2451,12 +2452,25 @@ router.put('/:id', async (req, res) => {
           console.error('❌ EMPOST invoice re-issue failed (edit will continue):', empostError.message);
         }
 
-        return res.json({
+        // Re-initiate delivery assignment after COD invoice update
+        let codDeliveryAssignment = null;
+        let codDeliveryAssignmentWarning = null;
+        try {
+          const createdBy = req.user && req.user.id ? req.user.id : null;
+          const { assignment, warning } = await reinitiateDeliveryAssignmentForInvoice(populatedInvoice, { createdBy });
+          codDeliveryAssignment = assignment;
+          codDeliveryAssignmentWarning = warning || undefined;
+        } catch (e) {
+          codDeliveryAssignmentWarning = 'Delivery assignment could not be updated: ' + (e.message || 'Unknown error');
+        }
+        const codResponse = {
           success: true,
           data: transformInvoice(populatedInvoice),
-          message: 'COD invoice updated successfully'
-        });
-
+          message: 'COD invoice updated successfully',
+        };
+        if (codDeliveryAssignment !== undefined) codResponse.delivery_assignment = codDeliveryAssignment;
+        if (codDeliveryAssignmentWarning !== undefined) codResponse.delivery_assignment_warning = codDeliveryAssignmentWarning;
+        return res.json(codResponse);
       } else if (invoiceType === 'TAX') {
         // Tax Invoice Edit
         // IMPORTANT: For Tax invoices, we update delivery_charge (NOT cod_delivery_charge)
@@ -2567,11 +2581,25 @@ router.put('/:id', async (req, res) => {
           console.error('❌ EMPOST invoice re-issue failed (edit will continue):', empostError.message);
         }
 
-        return res.json({
+        // Re-initiate delivery assignment after Tax invoice update
+        let taxDeliveryAssignment = null;
+        let taxDeliveryAssignmentWarning = null;
+        try {
+          const createdBy = req.user && req.user.id ? req.user.id : null;
+          const { assignment, warning } = await reinitiateDeliveryAssignmentForInvoice(populatedInvoice, { createdBy });
+          taxDeliveryAssignment = assignment;
+          taxDeliveryAssignmentWarning = warning || undefined;
+        } catch (e) {
+          taxDeliveryAssignmentWarning = 'Delivery assignment could not be updated: ' + (e.message || 'Unknown error');
+        }
+        const taxResponse = {
           success: true,
           data: transformInvoice(populatedInvoice),
-          message: 'Tax invoice updated successfully'
-        });
+          message: 'Tax invoice updated successfully',
+        };
+        if (taxDeliveryAssignment !== undefined) taxResponse.delivery_assignment = taxDeliveryAssignment;
+        if (taxDeliveryAssignmentWarning !== undefined) taxResponse.delivery_assignment_warning = taxDeliveryAssignmentWarning;
+        return res.json(taxResponse);
       }
     }
 
@@ -2787,11 +2815,33 @@ router.put('/:id', async (req, res) => {
       console.error('Error details:', empostError.response?.data || empostError.message);
     }
 
-    res.json({
+    // Re-initiate delivery assignment after invoice update (update or create)
+    let delivery_assignment = null;
+    let delivery_assignment_warning = null;
+    try {
+      const createdBy = req.user && req.user.id ? req.user.id : null;
+      const { assignment, warning } = await reinitiateDeliveryAssignmentForInvoice(populatedInvoice, { createdBy });
+      delivery_assignment = assignment;
+      delivery_assignment_warning = warning || undefined;
+      if (assignment) {
+        console.log('✅ Delivery assignment re-initiated for invoice:', invoice.invoice_id);
+      }
+      if (warning) {
+        console.log('ℹ️ Delivery assignment:', warning);
+      }
+    } catch (reinitError) {
+      console.error('❌ Re-initiate delivery assignment failed (invoice update succeeded):', reinitError.message);
+      delivery_assignment_warning = 'Delivery assignment could not be updated: ' + (reinitError.message || 'Unknown error');
+    }
+
+    const response = {
       success: true,
       data: transformInvoice(populatedInvoice),
-      message: 'Invoice updated successfully'
-    });
+      message: 'Invoice updated successfully',
+    };
+    if (delivery_assignment !== undefined) response.delivery_assignment = delivery_assignment;
+    if (delivery_assignment_warning !== undefined) response.delivery_assignment_warning = delivery_assignment_warning;
+    res.json(response);
   } catch (error) {
     console.error('Error updating invoice:', error);
     res.status(500).json({ 
