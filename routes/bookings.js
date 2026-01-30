@@ -3342,12 +3342,12 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
     // Get identity documents - ONLY from booking collection (not InvoiceRequest)
     const bookingIdentityDocs = fullBooking.identityDocuments || {};
     
-    // Helper function to get image from multiple sources
+    // Helper function to get image from multiple sources (string base64/URL or Buffer)
     const getImage = (sources) => {
       for (const source of sources) {
-        if (source && source.trim() && source !== 'null' && source !== 'undefined') {
-          return source;
-        }
+        if (source == null || source === 'null' || source === 'undefined') continue;
+        if (Buffer.isBuffer(source)) return 'data:image/jpeg;base64,' + source.toString('base64');
+        if (typeof source === 'string' && source.trim()) return source;
       }
       return null;
     };
@@ -3417,26 +3417,48 @@ async function generateAndUploadBookingPDF(booking, invoiceRequest) {
     // Decode HTML entities to ensure proper image processing
     const tradeLicense = tradeLicenseRaw ? decodeImageField(tradeLicenseRaw) : null;
     
-    // Extract Customer Images - ONLY from booking collection
+    // Extract Customer Images - from booking root, identityDocuments, sender/receiver, and invoiceRequest
+    const senderObj = fullBooking.sender || {};
+    const receiverObj = fullBooking.receiver || {};
     const customerImageRaw = getImage([
       fullBooking.customerImage,
-      fullBooking.customer_image
+      fullBooking.customer_image,
+      bookingIdentityDocs.customerImage,
+      bookingIdentityDocs.customer_image,
+      senderObj.customerImage,
+      senderObj.customer_image,
+      receiverObj.customerImage,
+      receiverObj.customer_image,
+      invoiceRequest.customerImage,
+      invoiceRequest.customer_image
     ]);
     // Decode HTML entities to ensure proper image processing
     const customerImage = customerImageRaw ? decodeImageField(customerImageRaw) : null;
     
+    // Normalize array image entry (string -> decode entities; Buffer -> base64 data URL)
+    const normalizeImageEntry = (img) =>
+      typeof img === 'string' ? decodeImageField(img) : (Buffer.isBuffer(img) ? 'data:image/jpeg;base64,' + img.toString('base64') : img);
+    const validImage = (img) => img != null && (typeof img !== 'string' || img.trim());
+
     const customerImages = (() => {
       // Check booking customerImages array
       if (fullBooking.customerImages && Array.isArray(fullBooking.customerImages) && fullBooking.customerImages.length > 0) {
-        return fullBooking.customerImages
-          .filter(img => img && img.trim())
-          .map(img => decodeImageField(img)); // Decode each image
+        return fullBooking.customerImages.filter(validImage).map(normalizeImageEntry);
       }
       // Check booking customer_images array
       if (fullBooking.customer_images && Array.isArray(fullBooking.customer_images) && fullBooking.customer_images.length > 0) {
-        return fullBooking.customer_images
-          .filter(img => img && img.trim())
-          .map(img => decodeImageField(img)); // Decode each image
+        return fullBooking.customer_images.filter(validImage).map(normalizeImageEntry);
+      }
+      // Check identityDocuments.customerImages
+      if (bookingIdentityDocs.customerImages && Array.isArray(bookingIdentityDocs.customerImages) && bookingIdentityDocs.customerImages.length > 0) {
+        return bookingIdentityDocs.customerImages.filter(validImage).map(normalizeImageEntry);
+      }
+      // Check invoiceRequest.customerImages / customer_images
+      if (invoiceRequest.customerImages && Array.isArray(invoiceRequest.customerImages) && invoiceRequest.customerImages.length > 0) {
+        return invoiceRequest.customerImages.filter(validImage).map(normalizeImageEntry);
+      }
+      if (invoiceRequest.customer_images && Array.isArray(invoiceRequest.customer_images) && invoiceRequest.customer_images.length > 0) {
+        return invoiceRequest.customer_images.filter(validImage).map(normalizeImageEntry);
       }
       // Fall back to single customerImage
       if (customerImage) {

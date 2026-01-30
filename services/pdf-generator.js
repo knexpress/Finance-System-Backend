@@ -89,7 +89,11 @@ async function generateBookingPDF(data) {
   // Helper function to add image to PDF (Node.js version)
   const addImageToPDF = async (imageData, x, y, width, maxHeight) => {
     try {
-      if (!imageData || imageData.trim() === '') {
+      // Normalize Buffer to base64 data URL
+      if (Buffer.isBuffer(imageData)) {
+        imageData = 'data:image/jpeg;base64,' + imageData.toString('base64');
+      }
+      if (!imageData || (typeof imageData === 'string' && imageData.trim() === '')) {
         console.warn('Image data is empty or undefined');
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(8);
@@ -264,28 +268,23 @@ async function generateBookingPDF(data) {
   doc.text(data.sender.agentName || '', leftColumnX, yPos);
   yPos += 8;
 
-  // Delivery Options
+  // Delivery Options (show only the option the customer selected)
+  doc.setFont('helvetica', 'bold');
   doc.setFontSize(7);
+  doc.text('DELIVERY OPTION', leftColumnX, yPos);
+  yPos += 5;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
   if (isPhToUae) {
     const isDropOffToWarehouse = data.sender.deliveryOption === 'warehouse';
     const isSchedulePickup = data.sender.deliveryOption === 'pickup';
-    
-    doc.text(isDropOffToWarehouse ? '☑' : '☐', leftColumnX, yPos);
-    doc.text('DROP OFF TO WAREHOUSE', leftColumnX + 5, yPos);
-    yPos += 4;
-    
-    doc.text(isSchedulePickup ? '☑' : '☐', leftColumnX, yPos);
-    doc.text('SCHEDULE A PICKUP', leftColumnX + 5, yPos);
+    const senderOption = isDropOffToWarehouse ? 'DROP OFF TO WAREHOUSE' : (isSchedulePickup ? 'SCHEDULE A PICKUP' : 'DROP OFF TO WAREHOUSE');
+    doc.text(senderOption, leftColumnX, yPos);
   } else {
-    const isWarehousePickup = data.sender.deliveryOption === 'warehouse' || data.sender.deliveryOption === 'pickup';
-    const isDeliverToAddress = data.receiver.deliveryOption === 'address';
-    
-    doc.text(isWarehousePickup ? '☑' : '☐', leftColumnX, yPos);
-    doc.text('UAE WAREHOUSE PICK-UP', leftColumnX + 5, yPos);
-    yPos += 4;
-    
-    doc.text(isDeliverToAddress ? '☑' : '☐', leftColumnX, yPos);
-    doc.text('DELIVER TO UAE ADDRESS', leftColumnX + 5, yPos);
+    // UAE TO PH: Sender (UAE) - only the selected option
+    const senderPickup = (data.sender.deliveryOption || '').toLowerCase() === 'pickup';
+    const senderOption = senderPickup ? 'PICK-UP FROM CUSTOMER ADDRESS' : 'DROP-OFF AT UAE WAREHOUSE';
+    doc.text(senderOption, leftColumnX, yPos);
   }
   yPos += 8;
 
@@ -355,6 +354,27 @@ async function generateBookingPDF(data) {
   doc.setFontSize(9);
   doc.text((data.receiver.numberOfBoxes || '').toString(), rightColumnX, yPos);
   yPos += 8;
+
+  // Receiver delivery option (UAE TO PH: show only the option the customer selected)
+  if (!isPhToUae) {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7);
+    doc.text('DELIVERY OPTION', rightColumnX, yPos);
+    yPos += 5;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    const receiverPickup = (data.receiver.deliveryOption || '').toLowerCase() === 'pickup';
+    const phWarehouseAddress = '81 Dr Arcadio Santos Ave, Parañaque, 1700 Metro Manila, Philippines';
+    const receiverOption = receiverPickup
+      ? 'PICK-UP FROM PHILIPPINES WAREHOUSE Paranaque Address: ' + phWarehouseAddress
+      : 'DROP-OFF AT CUSTOMER\'S PHILIPPINES ADDRESS';
+    const receiverOptionLines = doc.splitTextToSize(receiverOption, columnWidth - 2);
+    receiverOptionLines.forEach((line) => {
+      doc.text(line, rightColumnX, yPos);
+      yPos += 4;
+    });
+    yPos += 4;
+  }
 
   const maxY = Math.max(yPos, startY + 80);
   yPos = maxY + 5;
