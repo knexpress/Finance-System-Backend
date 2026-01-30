@@ -3237,6 +3237,14 @@ router.put('/:id/status', validateObjectIdParam('id'), async (req, res) => {
 
     await booking.save();
 
+    // When status is set to 'reviewed', generate PDF and upload to Drive (same as review flow)
+    if (review_status === 'reviewed') {
+      const invoiceRequest = await InvoiceRequest.findOne({ booking_id: id }).lean();
+      generateAndUploadBookingPDF(booking, invoiceRequest || {}).catch(err => {
+        console.error('❌ Background PDF upload failed after status update:', err.message);
+      });
+    }
+
     res.json({
       success: true,
       booking: booking.toObject ? booking.toObject() : booking, // Ensure all fields are included
@@ -3312,6 +3320,7 @@ router.put('/:id/shipment-status-history', validateObjectIdParam('id'), async (r
  * This runs in background and doesn't block the review response
  */
 async function generateAndUploadBookingPDF(booking, invoiceRequest) {
+  invoiceRequest = invoiceRequest || {};
   try {
     console.log(`📄 Starting PDF generation for booking: ${booking._id}`);
     

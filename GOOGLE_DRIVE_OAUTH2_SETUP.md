@@ -21,7 +21,9 @@ OAuth 2.0 is the recommended authentication method for Google Drive uploads, esp
 6. Back in Credentials, create OAuth client ID:
    - Application type: **Web application**
    - Name: `KNEX Drive Uploader` (or any name)
-   - Authorized redirect URIs: `http://localhost:3000/oauth2callback`
+   - Authorized redirect URIs: add **both**:
+     - `http://localhost:3000/oauth2callback` (for scripts / local app)
+     - `https://developers.google.com/oauthplayground` (for getting a refresh token in the Playground)
    - Click **Create**
 7. **Copy the Client ID and Client Secret** (you'll need these)
 
@@ -30,6 +32,15 @@ OAuth 2.0 is the recommended authentication method for Google Drive uploads, esp
 You need to generate a refresh token that allows the application to access Google Drive on your behalf.
 
 #### Option A: Using the OAuth 2.0 Playground (Easiest)
+
+**Important:** When using the Playground with your own credentials, you must add the Playground’s redirect URI to your OAuth client, or you’ll get `redirect_uri_mismatch`:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/) → **APIs & Services** → **Credentials** → open your **OAuth 2.0 Client ID** (Web application).
+2. Under **Authorized redirect URIs**, click **+ ADD URI** and add exactly:
+   - `https://developers.google.com/oauthplayground`
+3. Click **Save**.
+
+Then in the Playground:
 
 1. Go to [OAuth 2.0 Playground](https://developers.google.com/oauthplayground/)
 2. Click the gear icon (⚙️) in the top right
