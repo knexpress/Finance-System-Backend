@@ -1271,7 +1271,8 @@ router.put('/:id', async (req, res) => {
         trackingNumber,
         status: statusToUpdate,
         additionalData: {
-          deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+          deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined,
+          invoiceRequest
         }
       });
     }
@@ -1411,7 +1412,8 @@ router.put('/:id/status', async (req, res) => {
         trackingNumber,
         status: statusToUpdate,
         additionalData: {
-          deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined
+          deliveryDate: statusToUpdate === 'DELIVERED' ? new Date() : undefined,
+          invoiceRequest
         }
       });
     }
@@ -1464,7 +1466,8 @@ router.put('/:id/delivery-status', async (req, res) => {
         status: delivery_status,
         additionalData: {
           deliveryDate: delivery_status === 'DELIVERED' ? new Date() : undefined,
-          notes: notes
+          notes: notes,
+          invoiceRequest
         }
       });
     }

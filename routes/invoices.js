@@ -2,9 +2,38 @@ const express = require('express');
 const router = express.Router();
 const { ShipmentRequest } = require('../models/unified-schema');
 const auth = require('../middleware/auth');
+const {
+  syncStatusToEMPost,
+  getTrackingNumberFromShipmentRequest,
+  mapInvoiceStatusToDeliveryStatus,
+} = require('../utils/empost-status-sync');
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
+
+async function syncInvoiceUpdateToEMPOST(shipmentRequest) {
+  const trackingNumber = getTrackingNumberFromShipmentRequest(shipmentRequest);
+  if (!trackingNumber) {
+    return;
+  }
+
+  const deliveryStatus =
+    mapInvoiceStatusToDeliveryStatus(shipmentRequest?.status?.invoice_status) ||
+    (shipmentRequest?.status?.payment_status === 'PAID' ? 'DELIVERED' : null);
+
+  if (!deliveryStatus) {
+    return;
+  }
+
+  await syncStatusToEMPost({
+    trackingNumber,
+    status: deliveryStatus,
+    additionalData: {
+      notes: `Invoice update sync (${shipmentRequest?.status?.invoice_status || 'N/A'})`,
+    },
+    silent: false,
+  });
+}
 
 // Get all invoices (from shipment requests with generated invoices) with pagination
 router.get('/', auth, async (req, res) => {
@@ -212,6 +241,12 @@ router.put('/:id', auth, async (req, res) => {
     }
     
     await shipmentRequest.save();
+
+    try {
+      await syncInvoiceUpdateToEMPOST(shipmentRequest);
+    } catch (syncError) {
+      console.error('⚠️ EMPOST sync failed after invoice update (non-critical):', syncError.message);
+    }
     
     res.json({
       success: true,

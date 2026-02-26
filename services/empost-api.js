@@ -251,36 +251,17 @@ class EMpostAPIService {
       // Map status to EMPOST delivery status format
       const empostStatus = this.mapDeliveryStatus(status);
       
-      // Build update payload
-      const updateData = {
-        trackingNumber: trackingNumber,
-        deliveryStatus: empostStatus,
-        ...(additionalData.deliveryDate && { deliveryDate: new Date(additionalData.deliveryDate).toISOString() }),
-        ...(additionalData.deliveryAttempts !== undefined && { deliveryAttempts: additionalData.deliveryAttempts }),
-        ...(additionalData.notes && { notes: additionalData.notes })
-      };
+      // EPGL update flow uses the create endpoint with full shipment payload.
+      // For updates, include uhawb if available.
+      const updateData = this.buildShipmentUpdatePayload(trackingNumber, empostStatus, additionalData);
       
       const updateShipment = async () => {
-        // Try PUT endpoint first (update existing shipment)
-        try {
-          const response = await this.apiClient.put(
-            `/api/v1/shipment/update`,
-            updateData,
-            { headers }
-          );
-          return response.data;
-        } catch (putError) {
-          // If PUT doesn't work, try PATCH
-          if (putError.response?.status === 404 || putError.response?.status === 405) {
-            const patchResponse = await this.apiClient.patch(
-              `/api/v1/shipment/${trackingNumber}`,
-              updateData,
-              { headers }
-            );
-            return patchResponse.data;
-          }
-          throw putError;
-        }
+        const response = await this.apiClient.post(
+          '/api/v1/shipment/create',
+          updateData,
+          { headers }
+        );
+        return response.data;
       };
       
       const result = await this.retryWithBackoff(updateShipment, 3, 1000);
@@ -291,6 +272,150 @@ class EMpostAPIService {
       console.error('❌ Failed to update shipment status in EMPOST:', error.response?.data || error.message);
       throw error;
     }
+  }
+
+  /**
+   * Build shipment payload for status updates using EPGL create endpoint format.
+   * @param {string} trackingNumber
+   * @param {string} empostStatus
+   * @param {Object} additionalData
+   * @returns {Object}
+   */
+  buildShipmentUpdatePayload(trackingNumber, empostStatus, additionalData = {}) {
+    const fallbackPayload = {
+      trackingNumber,
+      uhawb: '',
+      sender: {
+        name: 'N/A',
+        email: 'noreply@company.com',
+        phone: '+971500000000',
+        countryCode: 'AE',
+        state: '',
+        postCode: '',
+        city: 'Dubai',
+        line1: 'N/A',
+        line2: '',
+        line3: '',
+      },
+      receiver: {
+        name: 'N/A',
+        email: '',
+        phone: '+971500000000',
+        countryCode: 'AE',
+        state: '',
+        postCode: '',
+        city: 'Dubai',
+        line1: 'N/A',
+        line2: '',
+        line3: '',
+      },
+      details: {
+        weight: { unit: 'KG', value: 0.1 },
+        declaredWeight: { unit: 'KG', value: 0.1 },
+        deliveryCharges: { currencyCode: 'AED', amount: 0 },
+        numberOfPieces: 1,
+        pickupDate: new Date().toISOString(),
+        deliveryStatus: empostStatus,
+        deliveryAttempts: 0,
+        shippingType: 'DOM',
+        productCategory: 'General',
+        productType: 'Parcel',
+        descriptionOfGoods: 'General Goods',
+        dimensions: {
+          length: 10,
+          width: 10,
+          height: 10,
+          unit: 'CM',
+        },
+      },
+      items: [{
+        description: 'General Goods',
+        countryOfOrigin: 'AE',
+        quantity: 1,
+        hsCode: '8504.40',
+        weight: { unit: 'KG', value: 0.1 },
+        dimensions: {
+          length: 10,
+          width: 10,
+          height: 10,
+          unit: 'CM',
+        },
+      }],
+    };
+
+    let sourcePayload = null;
+    try {
+      if (additionalData.shipmentData && typeof additionalData.shipmentData === 'object') {
+        sourcePayload = additionalData.shipmentData;
+      } else if (additionalData.invoice && typeof additionalData.invoice === 'object') {
+        sourcePayload = this.mapInvoiceToShipment(additionalData.invoice);
+      } else if (additionalData.invoiceRequest && typeof additionalData.invoiceRequest === 'object') {
+        sourcePayload = this.mapInvoiceRequestToShipment(additionalData.invoiceRequest);
+      }
+    } catch (mapError) {
+      console.warn('⚠️ Failed to map full shipment payload for update, using fallback payload:', mapError.message);
+    }
+
+    const payload = {
+      ...fallbackPayload,
+      ...(sourcePayload || {}),
+      sender: {
+        ...fallbackPayload.sender,
+        ...(sourcePayload?.sender || {}),
+      },
+      receiver: {
+        ...fallbackPayload.receiver,
+        ...(sourcePayload?.receiver || {}),
+      },
+      details: {
+        ...fallbackPayload.details,
+        ...(sourcePayload?.details || {}),
+        weight: {
+          ...fallbackPayload.details.weight,
+          ...(sourcePayload?.details?.weight || {}),
+        },
+        declaredWeight: {
+          ...fallbackPayload.details.declaredWeight,
+          ...(sourcePayload?.details?.declaredWeight || {}),
+        },
+        deliveryCharges: {
+          ...fallbackPayload.details.deliveryCharges,
+          ...(sourcePayload?.details?.deliveryCharges || {}),
+        },
+        dimensions: {
+          ...fallbackPayload.details.dimensions,
+          ...(sourcePayload?.details?.dimensions || {}),
+        },
+      },
+      items: Array.isArray(sourcePayload?.items) && sourcePayload.items.length > 0
+        ? sourcePayload.items
+        : fallbackPayload.items,
+    };
+
+    const looksLikeUhawb = typeof trackingNumber === 'string' && /^AE[A-Z0-9]+$/i.test(trackingNumber);
+    const resolvedUhawb =
+      additionalData.uhawb ||
+      additionalData.empost_uhawb ||
+      additionalData.empostUhawb ||
+      payload.uhawb ||
+      (looksLikeUhawb ? trackingNumber : '') ||
+      '';
+
+    payload.trackingNumber = trackingNumber || payload.trackingNumber;
+    payload.uhawb = resolvedUhawb;
+    payload.details.deliveryStatus = empostStatus;
+
+    if (additionalData.deliveryDate) {
+      payload.details.deliveryDate = new Date(additionalData.deliveryDate).toISOString();
+    }
+    if (additionalData.deliveryAttempts !== undefined) {
+      payload.details.deliveryAttempts = additionalData.deliveryAttempts;
+    }
+    if (additionalData.notes) {
+      payload.details.notes = additionalData.notes;
+    }
+
+    return payload;
   }
 
   /**

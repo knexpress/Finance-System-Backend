@@ -53,9 +53,9 @@ async function syncStatusToEMPost({ trackingNumber, status, additionalData = {},
  * @returns {string|null} - Tracking number or null
  */
 function getTrackingNumberFromInvoiceRequest(invoiceRequest) {
-  return invoiceRequest.tracking_code || 
+  return invoiceRequest.empost_uhawb ||
+         invoiceRequest.tracking_code || 
          invoiceRequest.invoice_number || 
-         invoiceRequest.empost_uhawb || 
          invoiceRequest.awb_number || 
          null;
 }
@@ -66,9 +66,9 @@ function getTrackingNumberFromInvoiceRequest(invoiceRequest) {
  * @returns {string|null} - Tracking number or null
  */
 function getTrackingNumberFromInvoice(invoice) {
-  return invoice.awb_number || 
+  return invoice.empost_uhawb ||
+         invoice.awb_number || 
          invoice.invoice_id || 
-         invoice.empost_uhawb || 
          (invoice.request_id && invoice.request_id.tracking_code) ||
          null;
 }
@@ -79,9 +79,11 @@ function getTrackingNumberFromInvoice(invoice) {
  * @returns {string|null} - Tracking number or null
  */
 function getTrackingNumberFromShipmentRequest(shipmentRequest) {
-  return shipmentRequest.awb_number || 
+  return shipmentRequest.empost_uhawb ||
+         shipmentRequest.awb_number || 
          shipmentRequest.tracking_code || 
-         shipmentRequest.empost_uhawb || 
+         shipmentRequest?.operational?.tracking_number ||
+         shipmentRequest.request_id ||
          null;
 }
 
