@@ -2426,13 +2426,12 @@ function mergeBookingData(invoiceRequest, booking = null) {
     });
   }
   
-  // Ensure identityDocuments is properly structured (PRIMARY SOURCE)
-  if (invoiceRequest && invoiceRequest.identityDocuments) {
-    merged.identityDocuments = transformIdentityDocuments(invoiceRequest.identityDocuments);
-  } else if (bookingData && bookingData.identityDocuments) {
+  // Identity documents source of truth is Booking only.
+  // InvoiceRequest identityDocuments is intentionally ignored.
+  if (bookingData && bookingData.identityDocuments) {
     merged.identityDocuments = transformIdentityDocuments(bookingData.identityDocuments);
   } else {
-    merged.identityDocuments = merged.identityDocuments || {};
+    merged.identityDocuments = {};
   }
   
   // Ensure customerImage and customerImages are included
@@ -2923,25 +2922,6 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
     // Calculate number of boxes
     const numberOfBoxes = booking.number_of_boxes || verificationBoxes.length || items.length || 1;
     
-    // Extract identity documents METADATA ONLY (NO base64 images)
-    // Images are stored ONLY in Booking collection and fetched from there for PDF generation
-    // This prevents MongoDB 16MB document size limit issues
-    const bookingIdentityDocs = booking.identityDocuments || {};
-    const identityDocuments = {
-      // Store ONLY metadata fields (not base64 images)
-      eidFrontImageFirstName: bookingIdentityDocs.eidFrontImageFirstName || booking.eidFrontImageFirstName || null,
-      eidFrontImageLastName: bookingIdentityDocs.eidFrontImageLastName || booking.eidFrontImageLastName || null,
-      // DO NOT include base64 image fields: eidFrontImage, eidBackImage, philippinesIdFront, philippinesIdBack
-      // Images are fetched from Booking collection when needed for PDF generation
-    };
-    
-    // Remove null/undefined/empty values
-    Object.keys(identityDocuments).forEach(key => {
-      if (identityDocuments[key] === null || identityDocuments[key] === undefined || identityDocuments[key] === '') {
-        delete identityDocuments[key];
-      }
-    });
-
     // Capture booking snapshot for audit/debug (exclude large image fields to avoid MongoDB 16MB limit)
     // First get the snapshot, then clean it
     const bookingSnapshotTemp = booking.toObject ? booking.toObject() : { ...booking };
@@ -3074,11 +3054,6 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
       receiver_address: receiver.completeAddress || receiver.addressLine1 || receiver.address || booking.receiver_address || booking.receiverAddress || destinationPlace, // Use detailed address if available, fallback to destinationPlace
       receiver_phone: receiver.contactNo || receiver.phoneNumber || receiver.phone || booking.receiver_phone || booking.receiverPhone || '',
       receiver_company: receiver.company || booking.receiver_company || '',
-      
-      // Identity documents METADATA ONLY (NO base64 images)
-      // Images are stored ONLY in Booking collection and fetched from there for PDF generation
-      // This prevents MongoDB 16MB document size limit issues
-      identityDocuments: Object.keys(identityDocuments).length > 0 ? identityDocuments : {},
       
       // DO NOT store customer images in InvoiceRequest (they're in Booking collection)
       // Images are fetched from Booking collection when needed for PDF generation

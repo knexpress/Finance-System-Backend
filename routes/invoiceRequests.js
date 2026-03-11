@@ -6,6 +6,7 @@ const { createNotificationsForAllUsers, createNotificationsForDepartment } = req
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { generateUniqueAWBNumber, generateUniqueInvoiceID } = require('../utils/id-generators');
 const { sanitizeRegex } = require('../middleware/security');
+const { cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest } = require('../utils/booking-identity-cleanup');
 
 const router = express.Router();
 
@@ -76,6 +77,9 @@ const normalizeInvoiceRequest = (request) => {
   // Exclude identityDocuments from API responses
   if (obj.identityDocuments !== undefined) {
     delete obj.identityDocuments;
+  }
+  if (obj.booking_snapshot && typeof obj.booking_snapshot === 'object' && obj.booking_snapshot.identityDocuments !== undefined) {
+    delete obj.booking_snapshot.identityDocuments;
   }
 
   return obj;
@@ -1207,6 +1211,10 @@ router.put('/:id', async (req, res) => {
 
     await invoiceRequest.save();
 
+    if (updateData.delivery_status === 'DELIVERED' && oldDeliveryStatus !== 'DELIVERED') {
+      await cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest(invoiceRequest);
+    }
+
     // Auto-update booking's shipment_status_history when invoice request status changes
     // Statuses that trigger shipment_status_history update
     const statusesToUpdate = ['SUBMITTED', 'IN_PROGRESS', 'VERIFIED', 'COMPLETED'];
@@ -1349,6 +1357,10 @@ router.put('/:id/status', async (req, res) => {
     }
 
     await invoiceRequest.save();
+
+    if (delivery_status === 'DELIVERED' && oldDeliveryStatus !== 'DELIVERED') {
+      await cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest(invoiceRequest);
+    }
 
     // Auto-update booking's shipment_status_history when invoice request status changes
     // Statuses that trigger shipment_status_history update

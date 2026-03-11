@@ -805,6 +805,56 @@ const invoiceRequestSchema = new mongoose.Schema({
   timestamps: true,
 });
 
+function stripBookingSnapshotIdentityDocuments(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  if (payload.identityDocuments !== undefined) {
+    delete payload.identityDocuments;
+  }
+  if (
+    payload.booking_snapshot &&
+    typeof payload.booking_snapshot === 'object' &&
+    payload.booking_snapshot.identityDocuments !== undefined
+  ) {
+    delete payload.booking_snapshot.identityDocuments;
+  }
+}
+
+invoiceRequestSchema.pre('save', function stripOnSave(next) {
+  stripBookingSnapshotIdentityDocuments(this);
+  next();
+});
+
+invoiceRequestSchema.pre(['updateOne', 'updateMany', 'findOneAndUpdate'], function stripOnUpdate(next) {
+  const update = this.getUpdate() || {};
+
+  // Replacement-style updates
+  stripBookingSnapshotIdentityDocuments(update);
+
+  if (update.$set && typeof update.$set === 'object') {
+    stripBookingSnapshotIdentityDocuments(update.$set);
+    delete update.$set.identityDocuments;
+    delete update.$set['booking_snapshot.identityDocuments'];
+  }
+  if (update.$setOnInsert && typeof update.$setOnInsert === 'object') {
+    stripBookingSnapshotIdentityDocuments(update.$setOnInsert);
+    delete update.$setOnInsert.identityDocuments;
+    delete update.$setOnInsert['booking_snapshot.identityDocuments'];
+  }
+  if (update.$unset && typeof update.$unset === 'object') {
+    update.$unset.identityDocuments = 1;
+    update.$unset['booking_snapshot.identityDocuments'] = 1;
+  } else {
+    update.$unset = {
+      ...(update.$unset || {}),
+      identityDocuments: 1,
+      'booking_snapshot.identityDocuments': 1,
+    };
+  }
+
+  this.setUpdate(update);
+  next();
+});
+
 invoiceRequestSchema.index({ status: 1 });
 invoiceRequestSchema.index({ created_by_employee_id: 1 });
 invoiceRequestSchema.index({ assigned_to_employee_id: 1 });

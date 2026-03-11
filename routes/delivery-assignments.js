@@ -4,6 +4,7 @@ const auth = require('../middleware/auth');
 const { DeliveryAssignment, Driver, ShipmentRequest, Invoice, Client } = require('../models/unified-schema');
 const crypto = require('crypto');
 const empostService = require('../services/empost-api');
+const { cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest } = require('../utils/booking-identity-cleanup');
 
 const normalizeAssignmentStatus = (status) => {
   if (status === 'DELIVERED') return 'DELIVERED';
@@ -565,6 +566,10 @@ router.put('/:id', auth, async (req, res) => {
           invoiceRequest.delivery_status = 'DELIVERED';
           await invoiceRequest.save();
           console.log('✅ Invoice request delivery_status updated to DELIVERED');
+
+          if (oldDeliveryStatus !== 'DELIVERED') {
+            await cleanupBookingIdentityDocumentsForDeliveredInvoiceRequest(invoiceRequest);
+          }
           
           // Check if invoice request should be marked as COMPLETED
           // (e.g., if invoice is generated, payment collected, and now delivered)
