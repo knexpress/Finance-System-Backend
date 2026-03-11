@@ -5,6 +5,10 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { sanitizeRequest, validateRequestSize, limitQueryComplexity } = require('./middleware/security');
+const {
+  storeBackendError,
+  attachConsoleErrorCapture,
+} = require('./utils/error-monitoring');
 
 // Import unified routes
 const authRoutes = require('./routes/auth');
@@ -12,9 +16,11 @@ const unifiedShipmentRoutes = require('./routes/unified-shipment-requests');
 const { router: notificationRoutes } = require('./routes/notifications');
 const performanceRoutes = require('./routes/performance');
 const activityRoutes = require('./routes/activity');
+const errorMonitoringRoutes = require('./routes/errors');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+attachConsoleErrorCapture();
 
 // Security middleware - Enhanced Helmet configuration
 // Note: CSP is disabled for API backend - frontend should handle its own CSP
@@ -173,6 +179,7 @@ app.use('/api/performance', performanceRoutes);
 
 // Activity tracking routes
 app.use('/api/activity', activityRoutes);
+app.use('/api/errors', errorMonitoringRoutes);
 
 // ========================================
 // ERROR HANDLING
@@ -196,6 +203,14 @@ app.use('*', (req, res) => {
 // Global error handler - Don't leak sensitive information
 app.use((error, req, res, next) => {
   const isDevelopment = process.env.NODE_ENV === 'development';
+  void storeBackendError({
+    message: error?.message || 'Unknown server error',
+    stackTrace: error?.stack || '',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'runtime',
+    source: 'api',
+  });
   
   console.error('Global error handler:', {
     message: error.message,
@@ -256,6 +271,30 @@ app.use((error, req, res, next) => {
     success: false,
     error: 'Internal Server Error',
     message: isDevelopment ? error.message : 'Something went wrong. Please try again later.'
+  });
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  const stackTrace = reason instanceof Error ? reason.stack || '' : '';
+  void storeBackendError({
+    message,
+    stackTrace,
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'runtime',
+    source: 'worker',
+  });
+});
+
+process.on('uncaughtException', (error) => {
+  void storeBackendError({
+    message: error?.message || 'Uncaught exception',
+    stackTrace: error?.stack || '',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'script',
+    source: 'worker',
   });
 });
 

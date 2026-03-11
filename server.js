@@ -8,6 +8,10 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { sanitizeRequest, validateRequestSize, limitQueryComplexity } = require('./middleware/security');
 const { initializeWebSocketServer } = require('./services/websocket-server');
+const {
+  storeBackendError,
+  attachConsoleErrorCapture,
+} = require('./utils/error-monitoring');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -37,9 +41,11 @@ const csvUploadRoutes = require('./routes/csv-upload');
 const bookingsRoutes = require('./routes/bookings');
 const chatRoutes = require('./routes/chat');
 const activityRoutes = require('./routes/activity');
+const errorMonitoringRoutes = require('./routes/errors');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+attachConsoleErrorCapture();
 
 // Security middleware - Enhanced Helmet configuration
 // Note: CSP is disabled for API backend - frontend should handle its own CSP
@@ -226,6 +232,7 @@ app.use('/uploads/chat', express.static(path.join(__dirname, 'uploads/chat')));
 
 // Activity tracking routes
 app.use('/api/activity', activityRoutes);
+app.use('/api/errors', errorMonitoringRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -238,6 +245,16 @@ app.get('/api/health', (req, res) => {
 
 // Error handling middleware - Don't leak sensitive information
 app.use((err, req, res, next) => {
+  const stackTrace = err && err.stack ? err.stack : '';
+  void storeBackendError({
+    message: err?.message || 'Unknown server error',
+    stackTrace,
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'runtime',
+    source: 'api',
+  });
+
   console.error('Error:', {
     message: err.message,
     stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
@@ -279,6 +296,30 @@ app.use((err, req, res, next) => {
     success: false,
     error: 'Internal server error',
     message: isDevelopment ? err.message : 'Something went wrong. Please try again later.'
+  });
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  const stackTrace = reason instanceof Error ? reason.stack || '' : '';
+  void storeBackendError({
+    message,
+    stackTrace,
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'runtime',
+    source: 'worker',
+  });
+});
+
+process.on('uncaughtException', (error) => {
+  void storeBackendError({
+    message: error?.message || 'Uncaught exception',
+    stackTrace: error?.stack || '',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    errorType: 'script',
+    source: 'worker',
   });
 });
 
