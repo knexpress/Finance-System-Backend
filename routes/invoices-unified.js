@@ -1783,7 +1783,8 @@ router.put('/:id/status', async (req, res) => {
         trackingNumber,
         status: deliveryStatus,
         additionalData: {
-          deliveryDate: deliveryStatus === 'DELIVERED' ? new Date() : undefined
+          deliveryDate: deliveryStatus === 'DELIVERED' ? new Date() : undefined,
+          invoice,
         }
       });
     }
@@ -1859,7 +1860,8 @@ router.patch('/:id/remit', async (req, res) => {
       trackingNumber,
       status: 'DELIVERED',
       additionalData: {
-        deliveryDate: new Date()
+        deliveryDate: new Date(),
+        invoice,
       }
     });
 
@@ -3054,9 +3056,7 @@ router.post('/:invoiceId/cancel', validateObjectIdParam('invoiceId'), async (req
     // Step 6: Update EMPOST (if was COMPLETED OR invoice_request exists)
     if (shouldUpdateEmpost) {
       try {
-        const trackingNumber = invoice.empost_uhawb && invoice.empost_uhawb !== 'N/A' 
-          ? invoice.empost_uhawb 
-          : invoice.awb_number || invoice.invoice_id;
+        const trackingNumber = invoice.awb_number || invoice.invoice_id;
         
         if (trackingNumber) {
           await empostAPI.updateShipmentStatus(
@@ -3064,7 +3064,9 @@ router.post('/:invoiceId/cancel', validateObjectIdParam('invoiceId'), async (req
             'CANCELLED',
             { 
               notes: reason || 'Invoice cancelled',
-              cancellation_reason: reason || null
+              cancellation_reason: reason || null,
+              empost_uhawb: invoice.empost_uhawb || null,
+              invoice,
             }
           );
           empostUpdated = true;

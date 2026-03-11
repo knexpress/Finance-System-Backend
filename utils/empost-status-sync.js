@@ -6,7 +6,7 @@ const { isEmpostDisabled } = require('./empost-disabled-check');
  * This function is called whenever a shipment status changes
  * 
  * @param {Object} options - Sync options
- * @param {string} options.trackingNumber - Tracking number (AWB, tracking_code, invoice_number, or empost_uhawb)
+ * @param {string} options.trackingNumber - Tracking number (AWB/tracking_code/invoice_number, not UHAWB)
  * @param {string} options.status - New status to sync
  * @param {Object} options.additionalData - Additional data (deliveryDate, notes, etc.)
  * @param {boolean} options.silent - If true, errors won't be logged (default: false)
@@ -29,11 +29,24 @@ async function syncStatusToEMPost({ trackingNumber, status, additionalData = {},
   }
 
   try {
+    // Ensure UHAWB travels separately from trackingNumber for EMPOST create/update flow.
+    const mergedAdditionalData = {
+      ...additionalData,
+      empost_uhawb:
+        additionalData.empost_uhawb ||
+        additionalData.uhawb ||
+        additionalData.invoiceRequest?.empost_uhawb ||
+        additionalData.invoice?.empost_uhawb ||
+        additionalData.shipmentRequest?.empost_uhawb ||
+        additionalData.request?.empost_uhawb ||
+        null,
+    };
+
     if (!silent) {
       console.log(`🔄 Syncing status to EMPOST: ${trackingNumber} -> ${status}`);
     }
 
-    await empostAPI.updateShipmentStatus(trackingNumber, status, additionalData);
+    await empostAPI.updateShipmentStatus(trackingNumber, status, mergedAdditionalData);
 
     if (!silent) {
       console.log('✅ EMPOST status synced successfully');
@@ -53,10 +66,9 @@ async function syncStatusToEMPost({ trackingNumber, status, additionalData = {},
  * @returns {string|null} - Tracking number or null
  */
 function getTrackingNumberFromInvoiceRequest(invoiceRequest) {
-  return invoiceRequest.empost_uhawb ||
-         invoiceRequest.tracking_code || 
+  return invoiceRequest.tracking_code ||
+         invoiceRequest.awb_number ||
          invoiceRequest.invoice_number || 
-         invoiceRequest.awb_number || 
          null;
 }
 
@@ -66,10 +78,9 @@ function getTrackingNumberFromInvoiceRequest(invoiceRequest) {
  * @returns {string|null} - Tracking number or null
  */
 function getTrackingNumberFromInvoice(invoice) {
-  return invoice.empost_uhawb ||
-         invoice.awb_number || 
-         invoice.invoice_id || 
+  return invoice.awb_number || 
          (invoice.request_id && invoice.request_id.tracking_code) ||
+         invoice.invoice_id || 
          null;
 }
 
@@ -79,8 +90,7 @@ function getTrackingNumberFromInvoice(invoice) {
  * @returns {string|null} - Tracking number or null
  */
 function getTrackingNumberFromShipmentRequest(shipmentRequest) {
-  return shipmentRequest.empost_uhawb ||
-         shipmentRequest.awb_number || 
+  return shipmentRequest.awb_number || 
          shipmentRequest.tracking_code || 
          shipmentRequest?.operational?.tracking_number ||
          shipmentRequest.request_id ||

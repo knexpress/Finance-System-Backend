@@ -81,6 +81,11 @@ const normalizeInvoiceRequest = (request) => {
   return obj;
 };
 
+function isOperationsEmpostCreateStage(status) {
+  const normalized = (status || '').toString().trim().toUpperCase();
+  return normalized === 'IN_PROGRESS' || normalized === 'VERIFIED';
+}
+
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 
@@ -1887,9 +1892,10 @@ router.put('/:id/verification', async (req, res) => {
     
     await invoiceRequest.save();
 
-    // Create EMPOST shipment when verification is updated (only shipment, NOT invoice)
-    // Only create if UHAWB doesn't already exist (avoid duplicates)
-    if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
+    // Create EMPOST shipment during operations flow only (IN_PROGRESS/VERIFIED)
+    // and only if UHAWB doesn't already exist.
+    const isEligibleOperationsStage = isOperationsEmpostCreateStage(invoiceRequest.status);
+    if (isEligibleOperationsStage && (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A')) {
       try {
         const empostAPI = require('../services/empost-api');
         console.log('📦 Creating EMPOST shipment from verified InvoiceRequest...');
@@ -1906,6 +1912,8 @@ router.put('/:id/verification', async (req, res) => {
         console.error('❌ Failed to create EMPOST shipment (non-critical, will retry later):', empostError.message);
         // Don't fail the verification update if EMPOST fails
       }
+    } else if (!isEligibleOperationsStage) {
+      console.log(`⏭️ Skipping EMPOST shipment creation: status ${invoiceRequest.status} is not an operations create stage`);
     } else {
       console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
     }
@@ -1939,38 +1947,53 @@ router.put('/:id/complete-verification', async (req, res) => {
     }
 
     // Complete verification
+    const previousStatus = invoiceRequest.status;
     invoiceRequest.verification.verified_by_employee_id = verified_by_employee_id;
     invoiceRequest.verification.verified_at = new Date();
     invoiceRequest.verification.verification_notes = verification_notes;
-    
-    // Move to next status - ready for finance
-    invoiceRequest.status = 'VERIFIED';
-    
-    await invoiceRequest.save();
 
     // Create EMPOST shipment automatically when verification is completed
     // This creates ONLY the shipment, NOT the invoice (invoice will be generated later by Finance)
-    // Only create if UHAWB doesn't already exist (avoid duplicates)
-    if (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A') {
+    // Only create from operations flow (previous status IN_PROGRESS/VERIFIED)
+    // and only if UHAWB doesn't already exist (avoid duplicates).
+    const isEligibleOperationsStage = isOperationsEmpostCreateStage(previousStatus);
+    if (isEligibleOperationsStage && (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A')) {
+      const empostAPI = require('../services/empost-api');
+      console.log('📦 Automatically creating EMPOST shipment from verified InvoiceRequest...');
+
       try {
-        const empostAPI = require('../services/empost-api');
-        console.log('📦 Automatically creating EMPOST shipment from verified InvoiceRequest...');
-        
         const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
-        
-        if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-          // Store UHAWB in invoiceRequest for future reference
-          invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
-          await invoiceRequest.save();
-          console.log('✅ EMPOST shipment created automatically with UHAWB:', shipmentResult.data.uhawb);
+        const returnedUhawb = shipmentResult?.data?.uhawb;
+
+        if (!returnedUhawb || returnedUhawb === 'N/A') {
+          console.error('❌ EMPOST shipment creation did not return a valid UHAWB.');
+          return res.status(502).json({
+            success: false,
+            error: 'EMPOST Booking Creation failed try again',
+            details: 'EMPOST did not return a valid UHAWB.',
+          });
         }
+
+        // Store UHAWB before moving to VERIFIED status
+        invoiceRequest.empost_uhawb = returnedUhawb;
+        console.log('✅ EMPOST shipment created automatically with UHAWB:', returnedUhawb);
       } catch (empostError) {
-        console.error('❌ Failed to create EMPOST shipment automatically (non-critical):', empostError.message);
-        // Don't fail verification completion if EMPOST fails - can be retried later
+        console.error('❌ Failed to create EMPOST shipment automatically:', empostError.response?.data || empostError.message);
+        return res.status(502).json({
+          success: false,
+          error: 'EMPOST Booking Creation failed try again',
+          details: empostError.response?.data?.message || empostError.message,
+        });
       }
+    } else if (!isEligibleOperationsStage) {
+      console.log(`⏭️ Skipping EMPOST shipment creation: previous status ${previousStatus} is not an operations create stage`);
     } else {
       console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
     }
+
+    // Move to next status - ready for finance (only after EMPOST create succeeds when required)
+    invoiceRequest.status = 'VERIFIED';
+    await invoiceRequest.save();
 
     res.json({
       success: true,

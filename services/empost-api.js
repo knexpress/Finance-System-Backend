@@ -34,6 +34,30 @@ class EMpostAPIService {
   }
 
   /**
+   * EMPOST rejects descriptionOfGoods longer than 500 chars.
+   * @param {string} value
+   * @param {number} maxLength
+   * @returns {string}
+   */
+  normalizeDescriptionOfGoods(value, maxLength = 500) {
+    const fallback = 'General Goods';
+    if (!value || typeof value !== 'string') {
+      return fallback;
+    }
+
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return fallback;
+    }
+
+    if (normalized.length <= maxLength) {
+      return normalized;
+    }
+
+    return normalized.slice(0, maxLength);
+  }
+
+  /**
    * Authenticate and get JWT token
    * @returns {Promise<string>} Access token
    */
@@ -582,7 +606,9 @@ class EMpostAPIService {
         shippingType: shippingType,
         productCategory: productCategory,
         productType: 'Parcel',
-        descriptionOfGoods: invoice.line_items?.map(item => item.description).join(', ') || 'General Goods',
+        descriptionOfGoods: this.normalizeDescriptionOfGoods(
+          invoice.line_items?.map(item => item.description).join(', ') || 'General Goods'
+        ),
         dimensions: {
           length: dimensionValue,
           width: dimensionValue,
@@ -929,8 +955,12 @@ class EMpostAPIService {
         productCategory: productCategory,
         // Use verification cargo_service if available (AIR or SEA)
         productType: invoiceRequest.verification?.cargo_service === 'SEA' ? 'Parcel' : 'Parcel', // Can be extended for SEA shipments
-        descriptionOfGoods: invoiceRequest.verification?.listed_commodities || 
-                             (items.length > 0 ? items.map(item => item.commodity || item.name || item.description).join(', ') : 'General Goods'),
+        descriptionOfGoods: this.normalizeDescriptionOfGoods(
+          invoiceRequest.verification?.listed_commodities ||
+          (items.length > 0
+            ? items.map(item => item.commodity || item.name || item.description).join(', ')
+            : 'General Goods')
+        ),
         dimensions: {
           length: dimensionValue,
           width: dimensionValue,

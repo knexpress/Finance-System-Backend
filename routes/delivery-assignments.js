@@ -584,7 +584,8 @@ router.put('/:id', auth, async (req, res) => {
                 trackingNumber,
                 status: 'DELIVERED',
                 additionalData: {
-                  deliveryDate: new Date()
+                  deliveryDate: new Date(),
+                  invoiceRequest,
                 }
               });
             } catch (empostError) {

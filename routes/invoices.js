@@ -30,6 +30,7 @@ async function syncInvoiceUpdateToEMPOST(shipmentRequest) {
     status: deliveryStatus,
     additionalData: {
       notes: `Invoice update sync (${shipmentRequest?.status?.invoice_status || 'N/A'})`,
+      shipmentRequest,
     },
     silent: false,
   });
