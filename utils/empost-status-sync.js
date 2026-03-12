@@ -1,5 +1,6 @@
 const empostAPI = require('../services/empost-api');
 const { isEmpostDisabled } = require('./empost-disabled-check');
+const { storeBackendError } = require('./error-monitoring');
 
 /**
  * Sync shipment status to EMPOST API
@@ -55,6 +56,15 @@ async function syncStatusToEMPost({ trackingNumber, status, additionalData = {},
     // Don't fail the main operation if EMPOST sync fails
     if (!silent) {
       console.error('❌ Failed to sync status to EMPOST (non-critical):', error.message);
+      await storeBackendError({
+        message: `EMPOST sync non-critical failure: ${error.message || 'Unknown error'}`,
+        stackTrace: error?.stack || '',
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'production',
+        errorType: 'runtime',
+        source: 'empost-sync',
+        fileName: 'utils/empost-status-sync.js',
+      });
     }
     // Re-throw only if we want to handle it upstream, but for now we'll just log
   }

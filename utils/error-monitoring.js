@@ -28,6 +28,11 @@ function generateErrorId() {
   return `err_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function normalizeEnvironment(value) {
+  if (!value || typeof value !== 'string') return 'production';
+  return value.trim().toLowerCase();
+}
+
 function trimRecentErrorKeys() {
   const now = Date.now();
   for (const [key, timestamp] of recentErrorKeys.entries()) {
@@ -122,7 +127,7 @@ async function storeBackendError({
       stackTrace: typeof stackTrace === 'string' ? stackTrace : '',
       timestamp: safeTimestamp.toISOString(),
       isSolved: false,
-      environment: environment || 'production',
+      environment: normalizeEnvironment(environment),
       errorType,
       source,
       fileName: resolvedFileName,

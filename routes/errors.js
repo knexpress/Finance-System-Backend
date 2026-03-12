@@ -15,6 +15,13 @@ function asIsoUtc(value) {
   return date.toISOString();
 }
 
+function normalizeEnvironment(value) {
+  if (!value || typeof value !== 'string') return 'production';
+  return value.trim().toLowerCase();
+}
+
+const PRODUCTION_ENV_REGEX = /^production$/i;
+
 function toClientShape(doc) {
   return {
     id: doc.id,
@@ -33,7 +40,7 @@ function toClientShape(doc) {
 // GET /api/errors
 router.get('/', async (req, res) => {
   try {
-    const docs = await BackendError.find({ environment: 'production' })
+    const docs = await BackendError.find({ environment: PRODUCTION_ENV_REGEX })
       .sort({ timestamp: -1 })
       .lean();
 
@@ -51,7 +58,7 @@ router.get('/', async (req, res) => {
 router.get('/recent', async (req, res) => {
   try {
     const limit = normalizeLimit(req.query.limit, 20, 200);
-    const docs = await BackendError.find({ environment: 'production' })
+    const docs = await BackendError.find({ environment: PRODUCTION_ENV_REGEX })
       .sort({ timestamp: -1 })
       .limit(limit)
       .lean();
@@ -109,10 +116,7 @@ router.post('/', async (req, res) => {
       stackTrace: typeof stackTrace === 'string' ? stackTrace : '',
       timestamp: normalizedTimestamp,
       isSolved: Boolean(isSolved),
-      environment:
-        typeof environment === 'string' && environment.trim()
-          ? environment.trim()
-          : 'production',
+      environment: normalizeEnvironment(environment),
       errorType:
         typeof errorType === 'string' && errorType.trim()
           ? errorType.trim()

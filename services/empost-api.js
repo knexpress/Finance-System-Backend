@@ -1,6 +1,7 @@
 const axios = require('axios');
 const https = require('https');
 const { isEmpostDisabled } = require('../utils/empost-disabled-check');
+const { storeBackendError } = require('../utils/error-monitoring');
 
 /**
  * EMpost API Service
@@ -30,6 +31,29 @@ class EMpostAPIService {
         // Modern Node.js versions will use TLS 1.3 if available
         // No need to specify secureProtocol - Node.js will handle it automatically
       }),
+    });
+  }
+
+  async persistEmpostError(context, error, meta = {}) {
+    const responseData = error?.response?.data;
+    const responsePayload =
+      responseData && typeof responseData === 'object'
+        ? JSON.stringify(responseData)
+        : responseData || '';
+
+    const message = `${context}: ${responseData?.message || error?.message || 'Unknown EMPOST error'}`;
+    const stackTrace = [error?.stack || '', responsePayload].filter(Boolean).join('\n');
+
+    await storeBackendError({
+      message,
+      stackTrace,
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || 'production',
+      errorType: 'runtime',
+      source: 'empost',
+      fileName: 'services/empost-api.js',
+      lineNumber: null,
+      ...meta,
     });
   }
 
@@ -92,6 +116,7 @@ class EMpostAPIService {
       }
     } catch (error) {
       console.error('❌ EMpost authentication failed:', error.response?.data || error.message);
+      await this.persistEmpostError('EMPOST authentication failed', error);
       throw new Error(`EMpost authentication failed: ${error.response?.data?.message || error.message}`);
     }
   }
@@ -177,6 +202,7 @@ class EMpostAPIService {
       return result;
     } catch (error) {
       console.error('❌ Failed to create shipment in EMpost:', error.response?.data || error.message);
+      await this.persistEmpostError('EMPOST create shipment failed', error);
       throw error;
     }
   }
@@ -212,6 +238,7 @@ class EMpostAPIService {
       return result;
     } catch (error) {
       console.error('❌ Failed to create shipment in EMpost:', error.response?.data || error.message);
+      await this.persistEmpostError('EMPOST create shipment from data failed', error);
       throw error;
     }
   }
@@ -250,6 +277,7 @@ class EMpostAPIService {
       return result;
     } catch (error) {
       console.error('❌ Failed to create shipment in EMpost from InvoiceRequest:', error.response?.data || error.message);
+      await this.persistEmpostError('EMPOST create shipment from invoice request failed', error);
       throw error;
     }
   }
@@ -294,6 +322,9 @@ class EMpostAPIService {
       return result;
     } catch (error) {
       console.error('❌ Failed to update shipment status in EMPOST:', error.response?.data || error.message);
+      await this.persistEmpostError('EMPOST update shipment status failed', error, {
+        source: 'empost-sync',
+      });
       throw error;
     }
   }
@@ -483,6 +514,7 @@ class EMpostAPIService {
       return result;
     } catch (error) {
       console.error('❌ Failed to issue invoice in EMpost:', error.response?.data || error.message);
+      await this.persistEmpostError('EMPOST issue invoice failed', error);
       throw error;
     }
   }
@@ -1097,6 +1129,7 @@ class EMpostAPIService {
       };
     } catch (error) {
       console.error('❌ Failed to cancel delivery in EMPOST:', error.response?.data || error.message);
+      await this.persistEmpostError('EMPOST cancel delivery failed', error);
       return {
         success: false,
         error: error.response?.data?.message || error.message || 'Unknown error occurred',
