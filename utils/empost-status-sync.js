@@ -56,9 +56,26 @@ async function syncStatusToEMPost({ trackingNumber, status, additionalData = {},
     // Don't fail the main operation if EMPOST sync fails
     if (!silent) {
       console.error('❌ Failed to sync status to EMPOST (non-critical):', error.message);
+      const context = {
+        trackingNumber,
+        status,
+        uhawb: mergedAdditionalData?.empost_uhawb || null,
+        invoiceId: mergedAdditionalData?.invoice?._id || null,
+        invoiceNumber:
+          mergedAdditionalData?.invoice?.invoice_id ||
+          mergedAdditionalData?.invoiceRequest?.invoice_number ||
+          null,
+        requestId:
+          mergedAdditionalData?.invoice?.request_id?._id ||
+          mergedAdditionalData?.invoice?.request_id ||
+          mergedAdditionalData?.invoiceRequest?._id ||
+          mergedAdditionalData?.shipmentRequest?._id ||
+          null,
+      };
+
       await storeBackendError({
-        message: `EMPOST sync non-critical failure: ${error.message || 'Unknown error'}`,
-        stackTrace: error?.stack || '',
+        message: `EMPOST sync non-critical failure: ${error.message || 'Unknown error'} | context=${JSON.stringify(context)}`,
+        stackTrace: `${error?.stack || ''}\ncontext=${JSON.stringify(context)}`.trim(),
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'production',
         errorType: 'runtime',

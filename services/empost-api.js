@@ -41,8 +41,22 @@ class EMpostAPIService {
         ? JSON.stringify(responseData)
         : responseData || '';
 
-    const message = `${context}: ${responseData?.message || error?.message || 'Unknown EMPOST error'}`;
-    const stackTrace = [error?.stack || '', responsePayload].filter(Boolean).join('\n');
+    const traceContext = {
+      trackingNumber: meta.trackingNumber || null,
+      status: meta.status || null,
+      uhawb: meta.uhawb || null,
+      invoiceId: meta.invoiceId || null,
+      invoiceNumber: meta.invoiceNumber || null,
+      requestId: meta.requestId || null,
+      correlationId: responseData?.correlationId || null,
+      empostCode: responseData?.errors?.[0]?.code || null,
+    };
+
+    const compactContext = JSON.stringify(traceContext);
+    const message = `${context}: ${responseData?.message || error?.message || 'Unknown EMPOST error'} | context=${compactContext}`;
+    const stackTrace = [error?.stack || '', responsePayload, `context=${compactContext}`]
+      .filter(Boolean)
+      .join('\n');
 
     await storeBackendError({
       message,
@@ -324,6 +338,17 @@ class EMpostAPIService {
       console.error('❌ Failed to update shipment status in EMPOST:', error.response?.data || error.message);
       await this.persistEmpostError('EMPOST update shipment status failed', error, {
         source: 'empost-sync',
+        trackingNumber,
+        status,
+        uhawb: additionalData?.empost_uhawb || additionalData?.uhawb || null,
+        invoiceId: additionalData?.invoice?._id || null,
+        invoiceNumber: additionalData?.invoice?.invoice_id || additionalData?.invoiceRequest?.invoice_number || null,
+        requestId:
+          additionalData?.invoice?.request_id?._id ||
+          additionalData?.invoice?.request_id ||
+          additionalData?.invoiceRequest?._id ||
+          additionalData?.shipmentRequest?._id ||
+          null,
       });
       throw error;
     }
