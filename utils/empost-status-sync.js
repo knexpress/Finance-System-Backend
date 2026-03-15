@@ -29,19 +29,29 @@ async function syncStatusToEMPost({ trackingNumber, status, additionalData = {},
     return;
   }
 
+  const normalizeUhawb = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.toUpperCase() === 'N/A') return null;
+    return trimmed;
+  };
+
+  // Ensure UHAWB travels separately from trackingNumber for EMPOST create/update flow.
+  // Keep it outside try{} so catch{} can access it for error logging context.
+  const mergedAdditionalData = {
+    ...additionalData,
+    empost_uhawb: normalizeUhawb(
+      additionalData.empost_uhawb ||
+      additionalData.uhawb ||
+      additionalData.invoiceRequest?.empost_uhawb ||
+      additionalData.invoice?.empost_uhawb ||
+      additionalData.shipmentRequest?.empost_uhawb ||
+      additionalData.request?.empost_uhawb ||
+      null
+    ),
+  };
+
   try {
-    // Ensure UHAWB travels separately from trackingNumber for EMPOST create/update flow.
-    const mergedAdditionalData = {
-      ...additionalData,
-      empost_uhawb:
-        additionalData.empost_uhawb ||
-        additionalData.uhawb ||
-        additionalData.invoiceRequest?.empost_uhawb ||
-        additionalData.invoice?.empost_uhawb ||
-        additionalData.shipmentRequest?.empost_uhawb ||
-        additionalData.request?.empost_uhawb ||
-        null,
-    };
 
     if (!silent) {
       console.log(`🔄 Syncing status to EMPOST: ${trackingNumber} -> ${status}`);
@@ -59,7 +69,7 @@ async function syncStatusToEMPost({ trackingNumber, status, additionalData = {},
       const context = {
         trackingNumber,
         status,
-        uhawb: mergedAdditionalData?.empost_uhawb || null,
+        uhawb: mergedAdditionalData.empost_uhawb || null,
         invoiceId: mergedAdditionalData?.invoice?._id || null,
         invoiceNumber:
           mergedAdditionalData?.invoice?.invoice_id ||

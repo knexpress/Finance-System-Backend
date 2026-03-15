@@ -362,6 +362,13 @@ class EMpostAPIService {
    * @returns {Object}
    */
   buildShipmentUpdatePayload(trackingNumber, empostStatus, additionalData = {}) {
+    const normalizeUhawb = (value) => {
+      if (!value || typeof value !== 'string') return '';
+      const trimmed = value.trim();
+      if (!trimmed || trimmed.toUpperCase() === 'N/A') return '';
+      return trimmed;
+    };
+
     const fallbackPayload = {
       trackingNumber,
       uhawb: '',
@@ -474,10 +481,10 @@ class EMpostAPIService {
 
     const looksLikeUhawb = typeof trackingNumber === 'string' && /^AE[A-Z0-9]+$/i.test(trackingNumber);
     const resolvedUhawb =
-      additionalData.uhawb ||
-      additionalData.empost_uhawb ||
-      additionalData.empostUhawb ||
-      payload.uhawb ||
+      normalizeUhawb(additionalData.uhawb) ||
+      normalizeUhawb(additionalData.empost_uhawb) ||
+      normalizeUhawb(additionalData.empostUhawb) ||
+      normalizeUhawb(payload.uhawb) ||
       (looksLikeUhawb ? trackingNumber : '') ||
       '';
 
