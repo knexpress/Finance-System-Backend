@@ -308,7 +308,8 @@ class EMpostAPIService {
       console.log('[EMPOST DISABLED] Skipping shipment status update in EMPOST');
       return { success: true, message: 'EMPOST API disabled' };
     }
-    
+    let updateData = null;
+
     try {
       console.log(`🔄 Updating EMPOST shipment status: ${trackingNumber} -> ${status}`);
       
@@ -319,7 +320,7 @@ class EMpostAPIService {
       
       // EPGL update flow uses the create endpoint with full shipment payload.
       // For updates, include uhawb if available.
-      const updateData = this.buildShipmentUpdatePayload(trackingNumber, empostStatus, additionalData);
+      updateData = this.buildShipmentUpdatePayload(trackingNumber, empostStatus, additionalData);
       
       const updateShipment = async () => {
         const response = await this.apiClient.post(
@@ -340,7 +341,7 @@ class EMpostAPIService {
         source: 'empost-sync',
         trackingNumber,
         status,
-        uhawb: additionalData?.empost_uhawb || additionalData?.uhawb || null,
+        uhawb: updateData?.uhawb || additionalData?.empost_uhawb || additionalData?.uhawb || null,
         invoiceId: additionalData?.invoice?._id || null,
         invoiceNumber: additionalData?.invoice?.invoice_id || additionalData?.invoiceRequest?.invoice_number || null,
         requestId:
@@ -362,10 +363,13 @@ class EMpostAPIService {
    * @returns {Object}
    */
   buildShipmentUpdatePayload(trackingNumber, empostStatus, additionalData = {}) {
+    const isLikelyUhawb = (value) => /^AE\d{8,20}$/i.test(value);
+
     const normalizeUhawb = (value) => {
       if (!value || typeof value !== 'string') return '';
       const trimmed = value.trim();
       if (!trimmed || trimmed.toUpperCase() === 'N/A') return '';
+      if (!isLikelyUhawb(trimmed)) return '';
       return trimmed;
     };
 
@@ -479,13 +483,11 @@ class EMpostAPIService {
         : fallbackPayload.items,
     };
 
-    const looksLikeUhawb = typeof trackingNumber === 'string' && /^AE[A-Z0-9]+$/i.test(trackingNumber);
     const resolvedUhawb =
-      normalizeUhawb(additionalData.uhawb) ||
       normalizeUhawb(additionalData.empost_uhawb) ||
+      normalizeUhawb(additionalData.uhawb) ||
       normalizeUhawb(additionalData.empostUhawb) ||
       normalizeUhawb(payload.uhawb) ||
-      (looksLikeUhawb ? trackingNumber : '') ||
       '';
 
     payload.trackingNumber = trackingNumber || payload.trackingNumber;
