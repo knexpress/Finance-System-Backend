@@ -6,6 +6,7 @@ const empostAPI = require('../services/empost-api');
 const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 const { reinitiateDeliveryAssignmentForInvoice } = require('../utils/reinitiate-delivery-assignment');
+const { generateUniqueInvoiceID } = require('../utils/id-generators');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
@@ -642,6 +643,21 @@ router.post('/', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Batch number is required when generating an invoice'
+      });
+    }
+
+    // Idempotent create: retries / double-submit must not fail on duplicate invoice_id
+    const existingInvoiceForRequest = await Invoice.findOne({ request_id }).lean();
+    if (existingInvoiceForRequest) {
+      const populatedInvoice = await Invoice.findById(existingInvoiceForRequest._id)
+        .populate('request_id', REQUEST_POPULATE_FIELDS)
+        .populate('client_id', 'company_name contact_name email phone address city country')
+        .populate('created_by', 'full_name email department_id');
+      return res.status(200).json({
+        success: true,
+        data: transformInvoice(populatedInvoice),
+        message: 'Invoice already exists for this request',
+        already_exists: true,
       });
     }
 
@@ -1490,7 +1506,37 @@ router.post('/', async (req, res) => {
     } else {
       console.warn('⚠️ No invoice_id to set, will use auto-generated');
     }
-    
+
+    // InvoiceRequest.invoice_number can match an existing Invoice.invoice_id (legacy count-based
+    // generation, or counter drift). Reserve a new global-unique ID instead of failing save.
+    let invoiceIdReassignedFrom = null;
+    if (invoiceData.invoice_id) {
+      const conflict = await Invoice.findOne({ invoice_id: invoiceData.invoice_id }).lean();
+      if (conflict) {
+        const sameRequest =
+          conflict.request_id &&
+          String(conflict.request_id) === String(request_id);
+        if (sameRequest) {
+          const populatedInvoice = await Invoice.findById(conflict._id)
+            .populate('request_id', REQUEST_POPULATE_FIELDS)
+            .populate('client_id', 'company_name contact_name email phone address city country')
+            .populate('created_by', 'full_name email department_id');
+          return res.status(200).json({
+            success: true,
+            data: transformInvoice(populatedInvoice),
+            message: 'Invoice already exists for this request',
+            already_exists: true,
+          });
+        }
+        const replacement = await generateUniqueInvoiceID(Invoice);
+        console.warn(
+          `⚠️ invoice_id ${invoiceData.invoice_id} already on invoice ${conflict._id}; using ${replacement} instead`
+        );
+        invoiceIdReassignedFrom = invoiceData.invoice_id;
+        invoiceData.invoice_id = replacement;
+      }
+    }
+
     // Set awb_number if we have it from the request
     if (awbNumberToUse) {
       invoiceData.awb_number = awbNumberToUse;
@@ -1738,7 +1784,14 @@ router.post('/', async (req, res) => {
     res.status(201).json({
       success: true,
       data: transformInvoice(populatedInvoice),
-      message: 'Invoice created successfully'
+      message: 'Invoice created successfully',
+      ...(invoiceIdReassignedFrom
+        ? {
+            invoice_id_reassigned_from: invoiceIdReassignedFrom,
+            warning:
+              'Invoice number differed from invoice request because that ID was already used on another invoice.',
+          }
+        : {}),
     });
   } catch (error) {
     console.error('Error creating invoice:', error);

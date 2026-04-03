@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const { generateUniqueInvoiceID } = require('../utils/id-generators');
 
 // ========================================
 // CORE BUSINESS ENTITIES
@@ -1261,14 +1262,13 @@ invoiceSchema.pre('save', async function(next) {
       const InvoiceModel = this.constructor;
       const existingInvoice = await InvoiceModel.findOne({ invoice_id: this.invoice_id });
       
-      // If this is a new document (no _id) and invoice_id already exists, it's a duplicate
-      if (!this._id && existingInvoice) {
+      // Mongoose assigns _id before first save; use isNew for "insert" vs update.
+      if (this.isNew && existingInvoice) {
         console.error(`❌ Duplicate invoice_id detected: ${this.invoice_id}, existing document: ${existingInvoice._id}`);
         return next(new Error(`Invoice with ID ${this.invoice_id} already exists`));
       }
       
-      // If this is an update and invoice_id already exists for a different document, it's a conflict
-      if (this._id && existingInvoice && existingInvoice._id.toString() !== this._id.toString()) {
+      if (!this.isNew && existingInvoice && existingInvoice._id.toString() !== this._id.toString()) {
         console.error(`❌ Invoice_id ${this.invoice_id} already exists for a different document`);
         return next(new Error(`Invoice ID ${this.invoice_id} is already in use by another invoice`));
       }
@@ -1282,16 +1282,13 @@ invoiceSchema.pre('save', async function(next) {
     return next();
   }
   
-  // Only generate invoice_id if it doesn't exist
+  // Only generate invoice_id if it doesn't exist — use atomic counter + cross-collection uniqueness
   try {
-    // Use the model directly instead of mongoose.model() to avoid circular reference issues
     const InvoiceModel = this.constructor;
-    const count = await InvoiceModel.countDocuments();
-    this.invoice_id = `INV-${String(count + 1).padStart(6, '0')}`;
+    this.invoice_id = await generateUniqueInvoiceID(InvoiceModel);
     console.log(`🔄 Generated new invoice_id: ${this.invoice_id}`);
   } catch (error) {
     console.error('Error generating invoice_id:', error);
-    // Fallback to timestamp-based ID
     this.invoice_id = `INV-${Date.now().toString().slice(-6)}`;
     console.log(`⚠️ Fallback invoice_id: ${this.invoice_id}`);
   }

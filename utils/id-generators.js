@@ -116,28 +116,40 @@ async function generateInvoiceID(sequenceName = 'invoice_number_seq') {
 }
 
 /**
- * Generate a unique Invoice ID that doesn't exist in the database
- * @param {mongoose.Model} Model - The model to check against (Invoice or InvoiceRequest)
- * @param {number} maxAttempts - Maximum number of attempts to generate unique ID
- * @returns {Promise<string>} Unique Invoice ID
+ * True if this string is already used as an invoice identifier anywhere we care about.
+ * InvoiceRequest uses `invoice_number`; Invoice uses `invoice_id`. They must not collide
+ * (Finance copies invoice_number onto the Invoice as invoice_id).
  */
-async function generateUniqueInvoiceID(Model, maxAttempts = 100) {
+async function isInvoiceIdTakenInSystem(invoiceID) {
+  const Invoice = mongoose.models.Invoice;
+  const InvoiceRequest = mongoose.models.InvoiceRequest;
+  const checks = [];
+  if (Invoice) {
+    checks.push(Invoice.findOne({ invoice_id: invoiceID }).select('_id').lean());
+  }
+  if (InvoiceRequest) {
+    checks.push(InvoiceRequest.findOne({ invoice_number: invoiceID }).select('_id').lean());
+  }
+  if (checks.length === 0) return false;
+  const results = await Promise.all(checks);
+  return results.some(Boolean);
+}
+
+/**
+ * Next INV-###### that is free on both Invoice and InvoiceRequest (atomic counter + collision retry).
+ * @param {mongoose.Model} [_Model] - Unused; kept for existing call sites.
+ * @param {number} [maxAttempts]
+ */
+async function generateUniqueInvoiceID(_Model, maxAttempts = 100) {
+  void _Model;
   let attempts = 0;
   let invoiceID;
   let isUnique = false;
 
   while (!isUnique && attempts < maxAttempts) {
     invoiceID = await generateInvoiceID();
-    
-    // Check if Invoice ID already exists (check both invoice_id and invoice_number fields)
-    const existing = await Model.findOne({ 
-      $or: [
-        { invoice_id: invoiceID },
-        { invoice_number: invoiceID }
-      ]
-    });
-    
-    if (!existing) {
+    const taken = await isInvoiceIdTakenInSystem(invoiceID);
+    if (!taken) {
       isUnique = true;
     } else {
       attempts++;
