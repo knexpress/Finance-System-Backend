@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const dns = require('dns');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -122,6 +123,18 @@ app.use(express.urlencoded({
 
 // MongoDB connection
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance';
+
+if (MONGODB_URI.startsWith('mongodb+srv://')) {
+  const dnsServers = (process.env.DNS_SERVERS || '8.8.8.8,1.1.1.1')
+    .split(',')
+    .map((server) => server.trim())
+    .filter(Boolean);
+
+  if (dnsServers.length > 0) {
+    dns.setServers(dnsServers);
+    console.log(`🌐 DNS servers set for MongoDB SRV lookup: ${dnsServers.join(', ')}`);
+  }
+}
 
 mongoose.connect(MONGODB_URI)
 .then(() => {
