@@ -1,8 +1,8 @@
 require('dotenv').config();
+const dns = require('dns');
 const express = require('express');
 const http = require('http');
 const path = require('path');
-const dns = require('dns');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -184,15 +184,19 @@ app.set('trust proxy', 1);
 // MongoDB connection
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://aliabdullah:knex22939@finance.gk7t9we.mongodb.net/finance?retryWrites=true&w=majority&appName=Finance';
 
-if (MONGODB_URI.startsWith('mongodb+srv://')) {
-  const dnsServers = (process.env.DNS_SERVERS || '8.8.8.8,1.1.1.1')
+// mongodb+srv triggers SRV lookups; some routers/DNS return ECONNREFUSED for _mongodb._tcp.*
+if (/^mongodb\+srv:\/\//i.test(MONGODB_URI) && process.env.MONGO_USE_SYSTEM_DNS !== '1') {
+  const servers = (
+    process.env.MONGO_DNS_SERVERS ||
+    process.env.DNS_SERVERS ||
+    '1.1.1.1,8.8.8.8'
+  )
     .split(',')
-    .map((server) => server.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
-
-  if (dnsServers.length > 0) {
-    dns.setServers(dnsServers);
-    console.log(`🌐 DNS servers set for MongoDB SRV lookup: ${dnsServers.join(', ')}`);
+  if (servers.length) {
+    dns.setServers(servers);
+    console.log(`🌐 DNS servers set for MongoDB SRV lookup: ${servers.join(', ')}`);
   }
 }
 

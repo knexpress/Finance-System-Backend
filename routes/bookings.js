@@ -10,8 +10,22 @@ const auth = require('../middleware/auth');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 const { generateBookingPDF } = require('../services/pdf-generator');
 const googleDriveService = require('../services/google-drive');
+const { purgeBookingIdentityIfEligible } = require('../utils/booking-identity-purge');
 
 const router = express.Router();
+
+/** Clear identityDocuments on booking after review/shipment transitions (never deletes booking). */
+async function enqueueBookingIdentityPurge(bookingId) {
+  try {
+    const lean = await Booking.findById(bookingId).lean();
+    if (lean) await purgeBookingIdentityIfEligible(lean);
+  } catch (err) {
+    console.error(
+      'Booking identityDocuments purge error:',
+      err?.message || err,
+    );
+  }
+}
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
@@ -2086,6 +2100,10 @@ router.put('/batch/shipment-status', auth, async (req, res) => {
     // Execute bulk update
     const result = await Booking.bulkWrite(updateOps, { ordered: false });
 
+    await Promise.all(
+      booking_ids.map((bookingId) => enqueueBookingIdentityPurge(bookingId)),
+    );
+
     // Fetch updated bookings with full details for response
     const updatedBookings = await Booking.find({
       _id: { $in: booking_ids }
@@ -2298,6 +2316,8 @@ router.put('/:id/shipment-status', auth, async (req, res) => {
     booking.updatedAt = new Date();
 
     await booking.save();
+
+    await enqueueBookingIdentityPurge(id);
 
     // Populate booking to get full details
     const populatedBooking = await Booking.findById(id)
@@ -3132,10 +3152,16 @@ router.post('/:id/review', validateObjectIdParam('id'), async (req, res) => {
     }
 
     // Generate PDF and upload to Google Drive (in background - don't block response)
-    generateAndUploadBookingPDF(booking, invoiceRequest).catch(err => {
-      console.error('❌ Error generating/uploading booking PDF:', err);
-      // Don't fail the review if PDF generation fails
-    });
+    generateAndUploadBookingPDF(booking, invoiceRequest)
+      .catch(err => {
+        console.error('❌ Error generating/uploading booking PDF:', err);
+        // Don't fail the review if PDF generation fails
+      })
+      .finally(() => {
+        enqueueBookingIdentityPurge(bookingDoc._id).catch((e) =>
+          console.error('Identity purge after review PDF:', e?.message || e),
+        );
+      });
 
     // Prepare invoice request response (exclude identityDocuments)
     const invoiceRequestObj = invoiceRequest.toObject ? invoiceRequest.toObject() : invoiceRequest;
@@ -3215,9 +3241,19 @@ router.put('/:id/status', validateObjectIdParam('id'), async (req, res) => {
     // When status is set to 'reviewed', generate PDF and upload to Drive (same as review flow)
     if (review_status === 'reviewed') {
       const invoiceRequest = await InvoiceRequest.findOne({ booking_id: id }).lean();
-      generateAndUploadBookingPDF(booking, invoiceRequest || {}).catch(err => {
-        console.error('❌ Background PDF upload failed after status update:', err.message);
-      });
+      generateAndUploadBookingPDF(booking, invoiceRequest || {})
+        .catch(err => {
+          console.error('❌ Background PDF upload failed after status update:', err.message);
+        })
+        .finally(() => {
+          enqueueBookingIdentityPurge(id).catch((e) =>
+            console.error('Identity purge after status PDF:', e?.message || e),
+          );
+        });
+    } else {
+      enqueueBookingIdentityPurge(id).catch((e) =>
+        console.error('Identity purge after status update:', e?.message || e),
+      );
     }
 
     res.json({

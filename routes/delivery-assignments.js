@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const router = express.Router();
 const auth = require('../middleware/auth');
 const { DeliveryAssignment, Driver, ShipmentRequest, Invoice, Client } = require('../models/unified-schema');
@@ -11,6 +12,50 @@ const normalizeAssignmentStatus = (status) => {
   if (status === 'CANCELLED') return 'CANCELLED';
   return 'NOT_DELIVERED';
 };
+
+async function applyPayloadToExistingAssignment(existing, assignmentData, invoiceAmount) {
+  existing.amount = mongoose.Types.Decimal128.fromString(invoiceAmount.toFixed(2));
+  existing.client_id = assignmentData.client_id;
+  existing.delivery_type = assignmentData.delivery_type;
+  existing.delivery_address = assignmentData.delivery_address;
+  existing.receiver_name = assignmentData.receiver_name;
+  existing.receiver_phone = assignmentData.receiver_phone;
+  existing.receiver_address = assignmentData.receiver_address;
+  existing.delivery_instructions = assignmentData.delivery_instructions;
+  if (assignmentData.request_id) {
+    existing.request_id = assignmentData.request_id;
+  }
+  if (assignmentData.driver_id) {
+    existing.driver_id = assignmentData.driver_id;
+  }
+  await existing.save();
+  return existing;
+}
+
+async function toAssignmentResponsePayload(assignment) {
+  if (assignment.driver_id) {
+    await assignment.populate('driver_id', 'name phone vehicle_type vehicle_number');
+  }
+  if (assignment.request_id) {
+    await assignment.populate('request_id', 'request_id customer receiver');
+  }
+  await assignment.populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address');
+  await assignment.populate('client_id', 'company_name');
+  const assignmentResponse = assignment.toObject();
+  if (!assignmentResponse.receiver_name && assignmentResponse.invoice_id) {
+    assignmentResponse.receiver_name = assignmentResponse.invoice_id.receiver_name || 'N/A';
+  }
+  if (!assignmentResponse.receiver_phone && assignmentResponse.invoice_id) {
+    assignmentResponse.receiver_phone = assignmentResponse.invoice_id.receiver_phone || 'N/A';
+  }
+  if (!assignmentResponse.receiver_address && assignmentResponse.invoice_id) {
+    assignmentResponse.receiver_address =
+      assignmentResponse.invoice_id.receiver_address ||
+      assignmentResponse.delivery_address ||
+      'N/A';
+  }
+  return assignmentResponse;
+}
 
 // GET /api/delivery-assignments - Get all delivery assignments
 router.get('/', auth, async (req, res) => {
@@ -191,6 +236,10 @@ router.get('/:id', auth, async (req, res) => {
 
 // POST /api/delivery-assignments - Create new delivery assignment with QR code
 router.post('/', auth, async (req, res) => {
+  let invoice;
+  let assignmentId;
+  let invoiceAmount;
+  let assignmentData;
   try {
     console.log('Creating delivery assignment with data:', req.body);
     
@@ -212,7 +261,7 @@ router.post('/', auth, async (req, res) => {
     }
     
     // Fetch invoice to get receiver information and AWB number
-    const invoice = await Invoice.findById(invoice_id);
+    invoice = await Invoice.findById(invoice_id);
     if (!invoice) {
       return res.status(404).json({
         success: false,
@@ -237,10 +286,10 @@ router.post('/', auth, async (req, res) => {
     }
     
     // Use AWB number as assignment_id (tracking ID) - this is mandatory
-    const assignmentId = awbNumber;
-    
+    assignmentId = awbNumber;
+
     // Get amount from invoice if not provided
-    const invoiceAmount = amount || (invoice.total_amount ? parseFloat(invoice.total_amount.toString()) : 0);
+    invoiceAmount = amount || (invoice.total_amount ? parseFloat(invoice.total_amount.toString()) : 0);
     
     if (!invoiceAmount || invoiceAmount <= 0) {
       return res.status(400).json({
@@ -267,13 +316,8 @@ router.post('/', auth, async (req, res) => {
     }
     
     // request_id is optional - some invoices may not have a shipment request yet
-    
-    // Generate unique QR code
-    const qrCode = crypto.randomBytes(16).toString('hex');
-    const qrUrl = `${process.env.FRONTEND_URL || 'https://finance-system-frontend.vercel.app'}/qr-payment/${qrCode}`;
-    const qrExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours from now
-    
-    const assignmentData = {
+
+    assignmentData = {
       invoice_id,
       client_id,
       amount: invoiceAmount,
@@ -283,10 +327,7 @@ router.post('/', auth, async (req, res) => {
       receiver_phone: receiverPhone,
       receiver_address: receiverAddress,
       delivery_instructions: delivery_instructions || 'Please contact customer for delivery details',
-      qr_code: qrCode,
-      qr_url: qrUrl,
-      qr_expires_at: qrExpiresAt,
-      created_by: req.user.id
+      created_by: req.user.id,
     };
     
     // Set assignment_id to AWB number (tracking ID) - this is mandatory
@@ -306,42 +347,76 @@ router.post('/', auth, async (req, res) => {
     }
     
     console.log('Assignment data to save:', assignmentData);
-    
+
+    let existing =
+      (await DeliveryAssignment.findOne({ invoice_id: invoice._id })) ||
+      (await DeliveryAssignment.findOne({ assignment_id: assignmentId }));
+
+    if (existing) {
+      if (existing.invoice_id.toString() !== invoice._id.toString()) {
+        return res.status(409).json({
+          success: false,
+          error: `A delivery assignment already exists for tracking ID ${assignmentId}. It is linked to a different invoice.`,
+        });
+      }
+      await applyPayloadToExistingAssignment(existing, assignmentData, invoiceAmount);
+      const assignmentResponse = await toAssignmentResponsePayload(existing);
+      return res.status(200).json({
+        success: true,
+        data: assignmentResponse,
+        message: 'Delivery assignment already existed; details updated.',
+      });
+    }
+
+    const qrCode = crypto.randomBytes(16).toString('hex');
+    const qrUrl = `${process.env.FRONTEND_URL || 'https://finance-system-frontend.vercel.app'}/qr-payment/${qrCode}`;
+    const qrExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    assignmentData.qr_code = qrCode;
+    assignmentData.qr_url = qrUrl;
+    assignmentData.qr_expires_at = qrExpiresAt;
+
     const assignment = new DeliveryAssignment(assignmentData);
     await assignment.save();
-    
+
     console.log('Assignment saved successfully:', assignment._id);
-    
-    // Populate the assignment for response (only if driver_id exists)
-    if (assignment.driver_id) {
-      await assignment.populate('driver_id', 'name phone vehicle_type vehicle_number');
-    }
-    if (assignment.request_id) {
-      await assignment.populate('request_id', 'request_id customer receiver');
-    }
-    await assignment.populate('invoice_id', 'invoice_id total_amount awb_number receiver_name receiver_phone receiver_address');
-    await assignment.populate('client_id', 'company_name');
-    
-    // Convert to object and ensure receiver info is included
-    const assignmentResponse = assignment.toObject();
-    
-    // Ensure receiver info is present (should already be set, but double-check)
-    if (!assignmentResponse.receiver_name && assignmentResponse.invoice_id) {
-      assignmentResponse.receiver_name = assignmentResponse.invoice_id.receiver_name || 'N/A';
-    }
-    if (!assignmentResponse.receiver_phone && assignmentResponse.invoice_id) {
-      assignmentResponse.receiver_phone = assignmentResponse.invoice_id.receiver_phone || 'N/A';
-    }
-    if (!assignmentResponse.receiver_address && assignmentResponse.invoice_id) {
-      assignmentResponse.receiver_address = assignmentResponse.invoice_id.receiver_address || assignmentResponse.delivery_address || 'N/A';
-    }
-    
+
+    const assignmentResponse = await toAssignmentResponsePayload(assignment);
+
     res.status(201).json({
       success: true,
       data: assignmentResponse,
-      message: 'Delivery assignment created successfully'
+      message: 'Delivery assignment created successfully',
     });
   } catch (error) {
+    if (
+      error.code === 11000 &&
+      assignmentId &&
+      invoice &&
+      assignmentData &&
+      invoiceAmount > 0
+    ) {
+      const isAssignmentIdDup =
+        (error.keyPattern && Object.prototype.hasOwnProperty.call(error.keyPattern, 'assignment_id')) ||
+        String(error.message || '').includes('assignment_id');
+      if (isAssignmentIdDup) {
+        const rescued = await DeliveryAssignment.findOne({ assignment_id: assignmentId });
+        if (rescued && rescued.invoice_id.toString() === invoice._id.toString()) {
+          await applyPayloadToExistingAssignment(rescued, assignmentData, invoiceAmount);
+          const assignmentResponse = await toAssignmentResponsePayload(rescued);
+          return res.status(200).json({
+            success: true,
+            data: assignmentResponse,
+            message: 'Delivery assignment already existed; details updated.',
+          });
+        }
+        if (rescued) {
+          return res.status(409).json({
+            success: false,
+            error: `A delivery assignment already exists for tracking ID ${assignmentId}. It is linked to a different invoice.`,
+          });
+        }
+      }
+    }
     console.error('Error creating delivery assignment:', error);
     res.status(500).json({
       success: false,

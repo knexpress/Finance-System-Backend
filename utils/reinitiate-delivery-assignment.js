@@ -68,9 +68,21 @@ async function reinitiateDeliveryAssignmentForInvoice(invoice, options = {}) {
     };
   }
 
+  const awbNumber = invoice.awb_number || (reqObj && reqObj.awb_number);
+
   let assignment = await DeliveryAssignment.findOne({ invoice_id: invoiceId });
+  if (!assignment && awbNumber) {
+    assignment = await DeliveryAssignment.findOne({ assignment_id: awbNumber });
+  }
 
   if (assignment) {
+    if (assignment.invoice_id.toString() !== invoiceId.toString()) {
+      return {
+        assignment: null,
+        warning: `A delivery assignment already exists for AWB ${awbNumber}. It is linked to a different invoice.`,
+      };
+    }
+
     assignment.amount = mongoose.Types.Decimal128.fromString(amount.toFixed(2));
     assignment.delivery_address = deliveryAddress || assignment.delivery_address || 'N/A';
     assignment.receiver_name = invoice.receiver_name || assignment.receiver_name || 'N/A';
@@ -105,7 +117,6 @@ async function reinitiateDeliveryAssignmentForInvoice(invoice, options = {}) {
     };
   }
 
-  const awbNumber = invoice.awb_number || (reqObj && reqObj.awb_number);
   if (!awbNumber) {
     return {
       assignment: null,

@@ -749,11 +749,42 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           }
         }
         
+        // AWB / tracking ID (must match unique assignment_id) — validate before QR / inserts
+        const awbNumber = invoice.awb_number || trackingCode || null;
+
+        if (!awbNumber) {
+          console.error(`❌ Skipping delivery assignment for invoice ${invoice.invoice_id}: AWB number (tracking ID) is required`);
+          errors.push({
+            row: rowNumber,
+            error: 'AWB number (tracking ID) is required to create delivery assignment',
+            invoice_id: invoice.invoice_id
+          });
+          continue; // Skip this row
+        }
+
+        const existingAssignment =
+          (await DeliveryAssignment.findOne({ invoice_id: invoice._id })) ||
+          (await DeliveryAssignment.findOne({ assignment_id: awbNumber }));
+
+        if (existingAssignment) {
+          if (existingAssignment.invoice_id.toString() !== invoice._id.toString()) {
+            console.warn(`⚠️ Skipping delivery assignment: AWB ${awbNumber} already linked to another invoice`);
+            errors.push({
+              row: rowNumber,
+              error: `Delivery assignment for tracking ID ${awbNumber} exists on a different invoice`,
+              invoice_id: invoice.invoice_id
+            });
+            continue;
+          }
+          console.log(`📦 Delivery assignment already exists for invoice ${invoice.invoice_id}; skipping create`);
+          continue;
+        }
+
         // Generate unique QR code for delivery
         const qrCode = crypto.randomBytes(16).toString('hex');
         const qrUrl = `${process.env.FRONTEND_URL || 'https://finance-system-frontend.vercel.app'}/qr-payment/${qrCode}`;
         const qrExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours from now
-        
+
         // Map delivery type (normalize to valid enum values)
         let normalizedDeliveryType = 'COD';
         if (deliveryType) {
@@ -767,20 +798,6 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
           } else if (deliveryTypeUpper.includes('WAREHOUSE') || deliveryTypeUpper.includes('PICKUP')) {
             normalizedDeliveryType = 'WAREHOUSE_PICKUP';
           }
-        }
-        
-        // Get AWB number from invoice (use as assignment_id/tracking ID)
-        const awbNumber = invoice.awb_number || trackingCode || null;
-        
-        // AWB number is REQUIRED - assignment_id MUST be the tracking ID
-        if (!awbNumber) {
-          console.error(`❌ Skipping delivery assignment for invoice ${invoice.invoice_id}: AWB number (tracking ID) is required`);
-          errors.push({
-            row: rowNumber,
-            error: 'AWB number (tracking ID) is required to create delivery assignment',
-            invoice_id: invoice.invoice_id
-          });
-          continue; // Skip this row
         }
         
         // Create delivery assignment with all mapped data

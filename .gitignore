@@ -28,6 +28,9 @@ Thumbs.db
 dist/
 build/
 
+# Script exports (may contain customer data)
+exports/
+
 # Temporary files and results
 *.pdf
 empost-*.json

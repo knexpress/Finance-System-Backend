@@ -218,6 +218,11 @@ const DEFAULT_FIELDS = [
  * Searches across multiple fields with case-insensitive partial matching
  * Optimized for performance - uses exact match for ObjectId, regex for text fields
  */
+/** Escape user input so it is matched literally inside RegExp (avoids Invalid RE e.g. trailing \\). */
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function buildSearchQuery(searchTerm) {
   if (!searchTerm || !searchTerm.trim()) {
     return null;
@@ -248,11 +253,13 @@ function buildSearchQuery(searchTerm) {
     return searchConditions.length > 0 ? { $or: searchConditions } : null;
   }
 
-  // Create case-insensitive regex for text fields
+  const literal = escapeRegExp(sanitized);
+
+  // Create case-insensitive regex for text fields (literal match, not user-supplied regex syntax)
   // Use anchored regex (^) when possible for better index usage
-  const searchRegex = sanitized.length > 3 
-    ? new RegExp(`^${sanitized}`, 'i') // Anchored regex for better performance
-    : new RegExp(sanitized, 'i'); // Non-anchored for short terms
+  const searchRegex = literal.length > 3 
+    ? new RegExp(`^${literal}`, 'i') // Anchored regex for better performance
+    : new RegExp(literal, 'i'); // Non-anchored for short terms
 
   // Add text field searches (these have indexes)
   searchConditions.push(
