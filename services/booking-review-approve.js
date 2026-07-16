@@ -28,6 +28,41 @@ async function performBookingReview(bookingId, reviewed_by_employee_id, deps = {
 
     // Convert back to Mongoose document for saving
     const bookingDoc = await Booking.findById(id);
+
+    const toObjectIdString = (v) => (v ? String(v._id || v) : null);
+    const findInvoiceByRequestId = async (requestId) => {
+      if (!requestId) return null;
+      return mongoose.connection.db.collection('invoices').findOne({
+        $or: [{ request_id: requestId }, { request_id: String(requestId) }],
+      });
+    };
+
+    // Idempotency guard #1:
+    // If this booking is already linked to an invoice request, do not create a second request
+    // and do not overwrite the link (this was causing cargo-status mismatches).
+    if (bookingDoc.converted_to_invoice_request_id) {
+      const linkedRequest = await InvoiceRequest.findById(bookingDoc.converted_to_invoice_request_id);
+      if (linkedRequest) {
+        const linkedInvoice = await findInvoiceByRequestId(linkedRequest._id);
+        const linkedStatus = (linkedRequest.status || '').toUpperCase();
+        if (linkedStatus !== 'CANCELLED' || linkedInvoice) {
+          if (!linkedRequest.booking_id) {
+            linkedRequest.booking_id = bookingDoc._id;
+            await linkedRequest.save();
+          }
+          bookingDoc.review_status = 'reviewed';
+          bookingDoc.reviewed_by_employee_id = reviewed_by_employee_id;
+          bookingDoc.reviewed_at = new Date();
+          await bookingDoc.save();
+          return {
+            success: true,
+            booking: bookingDoc.toObject ? bookingDoc.toObject() : bookingDoc,
+            invoiceRequest: linkedRequest.toObject ? linkedRequest.toObject() : linkedRequest,
+            message: 'Booking is already linked to an invoice request. Existing link kept to prevent mismatch.',
+          };
+        }
+      }
+    }
     
     // Update booking review status
     bookingDoc.review_status = 'reviewed';
@@ -128,7 +163,8 @@ async function performBookingReview(bookingId, reviewed_by_employee_id, deps = {
         awbNumber = booking.awb.trim();
         console.log('✅ Using AWB number from booking:', awbNumber);
         
-        // Check if this AWB already exists in InvoiceRequest (to avoid duplicates)
+        // Guard #2: if AWB already exists in InvoiceRequest, reuse/validate instead of creating a new AWB.
+        // Creating a second invoice request for the same booking AWB can re-point booking linkage incorrectly.
         const existingInvoiceRequest = await InvoiceRequest.findOne({
           $or: [
             { tracking_code: awbNumber },
@@ -137,12 +173,30 @@ async function performBookingReview(bookingId, reviewed_by_employee_id, deps = {
         });
         
         if (existingInvoiceRequest) {
-          console.warn(`⚠️  AWB ${awbNumber} already exists in InvoiceRequest. Generating new AWB as fallback.`);
-          // Fallback: generate new AWB if booking AWB already exists
-          const isPhToUae = serviceCode === 'PH_TO_UAE' || serviceCode.startsWith('PH_TO_UAE');
-          const awbPrefix = isPhToUae ? { prefix: 'PHL' } : {};
-          awbNumber = await generateUniqueAWBNumber(InvoiceRequest, awbPrefix);
-          console.log('✅ Generated new AWB Number as fallback:', awbNumber);
+          const existingRequestBookingId = toObjectIdString(existingInvoiceRequest.booking_id);
+          const currentBookingId = toObjectIdString(bookingDoc._id);
+          if (existingRequestBookingId && existingRequestBookingId !== currentBookingId) {
+            return {
+              success: false,
+              statusCode: 409,
+              error: `AWB ${awbNumber} is already linked to another booking's invoice request`,
+            };
+          }
+
+          // Reuse existing request for this booking rather than creating a duplicate.
+          existingInvoiceRequest.booking_id = bookingDoc._id;
+          await existingInvoiceRequest.save();
+          bookingDoc.converted_to_invoice_request_id = existingInvoiceRequest._id;
+          bookingDoc.review_status = 'reviewed';
+          bookingDoc.reviewed_by_employee_id = reviewed_by_employee_id;
+          bookingDoc.reviewed_at = new Date();
+          await bookingDoc.save();
+          return {
+            success: true,
+            booking: bookingDoc.toObject ? bookingDoc.toObject() : bookingDoc,
+            invoiceRequest: existingInvoiceRequest.toObject ? existingInvoiceRequest.toObject() : existingInvoiceRequest,
+            message: 'Existing invoice request for this AWB reused to prevent duplicate linkage.',
+          };
         }
       } else {
         // Generate unique AWB number if not provided in booking
