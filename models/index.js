@@ -1164,7 +1164,56 @@ bookingSchema.index({ awb_number: 1 });
 // Indexes for name-based search performance
 bookingSchema.index({ 'sender.firstName': 1, 'sender.lastName': 1 });
 bookingSchema.index({ 'receiver.firstName': 1, 'receiver.lastName': 1 });
-bookingSchema.index({ 'sender.name': 'text', 'receiver.name': 'text', 'customer_name': 'text' }); // Text index for full name search
+bookingSchema.index({ 'sender.fullName': 1 });
+bookingSchema.index({ 'receiver.fullName': 1 });
+// Case-insensitive equality search (Booking Forms)
+bookingSchema.index(
+  { 'sender.firstName': 1, 'sender.lastName': 1 },
+  { name: 'sender_name_ci', collation: { locale: 'en', strength: 2 } }
+);
+bookingSchema.index(
+  { 'receiver.firstName': 1, 'receiver.lastName': 1 },
+  { name: 'receiver_name_ci', collation: { locale: 'en', strength: 2 } }
+);
+bookingSchema.index(
+  { 'sender.fullName': 1 },
+  { name: 'sender_fullname_ci', collation: { locale: 'en', strength: 2 } }
+);
+bookingSchema.index(
+  { 'receiver.fullName': 1 },
+  { name: 'receiver_fullname_ci', collation: { locale: 'en', strength: 2 } }
+);
+// Broad text index for Booking Forms / AWB-by-name search (one text index per collection)
+bookingSchema.index(
+  {
+    'sender.fullName': 'text',
+    'sender.name': 'text',
+    'sender.firstName': 'text',
+    'sender.lastName': 'text',
+    'receiver.fullName': 'text',
+    'receiver.name': 'text',
+    'receiver.firstName': 'text',
+    'receiver.lastName': 'text',
+    customer_name: 'text',
+    name: 'text',
+  },
+  {
+    name: 'bookings_party_name_text',
+    weights: {
+      'sender.fullName': 10,
+      'receiver.fullName': 10,
+      'sender.name': 8,
+      'receiver.name': 8,
+      customer_name: 8,
+      'sender.firstName': 5,
+      'sender.lastName': 5,
+      'receiver.firstName': 5,
+      'receiver.lastName': 5,
+      name: 3,
+    },
+    default_language: 'none',
+  }
+);
 
 const Booking = mongoose.models.Booking || mongoose.model('Booking', bookingSchema);
 

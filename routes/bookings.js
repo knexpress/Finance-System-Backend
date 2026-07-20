@@ -1148,51 +1148,392 @@ router.put('/:id', validateObjectIdParam('id'), async (req, res) => {
   }
 });
 
-/**
- * Build $or query matching sender/receiver/root name fields (single token or "first last").
- */
-function buildPartyNameSearchQuery(nameInput) {
-  const trimmed = String(nameInput || '').trim();
-  if (!trimmed) return null;
-
-  const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const safeNamePattern = /^[a-zA-Z\s'-]+$/;
-  if (!safeNamePattern.test(trimmed)) return null;
-
-  const parts = trimmed.split(/\s+/).filter(Boolean);
-  const nameFields = (regex) => ({
-    $or: [
-      { 'sender.firstName': regex },
-      { 'sender.lastName': regex },
-      { 'sender.name': regex },
-      { 'sender.fullName': regex },
-      { 'receiver.firstName': regex },
-      { 'receiver.lastName': regex },
-      { 'receiver.name': regex },
-      { 'receiver.fullName': regex },
-      { customer_name: regex },
-      { customerName: regex },
-      { name: regex },
-    ],
-  });
-
-  if (parts.length === 1) {
-    const r = new RegExp(escapeRegex(parts[0]), 'i');
-    return nameFields(r);
-  }
-
-  const first = escapeRegex(parts[0]);
-  const last = escapeRegex(parts.slice(1).join(' '));
-  const fullPattern = new RegExp(`${first}.*${last}|${last}.*${first}`, 'i');
-  return nameFields(fullPattern);
+function partyDisplayName(person) {
+  if (!person || typeof person !== 'object') return null;
+  return (
+    person.fullName ||
+    person.name ||
+    [person.firstName, person.lastName].filter(Boolean).join(' ') ||
+    null
+  );
 }
 
-// Search bookings for booking-forms (Sales / Operations PDF download — all review statuses)
-router.post('/search-approved-forms', auth, async (req, res) => {
+/** Name-search hit: only identity for the list — no full booking payload */
+function mapNameSearchHit(b) {
+  const senderName = partyDisplayName(b.sender);
+  const receiverName = partyDisplayName(b.receiver);
+  const rootName = b.customer_name || b.customerName || b.name || null;
+  const displayName = senderName || receiverName || rootName || 'Unknown';
+  let matchSide = 'booking';
+  if (senderName && receiverName) matchSide = 'sender/receiver';
+  else if (senderName) matchSide = 'sender';
+  else if (receiverName) matchSide = 'receiver';
+
+  return {
+    _id: b._id,
+    display_name: displayName,
+    sender_name: senderName,
+    receiver_name: receiverName,
+    match_side: matchSide,
+  };
+}
+
+function mapBookingFormSummary(b) {
+  const awbVal = b.tracking_code || b.awb_number || b.awb || b.referenceNumber || null;
+  return {
+    _id: b._id,
+    awb: awbVal,
+    review_status: b.review_status,
+    createdAt: b.createdAt,
+    service: b.service || b.service_code,
+    sender_name: partyDisplayName(b.sender),
+    receiver_name: partyDisplayName(b.receiver),
+  };
+}
+
+// Name search: only name fields + _id (never full sender/receiver blobs)
+const BOOKING_FORMS_NAME_PROJECTION = {
+  'sender.firstName': 1,
+  'sender.lastName': 1,
+  'sender.fullName': 1,
+  'sender.name': 1,
+  'receiver.firstName': 1,
+  'receiver.lastName': 1,
+  'receiver.fullName': 1,
+  'receiver.name': 1,
+  customer_name: 1,
+  customerName: 1,
+  name: 1,
+  createdAt: 1,
+};
+
+// After click: light summary only (still not full booking / identity docs)
+const BOOKING_FORMS_SUMMARY_PROJECTION = {
+  ...BOOKING_FORMS_NAME_PROJECTION,
+  awb: 1,
+  awb_number: 1,
+  tracking_code: 1,
+  referenceNumber: 1,
+  review_status: 1,
+  service: 1,
+  service_code: 1,
+};
+
+const BOOKING_FORMS_LIMIT = 25;
+const BOOKING_FORMS_HARD_TIMEOUT_MS = 10000; // 10s hard timeout
+const NAME_COLLATION = { locale: 'en', strength: 2 }; // case-insensitive index-friendly
+
+/**
+ * Parse search into tokens.
+ * "SARAH TAPIT" → last token is lastName, earlier tokens match firstName prefix
+ * (DB often stores firstName as "Sarah Camille", not just "Sarah").
+ */
+function parseNameSearchTokens(nameInput) {
+  const trimmed = String(nameInput || '').trim();
+  if (!trimmed) return null;
+  if (!/^[a-zA-Z\s'-]+$/.test(trimmed)) return null;
+
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (!parts.length) return null;
+
+  if (parts.length === 1) {
+    return { kind: 'single', token: parts[0], parts };
+  }
+
+  return {
+    kind: 'full',
+    firstPrefix: parts[0],
+    firstExact: parts.slice(0, -1).join(' '), // "Sarah Camille" if typed fully
+    last: parts[parts.length - 1],
+    parts,
+  };
+}
+
+/**
+ * Keep bookings whose sender OR receiver first/last match the typed name.
+ */
+function partyNameMatches(person, tokens) {
+  if (!person || typeof person !== 'object' || !tokens) return false;
+  const first = String(person.firstName || '').trim().toLowerCase();
+  const last = String(person.lastName || '').trim().toLowerCase();
+  const full = String(person.fullName || person.name || `${first} ${last}`)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+
+  if (tokens.kind === 'single') {
+    const t = tokens.token.toLowerCase();
+    return first.includes(t) || last.includes(t) || full.includes(t);
+  }
+
+  const lastTok = tokens.last.toLowerCase();
+  const firstTok = tokens.firstPrefix.toLowerCase();
+  const firstExact = tokens.firstExact.toLowerCase();
+
+  const lastOk = last === lastTok || full.split(/\s+/).includes(lastTok);
+  const firstOk =
+    first === firstExact ||
+    first.startsWith(firstTok) ||
+    first.includes(firstTok) ||
+    full.includes(firstTok);
+
+  return lastOk && firstOk;
+}
+
+function bookingMatchesNameTokens(booking, tokens) {
+  return partyNameMatches(booking.sender, tokens) || partyNameMatches(booking.receiver, tokens);
+}
+
+function buildCreatedAtCursorFilter(beforeCreatedAt, beforeId) {
+  if (!beforeCreatedAt) return {};
+  const beforeDate = new Date(beforeCreatedAt);
+  if (Number.isNaN(beforeDate.getTime())) return {};
+
+  let beforeObjectId = null;
+  if (beforeId) {
+    try {
+      beforeObjectId = new mongoose.Types.ObjectId(String(beforeId));
+    } catch {
+      beforeObjectId = null;
+    }
+  }
+
+  if (beforeObjectId) {
+    return {
+      $or: [
+        { createdAt: { $lt: beforeDate } },
+        { createdAt: beforeDate, _id: { $lt: beforeObjectId } },
+      ],
+    };
+  }
+  return { createdAt: { $lt: beforeDate } };
+}
+
+function isMaxTimeError(err) {
+  return (
+    err?.code === 50 ||
+    err?.codeName === 'MaxTimeMSExpired' ||
+    /exceeded time limit|MaxTimeMSExpired/i.test(err?.message || '')
+  );
+}
+
+function dedupeBookingsById(docs) {
+  const seen = new Set();
+  const out = [];
+  for (const doc of docs) {
+    const id = String(doc._id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(doc);
+  }
+  return out;
+}
+
+function sortBookingsNewestFirst(docs) {
+  return docs.sort((a, b) => {
+    const ta = new Date(a.createdAt || 0).getTime();
+    const tb = new Date(b.createdAt || 0).getTime();
+    if (tb !== ta) return tb - ta;
+    return String(b._id).localeCompare(String(a._id));
+  });
+}
+
+/**
+ * Equality-only finds on sender/receiver firstName + lastName (index + collation).
+ * Middle-name cases like firstName="Sarah Camille" are covered by the text path.
+ */
+function buildPartyFirstLastQueries(tokens) {
+  if (!tokens) return [];
+
+  if (tokens.kind === 'single') {
+    const t = tokens.token;
+    return [
+      { 'sender.firstName': t },
+      { 'sender.lastName': t },
+      { 'receiver.firstName': t },
+      { 'receiver.lastName': t },
+    ];
+  }
+
+  const { firstExact, last, firstPrefix } = tokens;
+  const queries = [
+    { 'sender.firstName': firstExact, 'sender.lastName': last },
+    { 'receiver.firstName': firstExact, 'receiver.lastName': last },
+  ];
+  if (firstPrefix && firstPrefix.toLowerCase() !== String(firstExact).toLowerCase()) {
+    queries.push(
+      { 'sender.firstName': firstPrefix, 'sender.lastName': last },
+      { 'receiver.firstName': firstPrefix, 'receiver.lastName': last }
+    );
+  }
+  return queries;
+}
+
+/**
+ * Search bookings by sender/receiver firstName + lastName.
+ * Text index finds "Sarah Camille Tapit" for "SARAH TAPIT", then we keep only
+ * rows whose sender/receiver first+last match. Equality queries fill exact hits.
+ */
+async function findNameHitsPage(nameTrim, { beforeCreatedAt, beforeId, limit = BOOKING_FORMS_LIMIT } = {}) {
+  const tokens = parseNameSearchTokens(nameTrim);
+  if (!tokens) return { error: 'Invalid name search' };
+
+  const cursorFilter = buildCreatedAtCursorFilter(beforeCreatedAt, beforeId);
+  const fetchLimit = Math.min(Math.max(limit * 4, 50), 100);
+
   try {
-    const { awb, name } = req.body;
+    // 1) Text index first (handles middle names in firstName)
+    let textRows = [];
+    try {
+      const textSearch = tokens.parts
+        .map((p) => `"${String(p).replace(/"/g, '')}"`)
+        .join(' ');
+      const filter = {
+        $text: { $search: textSearch },
+        ...(Object.keys(cursorFilter).length ? cursorFilter : {}),
+      };
+      const rows = await Booking.find(filter, { score: { $meta: 'textScore' } })
+        .select(BOOKING_FORMS_NAME_PROJECTION)
+        .sort({ score: { $meta: 'textScore' } })
+        .limit(fetchLimit)
+        .maxTimeMS(BOOKING_FORMS_HARD_TIMEOUT_MS)
+        .lean();
+      textRows = rows.filter((b) => bookingMatchesNameTokens(b, tokens));
+    } catch (err) {
+      console.warn('Booking forms text name path skipped:', err.message);
+    }
+
+    // 2) Equality on firstName+lastName (no regex — avoids collection-scan timeouts)
+    const structuredQueries = buildPartyFirstLastQueries(tokens);
+    const structuredChunks = await Promise.all(
+      structuredQueries.map((q) => {
+        const filter =
+          Object.keys(cursorFilter).length > 0 ? { $and: [q, cursorFilter] } : q;
+        return Booking.find(filter)
+          .collation(NAME_COLLATION)
+          .select(BOOKING_FORMS_NAME_PROJECTION)
+          .limit(fetchLimit)
+          .maxTimeMS(BOOKING_FORMS_HARD_TIMEOUT_MS)
+          .lean()
+          .catch((err) => {
+            if (isMaxTimeError(err)) {
+              console.warn('Booking forms equality name branch timed out:', err.message);
+              return [];
+            }
+            throw err;
+          });
+      })
+    );
+
+    const structuredRows = structuredChunks
+      .flat()
+      .filter((b) => bookingMatchesNameTokens(b, tokens));
+
+    const merged = sortBookingsNewestFirst(
+      dedupeBookingsById([...textRows, ...structuredRows])
+    );
+
+    const hasMore = merged.length > limit;
+    const pageRows = hasMore ? merged.slice(0, limit) : merged;
+    const lastDoc = pageRows[pageRows.length - 1];
+
+    return {
+      bookings: pageRows,
+      hasMore,
+      nextCursor: lastDoc
+        ? { beforeCreatedAt: lastDoc.createdAt, beforeId: String(lastDoc._id) }
+        : null,
+      via: textRows.length ? 'text+first-last' : 'first-last',
+    };
+  } catch (err) {
+    if (isMaxTimeError(err)) {
+      console.warn('Booking forms name search hit 10s limit:', err.message);
+      return { bookings: [], hasMore: false, nextCursor: null, via: 'timeout', timedOut: true };
+    }
+    throw err;
+  }
+}
+
+async function findAwbSummariesPage(awbTrim, { beforeCreatedAt, beforeId, limit = BOOKING_FORMS_LIMIT } = {}) {
+  const sanitizedAwb = sanitizeAwb(awbTrim);
+  if (!sanitizedAwb) return { error: 'Invalid AWB format' };
+
+  const upper = sanitizedAwb.toUpperCase();
+  const cursorFilter = buildCreatedAtCursorFilter(beforeCreatedAt, beforeId);
+
+  const run = async (awbFilter, via) => {
+    const filter =
+      Object.keys(cursorFilter).length > 0
+        ? { $and: [awbFilter, cursorFilter] }
+        : awbFilter;
+    const rows = await Booking.find(filter)
+      .select(BOOKING_FORMS_SUMMARY_PROJECTION)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .maxTimeMS(BOOKING_FORMS_HARD_TIMEOUT_MS)
+      .lean();
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const last = pageRows[pageRows.length - 1];
+    return {
+      bookings: pageRows,
+      hasMore,
+      nextCursor: last
+        ? { beforeCreatedAt: last.createdAt, beforeId: String(last._id) }
+        : null,
+      via,
+    };
+  };
+
+  try {
+    // Exact match first (uses awb/tracking indexes)
+    const exact = await run(
+      {
+        $or: [
+          { awb: upper },
+          { tracking_code: upper },
+          { awb_number: upper },
+          { referenceNumber: upper },
+        ],
+      },
+      'awb-exact'
+    );
+    if (exact.bookings.length) return exact;
+
+    // Prefix only if exact miss
+    const escapedAwb = sanitizeRegex(sanitizedAwb);
+    const awbRegex = new RegExp(`^${escapedAwb}`, 'i');
+    return await run(
+      {
+        $or: [
+          { awb: awbRegex },
+          { tracking_code: awbRegex },
+          { awb_number: awbRegex },
+          { referenceNumber: awbRegex },
+        ],
+      },
+      'awb-prefix'
+    );
+  } catch (err) {
+    if (isMaxTimeError(err)) {
+      console.warn('Booking forms AWB search hit 10s limit:', err.message);
+      return { bookings: [], hasMore: false, nextCursor: null, via: 'timeout', timedOut: true };
+    }
+    throw err;
+  }
+}
+
+// Step 1: search — names only / light summaries, 25 newest per page
+router.post('/search-approved-forms', auth, async (req, res) => {
+  const started = Date.now();
+  try {
+    const { awb, name, beforeCreatedAt, beforeId, limit } = req.body;
     const awbTrim = awb && String(awb).trim();
     const nameTrim = name && String(name).trim();
+    const pageSize = Math.min(
+      Math.max(parseInt(limit, 10) || BOOKING_FORMS_LIMIT, 1),
+      50
+    );
 
     if (!awbTrim && !nameTrim) {
       return res.status(400).json({
@@ -1201,68 +1542,78 @@ router.post('/search-approved-forms', auth, async (req, res) => {
       });
     }
 
-    let searchClause = null;
-
-    if (awbTrim) {
-      const sanitizedAwb = sanitizeAwb(awbTrim);
-      if (!sanitizedAwb) {
-        return res.status(400).json({ success: false, error: 'Invalid AWB format' });
-      }
-      const escapedAwb = sanitizeRegex(sanitizedAwb);
-      searchClause = {
-        $or: [
-          { awb: { $regex: escapedAwb, $options: 'i' } },
-          { tracking_code: { $regex: escapedAwb, $options: 'i' } },
-          { awb_number: { $regex: escapedAwb, $options: 'i' } },
-          { referenceNumber: { $regex: escapedAwb, $options: 'i' } },
-        ],
-      };
-    } else {
-      searchClause = buildPartyNameSearchQuery(nameTrim);
-      if (!searchClause) {
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid name search',
-        });
-      }
+    if (nameTrim && nameTrim.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'Name search requires at least 2 characters',
+      });
     }
 
-    const query = searchClause;
-    const listProjection =
-      'awb awb_number tracking_code referenceNumber review_status createdAt service service_code sender receiver shipmentType insured declaredAmount';
+    if (!awbTrim && nameTrim) {
+      const result = await findNameHitsPage(nameTrim, {
+        beforeCreatedAt,
+        beforeId,
+        limit: pageSize,
+      });
+      if (result.error) {
+        return res.status(400).json({ success: false, error: result.error });
+      }
+      const hits = (result.bookings || []).map(mapNameSearchHit);
+      return res.json({
+        success: true,
+        mode: 'names',
+        data: hits,
+        meta: {
+          count: hits.length,
+          tookMs: Date.now() - started,
+          via: result.via,
+          pageSize,
+          hasMore: !!result.hasMore,
+          nextCursor: result.nextCursor,
+          timedOut: !!result.timedOut,
+        },
+      });
+    }
 
-    const bookings = await Booking.find(query)
-      .select(listProjection)
-      .sort({ createdAt: -1 })
-      .limit(100)
-      .lean();
-
-    const data = bookings.map((b) => {
-      const awbVal =
-        b.tracking_code || b.awb_number || b.awb || b.referenceNumber || null;
-      const senderName =
-        b.sender?.fullName ||
-        b.sender?.name ||
-        [b.sender?.firstName, b.sender?.lastName].filter(Boolean).join(' ') ||
-        null;
-      const receiverName =
-        b.receiver?.fullName ||
-        b.receiver?.name ||
-        [b.receiver?.firstName, b.receiver?.lastName].filter(Boolean).join(' ') ||
-        null;
-      return {
-        _id: b._id,
-        awb: awbVal,
-        review_status: b.review_status,
-        createdAt: b.createdAt,
-        service: b.service || b.service_code,
-        sender_name: senderName,
-        receiver_name: receiverName,
-      };
+    const result = await findAwbSummariesPage(awbTrim, {
+      beforeCreatedAt,
+      beforeId,
+      limit: pageSize,
     });
+    if (result.error) {
+      return res.status(400).json({ success: false, error: result.error });
+    }
 
-    res.json({ success: true, data });
+    res.json({
+      success: true,
+      mode: 'summaries',
+      data: (result.bookings || []).map(mapBookingFormSummary),
+      meta: {
+        count: (result.bookings || []).length,
+        tookMs: Date.now() - started,
+        via: result.via,
+        pageSize,
+        hasMore: !!result.hasMore,
+        nextCursor: result.nextCursor,
+        timedOut: !!result.timedOut,
+      },
+    });
   } catch (error) {
+    if (isMaxTimeError(error)) {
+      console.warn('Booking forms search timed out:', error.message);
+      return res.json({
+        success: true,
+        mode: 'names',
+        data: [],
+        meta: {
+          count: 0,
+          tookMs: Date.now() - started,
+          via: 'timeout',
+          hasMore: false,
+          timedOut: true,
+        },
+      });
+    }
     console.error('Error searching booking forms:', error);
     res.status(500).json({
       success: false,
@@ -1271,6 +1622,27 @@ router.post('/search-approved-forms', auth, async (req, res) => {
     });
   }
 });
+
+// Step 2: after user clicks a name — fetch light summary for that booking only
+router.get('/:id/form-summary', auth, validateObjectIdParam('id'), async (req, res) => {
+  try {
+    const booking = await Booking.findById(req.params.id)
+      .select(BOOKING_FORMS_SUMMARY_PROJECTION)
+      .lean();
+    if (!booking) {
+      return res.status(404).json({ success: false, error: 'Booking not found' });
+    }
+    res.json({ success: true, data: mapBookingFormSummary(booking) });
+  } catch (error) {
+    console.error('Error fetching booking form summary:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch booking summary',
+      details: error.message,
+    });
+  }
+});
+
 
 // Search bookings by customer first name and last name
 // Returns full booking objects with AWB information for invoice request filtering

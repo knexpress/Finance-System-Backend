@@ -223,6 +223,28 @@ mongoose.connect(MONGODB_URI)
   } catch (err) {
     console.warn('[auto-review-worker] Startup init skipped:', err.message);
   }
+
+  // Ensure Booking Forms name search indexes (non-blocking; text index can take minutes)
+  (async () => {
+    try {
+      const { Booking } = require('./models');
+      const col = mongoose.connection.collection('bookings');
+      const indexes = await col.indexes();
+      for (const idx of indexes) {
+        const isText = idx.key && Object.values(idx.key).includes('text');
+        if (isText && idx.name !== 'bookings_party_name_text') {
+          console.log(`🧹 Dropping legacy bookings text index: ${idx.name}`);
+          await col.dropIndex(idx.name);
+        }
+      }
+      // Prefer background-friendly index creation; do not block server startup
+      Booking.createIndexes()
+        .then(() => console.log('✅ Booking party-name search indexes ready'))
+        .catch((e) => console.warn('⚠️ Booking createIndexes:', e.message));
+    } catch (idxErr) {
+      console.warn('⚠️ Booking name-index sync skipped:', idxErr.message);
+    }
+  })();
 })
 .catch((error) => {
   console.error('❌ MongoDB connection error:', error);
