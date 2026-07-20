@@ -1178,13 +1178,41 @@ function mapNameSearchHit(b) {
   };
 }
 
+function resolveBookingCreatedAt(b) {
+  if (!b || typeof b !== 'object') return null;
+  const candidates = [
+    b.createdAt,
+    b.created_at,
+    b.submittedAt,
+    b.submissionTimestamp,
+    b.booking_date,
+    b.date,
+  ];
+  for (const value of candidates) {
+    if (value == null || value === '') continue;
+    const d = new Date(value);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  // Fall back to ObjectId creation time when timestamps were never stored
+  try {
+    const rawId = b._id;
+    const oid =
+      rawId && typeof rawId.getTimestamp === 'function'
+        ? rawId
+        : new mongoose.Types.ObjectId(String(rawId));
+    return oid.getTimestamp().toISOString();
+  } catch {
+    return null;
+  }
+}
+
 function mapBookingFormSummary(b) {
   const awbVal = b.tracking_code || b.awb_number || b.awb || b.referenceNumber || null;
   return {
     _id: b._id,
     awb: awbVal,
     review_status: b.review_status,
-    createdAt: b.createdAt,
+    createdAt: resolveBookingCreatedAt(b),
     service: b.service || b.service_code,
     sender_name: partyDisplayName(b.sender),
     receiver_name: partyDisplayName(b.receiver),
@@ -1205,6 +1233,10 @@ const BOOKING_FORMS_NAME_PROJECTION = {
   customerName: 1,
   name: 1,
   createdAt: 1,
+  created_at: 1,
+  submittedAt: 1,
+  submissionTimestamp: 1,
+  booking_date: 1,
 };
 
 // After click: light summary only (still not full booking / identity docs)
