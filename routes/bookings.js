@@ -1207,7 +1207,13 @@ function resolveBookingCreatedAt(b) {
 }
 
 function mapBookingFormSummary(b) {
-  const awbVal = b.tracking_code || b.awb_number || b.awb || b.referenceNumber || null;
+  const awbVal =
+    b.tracking_code ||
+    b.trackingCode ||
+    b.awb_number ||
+    b.awb ||
+    b.referenceNumber ||
+    null;
   return {
     _id: b._id,
     awb: awbVal,
@@ -1245,6 +1251,7 @@ const BOOKING_FORMS_SUMMARY_PROJECTION = {
   awb: 1,
   awb_number: 1,
   tracking_code: 1,
+  trackingCode: 1,
   referenceNumber: 1,
   review_status: 1,
   service: 1,
@@ -1491,64 +1498,96 @@ async function findAwbSummariesPage(awbTrim, { beforeCreatedAt, beforeId, limit 
   if (!sanitizedAwb) return { error: 'Invalid AWB format' };
 
   const upper = sanitizedAwb.toUpperCase();
+  const lower = sanitizedAwb.toLowerCase();
+  const variants = Array.from(new Set([sanitizedAwb, upper, lower]));
   const cursorFilter = buildCreatedAtCursorFilter(beforeCreatedAt, beforeId);
 
-  const run = async (awbFilter, via) => {
+  // Indexed fields only — referenceNumber has no usable index and times out on this DB.
+  const exactFieldSpecs = [
+    { field: 'awb', hint: { awb: 1 } },
+    { field: 'tracking_code', hint: { tracking_code: 1 } },
+    { field: 'trackingCode', hint: { trackingCode: 1 } },
+    { field: 'awb_number', hint: { awb_number: 1 } },
+  ];
+
+  const runExactField = async ({ field, hint }) => {
+    const base = { [field]: { $in: variants } };
     const filter =
-      Object.keys(cursorFilter).length > 0
-        ? { $and: [awbFilter, cursorFilter] }
-        : awbFilter;
-    const rows = await Booking.find(filter)
+      Object.keys(cursorFilter).length > 0 ? { $and: [base, cursorFilter] } : base;
+    let q = Booking.find(filter)
       .select(BOOKING_FORMS_SUMMARY_PROJECTION)
-      .sort({ createdAt: -1, _id: -1 })
       .limit(limit + 1)
-      .maxTimeMS(BOOKING_FORMS_HARD_TIMEOUT_MS)
-      .lean();
-    const hasMore = rows.length > limit;
-    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+      .maxTimeMS(5000);
+    if (hint) q = q.hint(hint);
+    return q.lean().catch((err) => {
+      if (isMaxTimeError(err) || /hint|index/i.test(err.message || '')) {
+        if (isMaxTimeError(err)) {
+          console.warn(`Booking forms AWB exact (${field}) timed out:`, err.message);
+          return [];
+        }
+        return Booking.find(filter)
+          .select(BOOKING_FORMS_SUMMARY_PROJECTION)
+          .limit(limit + 1)
+          .maxTimeMS(5000)
+          .lean()
+          .catch((err2) => {
+            if (isMaxTimeError(err2)) return [];
+            return [];
+          });
+      }
+      console.warn(`Booking forms AWB exact (${field}) failed:`, err.message);
+      return [];
+    });
+  };
+
+  try {
+    const exactChunks = await Promise.all(exactFieldSpecs.map(runExactField));
+    let merged = sortBookingsNewestFirst(dedupeBookingsById(exactChunks.flat()));
+
+    // Prefix only for partial AWB on indexed fields (skip full-length AWB numbers)
+    if (!merged.length && sanitizedAwb.length >= 4 && sanitizedAwb.length < 17) {
+      const escapedAwb = sanitizeRegex(sanitizedAwb);
+      const awbRegex = new RegExp(`^${escapedAwb}`, 'i');
+      const prefixChunks = await Promise.all(
+        exactFieldSpecs.map(({ field, hint }) => {
+          const base = { [field]: awbRegex };
+          const filter =
+            Object.keys(cursorFilter).length > 0 ? { $and: [base, cursorFilter] } : base;
+          let q = Booking.find(filter)
+            .select(BOOKING_FORMS_SUMMARY_PROJECTION)
+            .limit(limit + 1)
+            .maxTimeMS(5000);
+          if (hint) q = q.hint(hint);
+          return q.lean().catch((err) => {
+            if (isMaxTimeError(err)) {
+              console.warn(`Booking forms AWB prefix (${field}) timed out:`, err.message);
+            }
+            return [];
+          });
+        })
+      );
+      merged = sortBookingsNewestFirst(dedupeBookingsById(prefixChunks.flat()));
+    }
+
+    const hasMore = merged.length > limit;
+    const pageRows = hasMore ? merged.slice(0, limit) : merged;
     const last = pageRows[pageRows.length - 1];
+
     return {
       bookings: pageRows,
       hasMore,
       nextCursor: last
-        ? { beforeCreatedAt: last.createdAt, beforeId: String(last._id) }
+        ? {
+            beforeCreatedAt: last.createdAt || resolveBookingCreatedAt(last),
+            beforeId: String(last._id),
+          }
         : null,
-      via,
+      via: pageRows.length ? 'awb-indexed' : 'awb-miss',
+      timedOut: false,
     };
-  };
-
-  try {
-    // Exact match first (uses awb/tracking indexes)
-    const exact = await run(
-      {
-        $or: [
-          { awb: upper },
-          { tracking_code: upper },
-          { awb_number: upper },
-          { referenceNumber: upper },
-        ],
-      },
-      'awb-exact'
-    );
-    if (exact.bookings.length) return exact;
-
-    // Prefix only if exact miss
-    const escapedAwb = sanitizeRegex(sanitizedAwb);
-    const awbRegex = new RegExp(`^${escapedAwb}`, 'i');
-    return await run(
-      {
-        $or: [
-          { awb: awbRegex },
-          { tracking_code: awbRegex },
-          { awb_number: awbRegex },
-          { referenceNumber: awbRegex },
-        ],
-      },
-      'awb-prefix'
-    );
   } catch (err) {
     if (isMaxTimeError(err)) {
-      console.warn('Booking forms AWB search hit 10s limit:', err.message);
+      console.warn('Booking forms AWB search hit time limit:', err.message);
       return { bookings: [], hasMore: false, nextCursor: null, via: 'timeout', timedOut: true };
     }
     throw err;
