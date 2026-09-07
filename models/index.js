@@ -801,6 +801,32 @@ const invoiceRequestSchema = new mongoose.Schema({
     required: false,
     default: 'N/A',
   },
+  // Tracks EmPost push state so ops can continue when EmPost is down
+  empost_sync: {
+    shipment_status: {
+      type: String,
+      enum: ['pending', 'ok', 'failed'],
+      required: false,
+    },
+    invoice_status: {
+      type: String,
+      enum: ['pending', 'ok', 'failed', 'n/a'],
+      required: false,
+    },
+    pending_type: {
+      type: String,
+      enum: ['shipment_creation', 'invoice'],
+      required: false,
+    },
+    last_error: {
+      type: String,
+      required: false,
+    },
+    last_attempt_at: {
+      type: Date,
+      required: false,
+    },
+  },
 }, {
   timestamps: true,
 });

@@ -12,6 +12,9 @@
     "seed:sales": "node scripts/seed-sales-user.js",
     "seed:invoices": "node scripts/seed-invoices.js",
     "pdfs:to-drive": "node scripts/batch-pdfs-to-drive.js",
+    "pdfs:reupload-missing": "node scripts/reupload-missing-drive-pdfs.js",
+    "google-drive:auth": "node scripts/google-drive-oauth-setup.js",
+    "google-drive:auth:write-env": "node scripts/google-drive-oauth-setup.js --write-env",
     "setup": "node setup-env.js",
     "test": "node scripts/test-connection.js"
   },

@@ -576,33 +576,59 @@ router.post('/bulk-create', auth, upload.single('csvFile'), async (req, res) => 
         console.log('✅ Invoice created:', invoice.invoice_id || invoice._id);
         createdInvoices.push(invoice);
 
-        // Integrate with EMpost API
+        // Integrate with EMpost API (non-blocking)
         try {
           const empostAPI = require('../services/empost-api');
+          const {
+            markEmpostShipmentOk,
+            markEmpostShipmentFailed,
+            markEmpostInvoiceOk,
+            markEmpostInvoiceFailed,
+            markEmpostInvoicePending,
+          } = require('../utils/empost-sync-status');
           // Populate invoice with client data for EMpost
           const populatedInvoice = await Invoice.findById(invoice._id)
             .populate('client_id', 'company_name contact_name email phone address city country');
           
           console.log('📦 Starting EMpost integration for CSV invoice:', invoice.invoice_id);
+          markEmpostInvoicePending(invoice);
+          await invoice.save();
           
           // Create shipment in EMpost
-          const shipmentResult = await empostAPI.createShipment(populatedInvoice);
-          
-          if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-            // Update invoice with uhawb
-            invoice.empost_uhawb = shipmentResult.data.uhawb;
+          try {
+            const shipmentResult = await empostAPI.createShipment(populatedInvoice);
+            
+            if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb && shipmentResult.data.uhawb !== 'N/A') {
+              markEmpostShipmentOk(invoice, shipmentResult.data.uhawb);
+              await invoice.save();
+              console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
+            } else {
+              markEmpostShipmentFailed(invoice, { message: 'EMPOST did not return a valid UHAWB.' });
+              await invoice.save();
+            }
+          } catch (shipmentError) {
+            markEmpostShipmentFailed(invoice, shipmentError);
             await invoice.save();
-            console.log('✅ Updated invoice with EMpost uhawb:', shipmentResult.data.uhawb);
+            throw shipmentError;
           }
           
           // Issue invoice in EMpost
           await empostAPI.issueInvoice(populatedInvoice);
+          markEmpostInvoiceOk(invoice);
+          await invoice.save();
           console.log('✅ EMpost integration completed successfully for CSV invoice');
           
         } catch (empostError) {
           // Log error but don't block invoice creation
           console.error('❌ EMpost integration failed for CSV invoice (invoice creation will continue):', empostError.message);
           console.error('Error details:', empostError.response?.data || empostError.message);
+          try {
+            const { markEmpostInvoiceFailed } = require('../utils/empost-sync-status');
+            markEmpostInvoiceFailed(invoice, empostError);
+            await invoice.save();
+          } catch (persistErr) {
+            console.warn('Could not persist EmPost invoice failure status:', persistErr.message);
+          }
         }
 
         // Create audit report for CSV-uploaded invoice - This happens immediately after invoice creation

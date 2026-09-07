@@ -1917,19 +1917,33 @@ router.put('/:id/verification', async (req, res) => {
     if (isEligibleOperationsStage && (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A')) {
       try {
         const empostAPI = require('../services/empost-api');
+        const {
+          markEmpostShipmentOk,
+          markEmpostShipmentFailed,
+        } = require('../utils/empost-sync-status');
         console.log('📦 Creating EMPOST shipment from verified InvoiceRequest...');
         
         const shipmentResult = await empostAPI.createShipmentFromInvoiceRequest(invoiceRequest);
         
-        if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb) {
-          // Store UHAWB in invoiceRequest for future reference
-          invoiceRequest.empost_uhawb = shipmentResult.data.uhawb;
+        if (shipmentResult && shipmentResult.data && shipmentResult.data.uhawb && shipmentResult.data.uhawb !== 'N/A') {
+          markEmpostShipmentOk(invoiceRequest, shipmentResult.data.uhawb);
           await invoiceRequest.save();
           console.log('✅ EMPOST shipment created with UHAWB:', shipmentResult.data.uhawb);
+        } else {
+          markEmpostShipmentFailed(invoiceRequest, {
+            message: 'EMPOST did not return a valid UHAWB.',
+          });
+          await invoiceRequest.save();
         }
       } catch (empostError) {
         console.error('❌ Failed to create EMPOST shipment (non-critical, will retry later):', empostError.message);
-        // Don't fail the verification update if EMPOST fails
+        try {
+          const { markEmpostShipmentFailed } = require('../utils/empost-sync-status');
+          markEmpostShipmentFailed(invoiceRequest, empostError);
+          await invoiceRequest.save();
+        } catch (_) {
+          /* ignore status persist errors */
+        }
       }
     } else if (!isEligibleOperationsStage) {
       console.log(`⏭️ Skipping EMPOST shipment creation: status ${invoiceRequest.status} is not an operations create stage`);
@@ -1971,13 +1985,15 @@ router.put('/:id/complete-verification', async (req, res) => {
     invoiceRequest.verification.verified_at = new Date();
     invoiceRequest.verification.verification_notes = verification_notes;
 
-    // Create EMPOST shipment automatically when verification is completed
-    // This creates ONLY the shipment, NOT the invoice (invoice will be generated later by Finance)
-    // Only create from operations flow (previous status IN_PROGRESS/VERIFIED)
-    // and only if UHAWB doesn't already exist (avoid duplicates).
+    // Create EMPOST shipment automatically when verification is completed.
+    // NON-BLOCKING: ops continues even if EmPost is down; item appears in superadmin pending widget.
     const isEligibleOperationsStage = isOperationsEmpostCreateStage(previousStatus);
     if (isEligibleOperationsStage && (!invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A')) {
       const empostAPI = require('../services/empost-api');
+      const {
+        markEmpostShipmentOk,
+        markEmpostShipmentFailed,
+      } = require('../utils/empost-sync-status');
       console.log('📦 Automatically creating EMPOST shipment from verified InvoiceRequest...');
 
       try {
@@ -1985,24 +2001,17 @@ router.put('/:id/complete-verification', async (req, res) => {
         const returnedUhawb = shipmentResult?.data?.uhawb;
 
         if (!returnedUhawb || returnedUhawb === 'N/A') {
-          console.error('❌ EMPOST shipment creation did not return a valid UHAWB.');
-          return res.status(502).json({
-            success: false,
-            error: 'EMPOST Booking Creation failed try again',
-            details: 'EMPOST did not return a valid UHAWB.',
+          console.error('❌ EMPOST shipment creation did not return a valid UHAWB (continuing ops).');
+          markEmpostShipmentFailed(invoiceRequest, {
+            message: 'EMPOST did not return a valid UHAWB.',
           });
+        } else {
+          markEmpostShipmentOk(invoiceRequest, returnedUhawb);
+          console.log('✅ EMPOST shipment created automatically with UHAWB:', returnedUhawb);
         }
-
-        // Store UHAWB before moving to VERIFIED status
-        invoiceRequest.empost_uhawb = returnedUhawb;
-        console.log('✅ EMPOST shipment created automatically with UHAWB:', returnedUhawb);
       } catch (empostError) {
-        console.error('❌ Failed to create EMPOST shipment automatically:', empostError.response?.data || empostError.message);
-        return res.status(502).json({
-          success: false,
-          error: 'EMPOST Booking Creation failed try again',
-          details: empostError.response?.data?.message || empostError.message,
-        });
+        console.error('❌ Failed to create EMPOST shipment automatically (non-critical):', empostError.response?.data || empostError.message);
+        markEmpostShipmentFailed(invoiceRequest, empostError);
       }
     } else if (!isEligibleOperationsStage) {
       console.log(`⏭️ Skipping EMPOST shipment creation: previous status ${previousStatus} is not an operations create stage`);
@@ -2010,14 +2019,17 @@ router.put('/:id/complete-verification', async (req, res) => {
       console.log('ℹ️ EMPOST shipment already exists with UHAWB:', invoiceRequest.empost_uhawb);
     }
 
-    // Move to next status - ready for finance (only after EMPOST create succeeds when required)
+    // Move to next status - ready for finance (EmPost failure does not block)
     invoiceRequest.status = 'VERIFIED';
     await invoiceRequest.save();
 
     res.json({
       success: true,
       invoiceRequest: normalizeInvoiceRequest(invoiceRequest),
-      message: 'Verification completed successfully'
+      message: 'Verification completed successfully',
+      empost_pending: !invoiceRequest.empost_uhawb || invoiceRequest.empost_uhawb === 'N/A'
+        ? 'shipment_creation'
+        : null,
     });
   } catch (error) {
     console.error('Error completing verification:', error);

@@ -282,6 +282,7 @@ app.use('/api/csv-upload', csvUploadRoutes);
 // Bookings routes
 app.use('/api/bookings', bookingsRoutes);
 app.use('/api/system-settings', systemSettingsRoutes);
+app.use('/api/empost', require('./routes/empost-pending'));
 
 // Inter-Department Chat routes
 app.use('/api/chat', chatRoutes);
