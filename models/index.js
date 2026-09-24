@@ -1340,6 +1340,122 @@ auditReportSchema.index({ createdAt: -1 });
 
 const AuditReport = mongoose.models.AuditReport || mongoose.model('AuditReport', auditReportSchema);
 
+// Standalone client quotation. No refs to invoices, bookings, users, or Empost.
+const manualQuotationSchema = new mongoose.Schema({
+  quotation_number: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  customer_name: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  customer_phone: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  customer_address: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  route: {
+    type: String,
+    required: true,
+    enum: ['PH_TO_UAE', 'UAE_TO_PH'],
+  },
+  actual_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  volumetric_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  chargeable_weight_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  weight_type: {
+    type: String,
+    required: true,
+    enum: ['ACTUAL', 'VOLUMETRIC'],
+  },
+  items: [{
+    name: { type: String, required: true, trim: true },
+    quantity: { type: Number, required: true, min: 1 },
+  }],
+  rate_per_kg: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  rate_bracket: {
+    type: String,
+    required: false,
+  },
+  shipping_amount: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  pickup_location: {
+    type: String,
+    required: true,
+    enum: ['INSIDE_DUBAI', 'OUTSIDE_DUBAI'],
+  },
+  pickup_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  pickup_vat: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  delivery_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0,
+  },
+  insurance_charge: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0,
+  },
+  total_amount: {
+    type: Number,
+    required: true,
+    min: 0,
+  },
+  currency: {
+    type: String,
+    default: 'AED',
+  },
+  notes: {
+    type: String,
+    required: false,
+    default: '',
+  },
+}, {
+  timestamps: true,
+});
+
+manualQuotationSchema.index({ createdAt: -1 });
+manualQuotationSchema.index({ customer_name: 1 });
+manualQuotationSchema.index({ customer_phone: 1 });
+
+const ManualQuotation = mongoose.models.ManualQuotation || mongoose.model('ManualQuotation', manualQuotationSchema);
+
 module.exports = {
   Department,
   Employee,
@@ -1356,5 +1472,6 @@ module.exports = {
   SystemSettings,
   ChatRoom,
   ChatMessage,
-  AuditReport
+  AuditReport,
+  ManualQuotation,
 };
