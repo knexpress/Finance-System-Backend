@@ -109,6 +109,9 @@ router.get('/:id', auth, async (req, res) => {
 
 router.post('/', auth, async (req, res) => {
   try {
+    const senderName = (req.body.sender_name || '').toString().trim();
+    const senderPhone = (req.body.sender_phone || '').toString().trim();
+    const senderAddress = (req.body.sender_address || '').toString().trim();
     const customerName = (req.body.customer_name || '').toString().trim();
     const customerPhone = (req.body.customer_phone || '').toString().trim();
     const customerAddress = (req.body.customer_address || '').toString().trim();
@@ -121,8 +124,11 @@ router.post('/', auth, async (req, res) => {
     const insuranceCharge = Number(req.body.insurance_charge || 0);
     const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
 
+    if (!senderName || !senderPhone || !senderAddress) {
+      return res.status(400).json({ success: false, error: 'Sender name, phone, and address are required' });
+    }
     if (!customerName || !customerPhone || !customerAddress) {
-      return res.status(400).json({ success: false, error: 'Customer name, phone, and address are required' });
+      return res.status(400).json({ success: false, error: 'Receiver name, phone, and address are required' });
     }
     if (route !== 'PH_TO_UAE' && route !== 'UAE_TO_PH') {
       return res.status(400).json({ success: false, error: 'Route must be PH to UAE or UAE to PH' });
@@ -163,6 +169,9 @@ router.post('/', auth, async (req, res) => {
 
     const quotation = await ManualQuotation.create({
       quotation_number: await nextQuotationNumber(),
+      sender_name: senderName,
+      sender_phone: senderPhone,
+      sender_address: senderAddress,
       customer_name: customerName,
       customer_phone: customerPhone,
       customer_address: customerAddress,

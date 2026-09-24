@@ -1347,6 +1347,21 @@ const manualQuotationSchema = new mongoose.Schema({
     required: true,
     unique: true,
   },
+  sender_name: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  sender_phone: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  sender_address: {
+    type: String,
+    required: true,
+    trim: true,
+  },
   customer_name: {
     type: String,
     required: true,
