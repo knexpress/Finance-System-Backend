@@ -53,14 +53,20 @@ function roundMoney(value) {
 }
 
 async function nextQuotationNumber() {
-  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const count = await ManualQuotation.countDocuments();
-    const quotationNumber = `QT-${stamp}-${String(count + 1 + attempt).padStart(4, '0')}`;
-    const exists = await ManualQuotation.exists({ quotation_number: quotationNumber });
-    if (!exists) return quotationNumber;
+  const existing = await ManualQuotation.find({ quotation_number: /^QUOTATION-\d+$/ })
+    .select('quotation_number')
+    .lean();
+  let highest = 4520;
+  for (const row of existing) {
+    const number = parseInt(String(row.quotation_number).replace('QUOTATION-', ''), 10);
+    if (Number.isFinite(number) && number > highest) highest = number;
   }
-  return `QT-${stamp}-${Date.now().toString().slice(-6)}`;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const quotationNumber = `QUOTATION-${highest + 1 + attempt}`;
+    const taken = await ManualQuotation.exists({ quotation_number: quotationNumber });
+    if (!taken) return quotationNumber;
+  }
+  return `QUOTATION-${highest + 1 + Date.now().toString().slice(-4)}`;
 }
 
 router.get('/', auth, async (req, res) => {
