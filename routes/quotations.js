@@ -107,68 +107,67 @@ router.get('/:id', auth, async (req, res) => {
   }
 });
 
-router.post('/', auth, async (req, res) => {
-  try {
-    const senderName = (req.body.sender_name || '').toString().trim();
-    const senderPhone = (req.body.sender_phone || '').toString().trim();
-    const senderAddress = (req.body.sender_address || '').toString().trim();
-    const customerName = (req.body.customer_name || '').toString().trim();
-    const customerPhone = (req.body.customer_phone || '').toString().trim();
-    const customerAddress = (req.body.customer_address || '').toString().trim();
-    const route = (req.body.route || '').toString().toUpperCase();
-    const actualWeight = Number(req.body.actual_weight_kg);
-    const volumetricWeight = Number(req.body.volumetric_weight_kg);
-    const notes = (req.body.notes || '').toString().trim();
-    const pickupLocation = (req.body.pickup_location || '').toString().toUpperCase();
-    const deliveryCharge = Number(req.body.delivery_charge || 0);
-    const insuranceCharge = Number(req.body.insurance_charge || 0);
-    const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
+function buildQuotationFields(body) {
+  const senderName = (body.sender_name || '').toString().trim();
+  const senderPhone = (body.sender_phone || '').toString().trim();
+  const senderAddress = (body.sender_address || '').toString().trim();
+  const customerName = (body.customer_name || '').toString().trim();
+  const customerPhone = (body.customer_phone || '').toString().trim();
+  const customerAddress = (body.customer_address || '').toString().trim();
+  const route = (body.route || '').toString().toUpperCase();
+  const actualWeight = Number(body.actual_weight_kg);
+  const volumetricWeight = Number(body.volumetric_weight_kg);
+  const notes = (body.notes || '').toString().trim();
+  const pickupLocation = (body.pickup_location || '').toString().toUpperCase();
+  const deliveryCharge = Number(body.delivery_charge || 0);
+  const insuranceCharge = Number(body.insurance_charge || 0);
+  const rawItems = Array.isArray(body.items) ? body.items : [];
 
-    if (!senderName || !senderPhone || !senderAddress) {
-      return res.status(400).json({ success: false, error: 'Sender name, phone, and address are required' });
-    }
-    if (!customerName || !customerPhone || !customerAddress) {
-      return res.status(400).json({ success: false, error: 'Receiver name, phone, and address are required' });
-    }
-    if (route !== 'PH_TO_UAE' && route !== 'UAE_TO_PH') {
-      return res.status(400).json({ success: false, error: 'Route must be PH to UAE or UAE to PH' });
-    }
-    if (!Number.isFinite(actualWeight) || actualWeight <= 0 || !Number.isFinite(volumetricWeight) || volumetricWeight <= 0) {
-      return res.status(400).json({ success: false, error: 'Actual weight and volumetric weight must be greater than 0 kg' });
-    }
-    if (pickupLocation !== 'INSIDE_DUBAI' && pickupLocation !== 'OUTSIDE_DUBAI') {
-      return res.status(400).json({ success: false, error: 'Choose pickup inside Dubai or outside Dubai' });
-    }
-    if (!Number.isFinite(deliveryCharge) || deliveryCharge < 0 || !Number.isFinite(insuranceCharge) || insuranceCharge < 0) {
-      return res.status(400).json({ success: false, error: 'Delivery and insurance charges must be 0 or more' });
-    }
+  if (!senderName || !senderPhone || !senderAddress) {
+    return { error: 'Sender name, phone, and address are required' };
+  }
+  if (!customerName || !customerPhone || !customerAddress) {
+    return { error: 'Receiver name, phone, and address are required' };
+  }
+  if (route !== 'PH_TO_UAE' && route !== 'UAE_TO_PH') {
+    return { error: 'Route must be PH to UAE or UAE to PH' };
+  }
+  if (!Number.isFinite(actualWeight) || actualWeight <= 0 || !Number.isFinite(volumetricWeight) || volumetricWeight <= 0) {
+    return { error: 'Actual weight and volumetric weight must be greater than 0 kg' };
+  }
+  if (pickupLocation !== 'INSIDE_DUBAI' && pickupLocation !== 'OUTSIDE_DUBAI' && pickupLocation !== 'DROP_OFF') {
+    return { error: 'Choose inside Dubai, outside Dubai, or drop off' };
+  }
+  if (!Number.isFinite(deliveryCharge) || deliveryCharge < 0 || !Number.isFinite(insuranceCharge) || insuranceCharge < 0) {
+    return { error: 'Delivery and insurance charges must be 0 or more' };
+  }
 
-    const items = rawItems
-      .map((item) => ({
-        name: (item?.name || '').toString().trim(),
-        quantity: parseInt(item?.quantity, 10),
-      }))
-      .filter((item) => item.name && item.quantity > 0);
+  const items = rawItems
+    .map((item, index) => ({
+      box_number: (item?.box_number || String(index + 1)).toString().trim(),
+      name: (item?.name || '').toString().trim(),
+      quantity: parseInt(item?.quantity, 10),
+    }))
+    .filter((item) => item.name && item.quantity > 0);
 
-    if (!items.length) {
-      return res.status(400).json({ success: false, error: 'Add at least one item' });
-    }
+  if (!items.length) {
+    return { error: 'Add at least one item' };
+  }
 
-    const chargeableWeight = Math.max(actualWeight, volumetricWeight);
-    const weightType = actualWeight >= volumetricWeight ? 'ACTUAL' : 'VOLUMETRIC';
-    const ratePerKg = Number(req.body.rate_per_kg);
-    if (!Number.isFinite(ratePerKg) || ratePerKg <= 0) {
-      return res.status(400).json({ success: false, error: 'Enter a rate per kg greater than 0' });
-    }
-    const shippingAmount = roundMoney(chargeableWeight * ratePerKg);
-    const pickupCharge = pickupLocation === 'INSIDE_DUBAI' ? 20 : 25.71;
-    const pickupVat = roundMoney(pickupCharge * 0.05);
-    const delivery = roundMoney(deliveryCharge);
-    const insurance = roundMoney(insuranceCharge);
-    const totalAmount = roundMoney(shippingAmount + pickupCharge + pickupVat + delivery + insurance);
+  const ratePerKg = Number(body.rate_per_kg);
+  if (!Number.isFinite(ratePerKg) || ratePerKg <= 0) {
+    return { error: 'Enter a rate per kg greater than 0' };
+  }
 
-    const quotation = await ManualQuotation.create({
-      quotation_number: await nextQuotationNumber(),
+  const chargeableWeight = Math.max(actualWeight, volumetricWeight);
+  const shippingAmount = roundMoney(chargeableWeight * ratePerKg);
+  const pickupCharge = pickupLocation === 'INSIDE_DUBAI' ? 20 : pickupLocation === 'OUTSIDE_DUBAI' ? 25.71 : 0;
+  const pickupVat = roundMoney(pickupCharge * 0.05);
+  const delivery = roundMoney(deliveryCharge);
+  const insurance = roundMoney(insuranceCharge);
+
+  return {
+    fields: {
       sender_name: senderName,
       sender_phone: senderPhone,
       sender_address: senderAddress,
@@ -179,7 +178,7 @@ router.post('/', auth, async (req, res) => {
       actual_weight_kg: roundMoney(actualWeight),
       volumetric_weight_kg: roundMoney(volumetricWeight),
       chargeable_weight_kg: roundMoney(chargeableWeight),
-      weight_type: weightType,
+      weight_type: actualWeight >= volumetricWeight ? 'ACTUAL' : 'VOLUMETRIC',
       items,
       rate_per_kg: roundMoney(ratePerKg),
       rate_bracket: '',
@@ -189,15 +188,52 @@ router.post('/', auth, async (req, res) => {
       pickup_vat: pickupVat,
       delivery_charge: delivery,
       insurance_charge: insurance,
-      total_amount: totalAmount,
+      total_amount: roundMoney(shippingAmount + pickupCharge + pickupVat + delivery + insurance),
       currency: 'AED',
       notes,
+    },
+  };
+}
+
+router.post('/', auth, async (req, res) => {
+  try {
+    const built = buildQuotationFields(req.body);
+    if (built.error) {
+      return res.status(400).json({ success: false, error: built.error });
+    }
+
+    const quotation = await ManualQuotation.create({
+      quotation_number: await nextQuotationNumber(),
+      ...built.fields,
     });
 
     res.status(201).json({ success: true, data: quotation });
   } catch (error) {
     console.error('Error creating quotation:', error);
     res.status(500).json({ success: false, error: 'Failed to create quotation' });
+  }
+});
+
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const built = buildQuotationFields(req.body);
+    if (built.error) {
+      return res.status(400).json({ success: false, error: built.error });
+    }
+
+    const quotation = await ManualQuotation.findByIdAndUpdate(
+      req.params.id,
+      built.fields,
+      { new: true, runValidators: true }
+    );
+    if (!quotation) {
+      return res.status(404).json({ success: false, error: 'Quotation not found' });
+    }
+
+    res.json({ success: true, data: quotation });
+  } catch (error) {
+    console.error('Error updating quotation:', error);
+    res.status(500).json({ success: false, error: 'Failed to update quotation' });
   }
 });
 
