@@ -150,13 +150,10 @@ router.post('/', auth, async (req, res) => {
 
     const chargeableWeight = Math.max(actualWeight, volumetricWeight);
     const weightType = actualWeight >= volumetricWeight ? 'ACTUAL' : 'VOLUMETRIC';
-    const brackets = loadBrackets(route);
-    const bracket = matchBracket(chargeableWeight, brackets);
-    if (!bracket) {
-      return res.status(400).json({ success: false, error: 'No price bracket found for this route' });
+    const ratePerKg = Number(req.body.rate_per_kg);
+    if (!Number.isFinite(ratePerKg) || ratePerKg <= 0) {
+      return res.status(400).json({ success: false, error: 'Enter a rate per kg greater than 0' });
     }
-
-    const ratePerKg = Number(bracket.rate);
     const shippingAmount = roundMoney(chargeableWeight * ratePerKg);
     const pickupCharge = pickupLocation === 'INSIDE_DUBAI' ? 20 : 25.71;
     const pickupVat = roundMoney(pickupCharge * 0.05);
@@ -175,8 +172,8 @@ router.post('/', auth, async (req, res) => {
       chargeable_weight_kg: roundMoney(chargeableWeight),
       weight_type: weightType,
       items,
-      rate_per_kg: ratePerKg,
-      rate_bracket: bracket.label || '',
+      rate_per_kg: roundMoney(ratePerKg),
+      rate_bracket: '',
       shipping_amount: shippingAmount,
       pickup_location: pickupLocation,
       pickup_charge: pickupCharge,
