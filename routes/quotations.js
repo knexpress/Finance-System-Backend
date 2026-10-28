@@ -52,6 +52,14 @@ function roundMoney(value) {
   return Math.round(value * 100) / 100;
 }
 
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function contains(value) {
+  return { $regex: escapeRegex(value), $options: 'i' };
+}
+
 async function nextQuotationNumber() {
   const existing = await ManualQuotation.find({ quotation_number: /^QUOTATION-\d+$/ })
     .select('quotation_number')
@@ -72,17 +80,45 @@ async function nextQuotationNumber() {
 router.get('/', auth, async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 1000);
     const search = (req.query.search || '').toString().trim();
-    const filter = {};
+    const number = (req.query.number || '').toString().trim();
+    const sender = (req.query.sender || '').toString().trim();
+    const receiver = (req.query.receiver || '').toString().trim();
+    const route = (req.query.route || '').toString().trim();
+    const and = [];
 
     if (search) {
-      filter.$or = [
-        { quotation_number: { $regex: search, $options: 'i' } },
-        { customer_name: { $regex: search, $options: 'i' } },
-        { customer_phone: { $regex: search, $options: 'i' } },
-      ];
+      and.push({
+        $or: [
+          { quotation_number: contains(search) },
+          { customer_name: contains(search) },
+          { customer_phone: contains(search) },
+          { sender_name: contains(search) },
+          { sender_phone: contains(search) },
+        ],
+      });
     }
+    if (number) and.push({ quotation_number: contains(number) });
+    if (sender) {
+      and.push({
+        $or: [
+          { sender_name: contains(sender) },
+          { sender_phone: contains(sender) },
+        ],
+      });
+    }
+    if (receiver) {
+      and.push({
+        $or: [
+          { customer_name: contains(receiver) },
+          { customer_phone: contains(receiver) },
+        ],
+      });
+    }
+    if (route === 'PH_TO_UAE' || route === 'UAE_TO_PH') and.push({ route });
+
+    const filter = and.length ? { $and: and } : {};
 
     const [data, total] = await Promise.all([
       ManualQuotation.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
