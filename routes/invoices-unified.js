@@ -7,9 +7,179 @@ const { syncInvoiceWithEMPost } = require('../utils/empost-sync');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 const { reinitiateDeliveryAssignmentForInvoice } = require('../utils/reinitiate-delivery-assignment');
 const { generateUniqueInvoiceID } = require('../utils/id-generators');
+const { generateAwbPDF } = require('../services/awb-pdf-generator');
 // const { createNotificationsForAllUsers } = require('./notifications');
 
 const router = express.Router();
+
+/**
+ * Resolve booking / invoice-request payload for AWB generation from a unified Invoice.
+ */
+async function resolveAwbSourceFromInvoice(invoice) {
+  const invoiceObj = invoice?.toObject ? invoice.toObject() : { ...(invoice || {}) };
+  let requestIdValue = null;
+
+  if (invoiceObj.request_id) {
+    if (typeof invoiceObj.request_id === 'object' && invoiceObj.request_id._id) {
+      requestIdValue = invoiceObj.request_id._id.toString();
+    } else {
+      requestIdValue = invoiceObj.request_id.toString();
+    }
+  }
+
+  if (!requestIdValue && invoiceObj.notes) {
+    const notesMatch = String(invoiceObj.notes).match(
+      /Invoice for request ([a-fA-F0-9]{24}|\w+)/
+    );
+    if (notesMatch?.[1]) requestIdValue = notesMatch[1];
+  }
+
+  const awb =
+    invoiceObj.awb_number ||
+    invoiceObj.awb ||
+    invoiceObj.tracking_code ||
+    null;
+
+  let invoiceRequest = null;
+  if (requestIdValue && mongoose.Types.ObjectId.isValid(requestIdValue)) {
+    invoiceRequest = await InvoiceRequest.findById(requestIdValue).lean();
+  }
+  if (!invoiceRequest && awb) {
+    invoiceRequest = await InvoiceRequest.findOne({
+      $or: [{ tracking_code: awb }, { awb_number: awb }, { awb }],
+    }).lean();
+  }
+
+  let booking = null;
+  const bookingId =
+    invoiceRequest?.booking_id?._id ||
+    invoiceRequest?.booking_id ||
+    invoiceObj.booking_id ||
+    null;
+  if (bookingId && mongoose.Types.ObjectId.isValid(String(bookingId))) {
+    booking = await Booking.findById(bookingId).lean();
+  }
+  if (!booking && awb) {
+    booking = await Booking.findOne({
+      $or: [{ awb }, { awb_number: awb }, { tracking_code: awb }],
+    }).lean();
+  }
+
+  if (!invoiceRequest && !booking) {
+    return null;
+  }
+
+  const merged = {
+    ...(booking || {}),
+    ...(invoiceRequest || {}),
+    awb:
+      awb ||
+      invoiceRequest?.tracking_code ||
+      invoiceRequest?.awb_number ||
+      booking?.awb ||
+      booking?.awb_number ||
+      booking?.tracking_code,
+    awb_number:
+      awb ||
+      invoiceRequest?.awb_number ||
+      invoiceRequest?.tracking_code ||
+      booking?.awb_number ||
+      booking?.awb,
+    tracking_code:
+      invoiceRequest?.tracking_code ||
+      awb ||
+      booking?.tracking_code ||
+      booking?.awb,
+    service:
+      invoiceObj.service_code ||
+      invoiceRequest?.service_code ||
+      invoiceRequest?.verification?.service_code ||
+      booking?.service ||
+      booking?.service_code,
+    service_code:
+      invoiceObj.service_code ||
+      invoiceRequest?.service_code ||
+      booking?.service_code ||
+      booking?.service,
+    weight_kg:
+      invoiceObj.weight_kg ||
+      invoiceRequest?.weight_kg ||
+      invoiceRequest?.weight ||
+      invoiceRequest?.verification?.chargeable_weight ||
+      booking?.weight_kg ||
+      booking?.weight,
+    number_of_boxes:
+      invoiceObj.number_of_boxes ||
+      invoiceRequest?.verification?.number_of_boxes ||
+      invoiceRequest?.number_of_boxes ||
+      booking?.number_of_boxes ||
+      booking?.numberOfBoxes,
+    declaredAmount:
+      booking?.declaredAmount ??
+      booking?.declared_amount ??
+      invoiceRequest?.declaredAmount ??
+      invoiceRequest?.declared_amount ??
+      null,
+    items: booking?.items || invoiceRequest?.items || invoiceRequest?.listed_commodities || [],
+    sender: booking?.sender || invoiceRequest?.sender || invoiceRequest?.booking_snapshot?.sender,
+    receiver:
+      booking?.receiver || invoiceRequest?.receiver || invoiceRequest?.booking_snapshot?.receiver,
+    verification: invoiceRequest?.verification || booking?.verification,
+    createdAt:
+      booking?.createdAt || invoiceRequest?.createdAt || invoiceObj.issue_date || invoiceObj.createdAt,
+  };
+
+  // Flatten common invoice-request flat fields into sender/receiver if missing
+  if (!merged.sender || !merged.sender.fullName) {
+    merged.sender = {
+      ...(merged.sender || {}),
+      fullName:
+        merged.sender?.fullName ||
+        merged.sender?.name ||
+        invoiceRequest?.customer_name ||
+        invoiceObj.customer_name ||
+        invoiceObj.client_id?.contact_name ||
+        invoiceObj.client_id?.company_name,
+      completeAddress:
+        merged.sender?.completeAddress ||
+        merged.sender?.address ||
+        invoiceRequest?.origin_place ||
+        invoiceObj.origin_place,
+      phone:
+        merged.sender?.phone ||
+        merged.sender?.contactNo ||
+        invoiceRequest?.customer_phone ||
+        invoiceObj.customer_phone,
+      email:
+        merged.sender?.email ||
+        invoiceRequest?.customer_email ||
+        invoiceObj.customer_email,
+    };
+  }
+  if (!merged.receiver || !merged.receiver.fullName) {
+    merged.receiver = {
+      ...(merged.receiver || {}),
+      fullName:
+        merged.receiver?.fullName ||
+        merged.receiver?.name ||
+        invoiceRequest?.receiver_name ||
+        invoiceObj.receiver_name,
+      completeAddress:
+        merged.receiver?.completeAddress ||
+        merged.receiver?.address ||
+        invoiceRequest?.receiver_address ||
+        invoiceObj.receiver_address,
+      phone:
+        merged.receiver?.phone ||
+        merged.receiver?.contactNo ||
+        invoiceRequest?.receiver_phone ||
+        invoiceObj.receiver_phone,
+      email: merged.receiver?.email || invoiceRequest?.receiver_email,
+    };
+  }
+
+  return merged;
+}
 
 const REQUEST_POPULATE_FIELDS = 'request_id awb_number customer route status shipment verification number_of_boxes origin_place destination_place receiver_name receiver_address receiver_phone';
 
@@ -325,6 +495,51 @@ router.get('/', async (req, res) => {
     res.status(500).json({ 
       success: false,
       error: 'Failed to fetch invoices' 
+    });
+  }
+});
+
+// GET /api/invoices-unified/:id/awb — KNEXPRESS waybill / AWB PDF for this invoice
+router.get('/:id/awb', validateObjectIdParam('id'), async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id)
+      .populate('client_id', 'company_name contact_name email phone')
+      .lean();
+
+    if (!invoice) {
+      return res.status(404).json({ success: false, error: 'Invoice not found' });
+    }
+
+    const merged = await resolveAwbSourceFromInvoice(invoice);
+    if (!merged) {
+      return res.status(404).json({
+        success: false,
+        error: 'No booking/waybill data found for this invoice',
+      });
+    }
+
+    const awb =
+      merged.awb ||
+      merged.awb_number ||
+      merged.tracking_code ||
+      invoice.awb_number ||
+      'PENDING';
+
+    const pdfBuffer = await generateAwbPDF(merged);
+    const safeName = String(awb).replace(/[^A-Za-z0-9_-]/g, '_');
+    const fileName = `KNEXPRESS-AWB-${safeName}.pdf`;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Error generating invoice AWB PDF:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to generate AWB PDF',
+      details: error.message,
     });
   }
 });
@@ -1588,6 +1803,35 @@ router.post('/', async (req, res) => {
     });
     
     await invoice.save();
+
+    // Keep booking.batch_no in sync so Cargo Status (Batch No) can show it even if invoice join is incomplete
+    try {
+      const trimmedBatch = batch_number.toString().trim();
+      const bookingSyncFilter = {
+        $or: [{ converted_to_invoice_request_id: request_id }],
+      };
+      if (invoiceRequest?.booking_id) {
+        bookingSyncFilter.$or.push({ _id: invoiceRequest.booking_id });
+      }
+      if (awbNumberToUse) {
+        bookingSyncFilter.$or.push(
+          { awb: awbNumberToUse },
+          { awb_number: awbNumberToUse },
+          { tracking_code: awbNumberToUse }
+        );
+      }
+      const bookingSyncResult = await Booking.updateMany(bookingSyncFilter, {
+        $set: { batch_no: trimmedBatch },
+      });
+      console.log(
+        `✅ Synced batch_no="${trimmedBatch}" to ${bookingSyncResult.modifiedCount || 0} booking(s)`
+      );
+    } catch (batchSyncErr) {
+      console.warn(
+        '⚠️ Failed to sync batch_no onto booking:',
+        batchSyncErr?.message || batchSyncErr
+      );
+    }
 
     // Sync invoice to EMPOST
     await syncInvoiceWithEMPost({
@@ -2885,6 +3129,33 @@ router.put('/:id', async (req, res) => {
     // Apply all updates to invoice
     Object.assign(invoice, updateData);
     await invoice.save();
+
+    // Sync batch_number onto linked booking(s) for Cargo Status display
+    if (preparedUpdate.batch_number) {
+      try {
+        const syncFilter = { $or: [] };
+        if (invoice.request_id) {
+          syncFilter.$or.push({ converted_to_invoice_request_id: invoice.request_id });
+        }
+        if (invoice.awb_number) {
+          syncFilter.$or.push(
+            { awb: invoice.awb_number },
+            { awb_number: invoice.awb_number },
+            { tracking_code: invoice.awb_number }
+          );
+        }
+        if (syncFilter.$or.length > 0) {
+          await Booking.updateMany(syncFilter, {
+            $set: { batch_no: preparedUpdate.batch_number },
+          });
+        }
+      } catch (batchSyncErr) {
+        console.warn(
+          '⚠️ Failed to sync updated batch_no onto booking:',
+          batchSyncErr?.message || batchSyncErr
+        );
+      }
+    }
 
     // Populate the updated invoice for response
     const populatedInvoice = await Invoice.findById(invoice._id)

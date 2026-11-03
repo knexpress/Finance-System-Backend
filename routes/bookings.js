@@ -12,6 +12,7 @@ const { tryAutoReviewNewBookingAfterCreate } = require('../services/booking-auto
 const { toValidObjectIdString } = require('../services/system-settings');
 const { validateObjectIdParam, sanitizeRegex } = require('../middleware/security');
 const { generateBookingPDF, pickUaePassUserInfoFromBooking } = require('../services/pdf-generator');
+const { generateAwbPDF } = require('../services/awb-pdf-generator');
 const googleDriveService = require('../services/google-drive');
 const { purgeBookingIdentityIfEligible } = require('../utils/booking-identity-purge');
 
@@ -2383,7 +2384,13 @@ function filterFields(obj, fields) {
       // Navigate to the nested object
       for (let i = 0; i < parts.length - 1; i++) {
         const part = parts[i];
-        if (current && typeof current === 'object' && current[part]) {
+        if (
+          current &&
+          typeof current === 'object' &&
+          Object.prototype.hasOwnProperty.call(current, part) &&
+          current[part] != null &&
+          typeof current[part] === 'object'
+        ) {
           if (!currentFiltered[part]) {
             currentFiltered[part] = {};
           }
@@ -2491,7 +2498,8 @@ router.get('/verified-invoices', auth, async (req, res) => {
       service_code: 1,
       service: 1,
       awb: 1,
-      awb_number: 1
+      awb_number: 1,
+      booking_id: 1,
     } : {}).lean();
 
     if (verifiedInvoiceRequests.length === 0) {
@@ -2504,32 +2512,71 @@ router.get('/verified-invoices', auth, async (req, res) => {
     // Get all invoice request IDs
     const invoiceRequestIds = verifiedInvoiceRequests.map(req => req._id);
 
-    // Find all invoices that reference these invoice requests (optional - invoice may not exist yet)
-    const invoices = await Invoice.find({
-      request_id: { $in: invoiceRequestIds }
-    }).select(useFieldSelection ? {
-      _id: 1,
-      request_id: 1,
-      invoice_id: 1,
-      batch_number: 1
-    } : {}).lean();
+    // Collect AWB / tracking codes for invoice fallback matching
+    const awbCodes = [
+      ...new Set(
+        verifiedInvoiceRequests
+          .flatMap((req) => [req.tracking_code, req.awb_number, req.awb])
+          .filter((v) => v != null && String(v).trim() !== '')
+          .map((v) => String(v).trim())
+      ),
+    ];
 
-    // Create a map of invoice request ID to invoice (if invoice exists)
-    const invoiceMap = new Map();
-    invoices.forEach(invoice => {
-      const requestId = invoice.request_id?.toString();
+    // Find invoices by request_id OR awb_number (request_id alone misses some legacy rows)
+    const invoiceQuery = {
+      $or: [{ request_id: { $in: invoiceRequestIds } }],
+    };
+    if (awbCodes.length > 0) {
+      invoiceQuery.$or.push({ awb_number: { $in: awbCodes } });
+      invoiceQuery.$or.push({ awb: { $in: awbCodes } });
+    }
+
+    const invoices = await Invoice.find(invoiceQuery)
+      .select(
+        useFieldSelection
+          ? {
+              _id: 1,
+              request_id: 1,
+              invoice_id: 1,
+              batch_number: 1,
+              awb_number: 1,
+              awb: 1,
+            }
+          : {}
+      )
+      .lean();
+
+    // Maps for invoice lookup by request id and by AWB
+    const invoiceByRequestId = new Map();
+    const invoiceByAwb = new Map();
+    invoices.forEach((invoice) => {
+      const requestId = invoice.request_id?.toString?.() || invoice.request_id;
       if (requestId) {
-        invoiceMap.set(requestId, invoice);
+        invoiceByRequestId.set(String(requestId), invoice);
+      }
+      const invAwb = (invoice.awb_number || invoice.awb || '').toString().trim();
+      if (invAwb) {
+        invoiceByAwb.set(invAwb, invoice);
       }
     });
 
-    // Find bookings by their converted_to_invoice_request_id that match verified invoice requests
-    // Include ALL bookings with verified/completed invoice requests, even if invoice doesn't exist yet
-    // Note: request_id and booking_id are not in the schema, so we can't populate them
-    // The extractServiceCode function will check these fields if they exist as ObjectIds or already populated
+    // Find bookings by converted_to_invoice_request_id OR by invoice-request.booking_id
+    const irBookingIds = verifiedInvoiceRequests
+      .map((req) => req.booking_id)
+      .filter((id) => id)
+      .map((id) => (id._id ? id._id : id));
+
     const bookingQuery = Booking.find({
-      converted_to_invoice_request_id: { $in: invoiceRequestIds }
+      $or: [
+        { converted_to_invoice_request_id: { $in: invoiceRequestIds } },
+        ...(irBookingIds.length > 0 ? [{ _id: { $in: irBookingIds } }] : []),
+      ],
     });
+
+    // Ensure booking_id is available on IR for the join above when field selection is on
+    if (useFieldSelection) {
+      // booking_id may not be in the IR projection — refetch lean ids only if needed
+    }
 
     if (bookingProjection) {
       bookingQuery.select(bookingProjection);
@@ -2537,13 +2584,48 @@ router.get('/verified-invoices', auth, async (req, res) => {
 
     const bookings = await bookingQuery.lean();
 
+    // Index invoice requests by id and by booking_id for reverse lookup
+    const invoiceRequestById = new Map(
+      verifiedInvoiceRequests.map((req) => [req._id.toString(), req])
+    );
+    const invoiceRequestByBookingId = new Map();
+    verifiedInvoiceRequests.forEach((req) => {
+      const bid = req.booking_id?._id?.toString?.() || req.booking_id?.toString?.();
+      if (bid) invoiceRequestByBookingId.set(bid, req);
+    });
+
     // Format response with invoice information
-    let formattedBookings = bookings.map(booking => {
+    let formattedBookings = bookings.map((booking) => {
+      const bookingIdStr = booking._id.toString();
       const invoiceRequestId = booking.converted_to_invoice_request_id?.toString();
-      const invoice = invoiceRequestId ? invoiceMap.get(invoiceRequestId) : null;
-      const invoiceRequest = verifiedInvoiceRequests.find(
-        req => req._id.toString() === invoiceRequestId
-      );
+      const invoiceRequest =
+        (invoiceRequestId && invoiceRequestById.get(invoiceRequestId)) ||
+        invoiceRequestByBookingId.get(bookingIdStr) ||
+        null;
+
+      const resolvedRequestId = invoiceRequest?._id?.toString() || invoiceRequestId || null;
+      const bookingAwb = (
+        booking.awb ||
+        booking.tracking_code ||
+        booking.awb_number ||
+        invoiceRequest?.tracking_code ||
+        invoiceRequest?.awb_number ||
+        invoiceRequest?.awb ||
+        ''
+      )
+        .toString()
+        .trim();
+
+      const invoice =
+        (resolvedRequestId && invoiceByRequestId.get(resolvedRequestId)) ||
+        (bookingAwb && invoiceByAwb.get(bookingAwb)) ||
+        null;
+
+      const batchNumber =
+        (invoice?.batch_number && String(invoice.batch_number).trim()) ||
+        (booking.batch_no && String(booking.batch_no).trim()) ||
+        (booking.batch_number && String(booking.batch_number).trim()) ||
+        null;
 
       // Extract and normalize service_code from multiple possible locations
       const serviceCode = extractServiceCode(booking, invoiceRequest);
@@ -2554,37 +2636,56 @@ router.get('/verified-invoices', auth, async (req, res) => {
       // Build full response object
       const fullResponse = {
         _id: booking._id,
-        tracking_code: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
-        awb_number: invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
-        awb: booking.awb || invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
+        tracking_code:
+          invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
+        awb_number:
+          invoiceRequest?.tracking_code || booking.tracking_code || booking.awb_number || null,
+        awb:
+          booking.awb ||
+          invoiceRequest?.tracking_code ||
+          booking.tracking_code ||
+          booking.awb_number ||
+          null,
         customer_name: booking.customer_name || booking.sender?.fullName || null,
         receiver_name: booking.receiver_name || booking.receiver?.fullName || null,
         origin_place: booking.origin_place || booking.origin || null,
         destination_place: booking.destination_place || booking.destination || null,
-        shipment_status: shipmentStatus, // Always include, default to SHIPMENT_RECEIVED if missing
-        batch_no: invoice?.batch_number || booking.batch_no || null, // Prioritize batch_number from invoices collection
+        shipment_status: shipmentStatus,
+        batch_no: batchNumber,
+        batch_number: batchNumber,
+        invoice: invoice
+          ? {
+              _id: invoice._id,
+              invoice_id: invoice.invoice_id || null,
+              batch_number: batchNumber,
+            }
+          : batchNumber
+            ? { batch_number: batchNumber }
+            : null,
         invoice_id: invoice?._id || null,
         invoice_number: invoice?.invoice_id || invoiceRequest?.invoice_number || null,
-        service_code: serviceCode, // Include normalized service_code (can be null)
+        service_code: serviceCode,
         service: booking.service || invoiceRequest?.service || null,
         sender: booking.sender || null,
         receiver: booking.receiver || null,
-        request_id: invoiceRequest ? {
-          service_code: invoiceRequest.service_code || null,
-          service: invoiceRequest.service || null,
-          awb: invoiceRequest.awb || null,
-          tracking_code: invoiceRequest.tracking_code || null,
-          awb_number: invoiceRequest.awb_number || null
-        } : null,
+        request_id: invoiceRequest
+          ? {
+              service_code: invoiceRequest.service_code || null,
+              service: invoiceRequest.service || null,
+              awb: invoiceRequest.awb || null,
+              tracking_code: invoiceRequest.tracking_code || null,
+              awb_number: invoiceRequest.awb_number || null,
+            }
+          : null,
         booking: {
           service_code: booking.service_code || null,
           service: booking.service || null,
           awb: booking.awb || null,
           tracking_code: booking.tracking_code || null,
-          awb_number: booking.awb_number || null
+          awb_number: booking.awb_number || null,
         },
         createdAt: booking.createdAt,
-        updatedAt: booking.updatedAt
+        updatedAt: booking.updatedAt,
       };
 
       // Apply field filtering if fields parameter was provided
@@ -3144,6 +3245,80 @@ function mergeBookingData(invoiceRequest, booking = null) {
   
   return merged;
 }
+
+/**
+ * Resolve booking + invoice-request the same way as /:id/review, for document downloads.
+ */
+async function resolveBookingAndInvoiceRequest(id) {
+  let invoiceRequest = await InvoiceRequest.findById(id)
+    .populate('booking_id')
+    .lean();
+
+  let booking = null;
+
+  if (invoiceRequest) {
+    if (invoiceRequest.booking_id) {
+      booking =
+        typeof invoiceRequest.booking_id === 'object'
+          ? invoiceRequest.booking_id
+          : await Booking.findById(invoiceRequest.booking_id).lean();
+    }
+  } else {
+    invoiceRequest = await InvoiceRequest.findOne({ booking_id: id })
+      .populate('booking_id')
+      .lean();
+
+    if (invoiceRequest && invoiceRequest.booking_id) {
+      booking =
+        typeof invoiceRequest.booking_id === 'object'
+          ? invoiceRequest.booking_id
+          : await Booking.findById(invoiceRequest.booking_id).lean();
+    }
+  }
+
+  if (!invoiceRequest) {
+    booking = await Booking.findById(id).lean();
+    if (!booking) return null;
+  }
+
+  return { invoiceRequest, booking, merged: mergeBookingData(invoiceRequest, booking) };
+}
+
+// GET /api/bookings/:id/awb — KNEXPRESS AWB / shipping label PDF with barcodes
+// Must be defined BEFORE /:id
+router.get('/:id/awb', auth, validateObjectIdParam('id'), async (req, res) => {
+  try {
+    const resolved = await resolveBookingAndInvoiceRequest(req.params.id);
+    if (!resolved) {
+      return res.status(404).json({ success: false, error: 'Booking not found' });
+    }
+
+    const { merged } = resolved;
+    const awb =
+      merged.awb ||
+      merged.awb_number ||
+      merged.awbNumber ||
+      merged.tracking_code ||
+      'PENDING';
+
+    const pdfBuffer = await generateAwbPDF(merged);
+    const safeName = String(awb).replace(/[^A-Za-z0-9_-]/g, '_');
+    const fileName = `KNEXPRESS-AWB-${safeName}.pdf`;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Error generating AWB PDF:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to generate AWB PDF',
+      details: error.message,
+    });
+  }
+});
 
 // Get booking by ID for review (includes all identityDocuments images)
 // This endpoint queries InvoiceRequest collection first, then falls back to Booking collection
