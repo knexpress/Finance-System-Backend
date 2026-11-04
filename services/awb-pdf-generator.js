@@ -13,7 +13,7 @@ const BRAND = {
   phone: '+971559738713',
   address: 'Rocky Warehouse #19, 11th Street, Al Qusais Industrial Area 1, Dubai, UAE',
   productCode: 'KNX',
-  productName: 'EXPRESS WORLDWIDE',
+  productName: 'KNEXPRESS',
   terms:
     'KNEXPRESS Terms and Conditions of Carriage apply (www.knexpress.ae).',
 };
@@ -200,14 +200,21 @@ function buildAwbData(booking) {
   const pieces = pieceCount(data);
   const weightKg = parseWeightKg(data);
   const value = declaredValue(data);
-  const items = Array.isArray(data.items) ? data.items : [];
-  const ref = firstNonEmpty(
-    data.reference,
-    data.shipper_reference,
-    data.declarationText,
-    data.shipmentType === 'document' ? 'Documents' : 'Personal items',
-    'Shipment'
-  );
+  const items = Array.isArray(data.items)
+    ? data.items
+    : Array.isArray(data.listed_commodities)
+      ? data.listed_commodities
+      : Array.isArray(data.orderItems)
+        ? data.orderItems
+        : Array.isArray(data.verification?.listed_commodities)
+          ? data.verification.listed_commodities
+          : [];
+  const commodities = contentsFromItems(items);
+  // Ref shows commodities (not a generic "Personal items" label)
+  const ref =
+    textOr(data.shipmentType || data.shipment_type, '').toLowerCase() === 'document'
+      ? 'Documents'
+      : commodities;
 
   const pieceIds = [];
   for (let i = 1; i <= pieces; i += 1) {
@@ -253,7 +260,7 @@ function buildAwbData(booking) {
     declaredValue: value,
     declaredValueLabel:
       value != null ? `${value.toFixed(2)} AED` : 'N/A',
-    contents: contentsFromItems(items),
+    contents: commodities,
     reference: ref,
     shipmentType:
       textOr(data.shipmentType || data.shipment_type, 'non_document').toLowerCase() ===
