@@ -285,10 +285,10 @@ async function makeBarcodePng(text, options = {}) {
   return png;
 }
 
-function drawHLine(doc, x1, x2, y, width = 0.8) {
+function drawHLine(doc, x1, x2, y, lineWidth = 0.8) {
   doc
     .save()
-    .lineWidth(width)
+    .lineWidth(lineWidth)
     .strokeColor('#000000')
     .moveTo(x1, y)
     .lineTo(x2, y)
@@ -296,382 +296,640 @@ function drawHLine(doc, x1, x2, y, width = 0.8) {
     .restore();
 }
 
-function drawBrandMark(doc, x, y) {
-  doc
-    .save()
-    .font('Helvetica-Bold')
-    .fontSize(18)
-    .fillColor('#008000')
-    .text(BRAND.name, x, y, { width: 160, align: 'right', lineBreak: false });
-  doc
-    .font('Helvetica')
-    .fontSize(7)
-    .fillColor('#333333')
-    .text(BRAND.website, x, y + 20, { width: 160, align: 'right', lineBreak: false });
+/** Draw wrapped text at an absolute position; returns Y below the block. */
+function drawTextAt(doc, text, x, y, opts = {}) {
+  const {
+    width = 200,
+    fontSize = 9,
+    font = 'Helvetica',
+    color = '#000000',
+    align = 'left',
+    lineGap = 1,
+    maxLines = 0,
+  } = opts;
+  let str = String(text == null ? '' : text);
+  doc.save();
+  doc.font(font).fontSize(fontSize).fillColor(color);
+  if (maxLines > 0) {
+    const lineH = fontSize + lineGap;
+    const maxH = maxLines * lineH;
+    while (str && doc.heightOfString(str, { width, lineGap }) > maxH && str.length > 3) {
+      str = `${str.slice(0, Math.max(1, str.length - 4))}…`;
+    }
+  }
+  const h = Math.max(fontSize + 2, doc.heightOfString(str, { width, align, lineGap }));
+  doc.text(str, x, y, {
+    width,
+    align,
+    lineGap,
+    lineBreak: true,
+  });
   doc.restore();
+  return y + h;
 }
 
 function drawProductBadge(doc, x, y, code) {
-  const w = 54;
-  const h = 28;
+  const w = 50;
+  const h = 24;
   doc.save().rect(x, y, w, h).fill('#000000');
   doc
     .fillColor('#FFFFFF')
     .font('Helvetica-Bold')
-    .fontSize(16)
-    .text(code, x, y + 7, { width: w, align: 'center', lineBreak: false });
+    .fontSize(14)
+    .text(code, x, y + 5, { width: w, align: 'center', lineBreak: false });
   doc.restore();
+  return h;
 }
 
 /**
  * Page 1+: Package label(s) — attach to package. One page per piece.
  */
 async function drawPackageLabel(doc, awbData, pieceIndex) {
-  const margin = 28;
+  const margin = 24;
   const left = margin;
-  const right = PAGE.width / 2 - 10; // left half of landscape (printable label area)
+  // Use left ~48% of landscape page as the label column to avoid crowding
+  const right = Math.min(PAGE.width * 0.48, 400);
   const width = right - left;
+  const gap = 6;
   let y = margin;
 
-  // Header
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(14)
-    .fillColor('#000000')
-    .text(awbData.productName, left, y + 4, {
-      width: width - 230,
-      lineBreak: false,
-      ellipsis: false,
-    });
-  drawProductBadge(doc, left + width - 220, y - 2, awbData.productCode);
-  drawBrandMark(doc, left + width - 160, y);
+  // Header row: title | badge | brand (non-overlapping columns)
+  const badgeW = 50;
+  const brandW = 110;
+  const titleW = Math.max(80, width - badgeW - brandW - 16);
+  drawTextAt(doc, awbData.productName, left, y + 4, {
+    width: titleW,
+    fontSize: 13,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  drawProductBadge(doc, left + titleW + 8, y, awbData.productCode);
+  drawTextAt(doc, BRAND.name, left + titleW + badgeW + 12, y, {
+    width: brandW,
+    fontSize: 12,
+    font: 'Helvetica-Bold',
+    color: '#008000',
+    align: 'right',
+    maxLines: 1,
+  });
+  drawTextAt(doc, BRAND.website, left + titleW + badgeW + 12, y + 14, {
+    width: brandW,
+    fontSize: 7,
+    color: '#333333',
+    align: 'right',
+    maxLines: 1,
+  });
+  y += 30;
 
-  y += 36;
-  doc
-    .font('Helvetica')
-    .fontSize(8)
-    .fillColor('#333333')
-    .text(`${awbData.createdAt}  KNEXPRESS AWB 1.0`, left, y);
-  y += 14;
+  y = drawTextAt(doc, `${awbData.createdAt}  KNEXPRESS AWB 1.0`, left, y, {
+    width,
+    fontSize: 8,
+    color: '#333333',
+    maxLines: 1,
+  });
+  y += gap;
   drawHLine(doc, left, right, y, 1.2);
-  y += 10;
+  y += gap + 2;
 
-  // From + Origin
-  const colLeftW = width * 0.62;
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#000000').text(`From : ${awbData.sender.name}`, left, y);
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(9)
-    .text('Origin:', left + colLeftW, y);
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(28)
-    .text(awbData.route.originCode, left + colLeftW, y + 12);
+  // From + Origin (two columns with clear widths)
+  const originW = 70;
+  const leftColW = width - originW - 10;
+  const fromTop = y;
+  y = drawTextAt(doc, `From : ${awbData.sender.name}`, left, y, {
+    width: leftColW,
+    fontSize: 10,
+    font: 'Helvetica-Bold',
+    maxLines: 2,
+  });
+  drawTextAt(doc, 'Origin:', left + leftColW + 6, fromTop, {
+    width: originW,
+    fontSize: 8,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  drawTextAt(doc, awbData.route.originCode, left + leftColW + 6, fromTop + 12, {
+    width: originW,
+    fontSize: 22,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
 
-  y += 14;
-  doc.font('Helvetica').fontSize(9).fillColor('#000000');
-  const fromLines = [
-    awbData.sender.name,
+  const fromBody = [
     ...awbData.sender.addressLines,
     awbData.sender.country,
   ].filter(Boolean);
-  fromLines.forEach((line) => {
-    doc.text(line, left, y, { width: colLeftW - 8 });
-    y += 11;
-  });
-
-  y += 6;
+  for (const line of fromBody) {
+    y = drawTextAt(doc, line, left, y, {
+      width: leftColW,
+      fontSize: 9,
+      maxLines: 2,
+    });
+  }
+  y = Math.max(y, fromTop + 40) + gap;
   drawHLine(doc, left, right, y, 0.6);
-  y += 8;
+  y += gap + 2;
 
   // To + Contact
+  const contactW = 120;
+  const toColW = width - contactW - 10;
   const toTop = y;
-  doc.font('Helvetica-Bold').fontSize(11).text(`To : ${awbData.receiver.name}`, left, y);
-  doc.font('Helvetica-Bold').fontSize(9).text('Contact:', left + colLeftW, y);
-  doc
-    .font('Helvetica')
-    .fontSize(9)
-    .text(awbData.receiver.contactName || awbData.receiver.name, left + colLeftW, y + 12, {
-      width: width - colLeftW - 4,
-    });
+  y = drawTextAt(doc, `To : ${awbData.receiver.name}`, left, y, {
+    width: toColW,
+    fontSize: 10,
+    font: 'Helvetica-Bold',
+    maxLines: 2,
+  });
+  let cy = toTop;
+  cy = drawTextAt(doc, 'Contact:', left + toColW + 6, cy, {
+    width: contactW,
+    fontSize: 8,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  cy = drawTextAt(
+    doc,
+    awbData.receiver.contactName || awbData.receiver.name,
+    left + toColW + 6,
+    cy,
+    { width: contactW, fontSize: 9, maxLines: 2 }
+  );
   if (awbData.receiver.phone) {
-    doc.text(awbData.receiver.phone, left + colLeftW, y + 24, {
-      width: width - colLeftW - 4,
+    cy = drawTextAt(doc, awbData.receiver.phone, left + toColW + 6, cy, {
+      width: contactW,
+      fontSize: 9,
+      maxLines: 1,
     });
   }
 
-  y += 14;
-  const toLines = [...awbData.receiver.addressLines, awbData.receiver.country].filter(Boolean);
-  toLines.forEach((line) => {
-    doc.font('Helvetica').fontSize(10).text(line, left, y, { width: colLeftW - 8 });
-    y += 12;
-  });
-  y = Math.max(y, toTop + 70);
-
-  y += 6;
-  drawHLine(doc, left, right, y, 1.5);
-  y += 8;
+  const toBody = [...awbData.receiver.addressLines, awbData.receiver.country].filter(Boolean);
+  for (const line of toBody) {
+    y = drawTextAt(doc, line, left, y, {
+      width: toColW,
+      fontSize: 9,
+      maxLines: 2,
+    });
+  }
+  y = Math.max(y, cy) + gap;
+  drawHLine(doc, left, right, y, 1.2);
+  y += gap + 2;
 
   // Routing
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(18)
-    .text(awbData.route.routingLine, left, y, { width: width - 8 });
-  y += 26;
+  y = drawTextAt(doc, awbData.route.routingLine, left, y, {
+    width,
+    fontSize: 14,
+    font: 'Helvetica-Bold',
+    maxLines: 2,
+  });
+  y += gap;
 
   // Service band
-  doc.save().rect(left, y, 90, 22).fill('#000000');
+  doc.save().rect(left, y, 78, 20).fill('#000000');
   doc
     .fillColor('#FFFFFF')
     .font('Helvetica-Bold')
-    .fontSize(12)
-    .text('C-KNX', left, y + 5, { width: 90, align: 'center', lineBreak: false });
+    .fontSize(11)
+    .text('C-KNX', left, y + 4, { width: 78, align: 'center', lineBreak: false });
   doc.restore();
-  doc
-    .fillColor('#000000')
-    .font('Helvetica')
-    .fontSize(8)
-    .text('Time', left + 100, y + 2)
-    .text('Day', left + 140, y + 2);
-  y += 30;
+  drawTextAt(doc, 'Time', left + 88, y + 2, { width: 40, fontSize: 8, maxLines: 1 });
+  drawTextAt(doc, 'Day', left + 130, y + 2, { width: 40, fontSize: 8, maxLines: 1 });
+  y += 26;
   drawHLine(doc, left, right, y, 0.6);
-  y += 8;
+  y += gap + 2;
 
-  // Ref / weight / pieces
-  doc.font('Helvetica').fontSize(9).fillColor('#000000');
-  doc.text(`Ref: ${awbData.reference}`, left, y, { width: width * 0.45 });
-  doc.font('Helvetica-Bold').fontSize(8).text('Pce/Shpt Weight', left + width * 0.45, y);
-  doc.font('Helvetica-Bold').fontSize(8).text('Piece', left + width * 0.78, y);
-  y += 12;
-  doc.font('Helvetica-Bold').fontSize(14).text(awbData.weightLabel, left + width * 0.45, y);
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(14)
-    .text(`${pieceIndex} / ${awbData.pieces}`, left + width * 0.78, y);
-  y += 22;
+  // Ref / weight / pieces — three fixed columns
+  const c1 = width * 0.46;
+  const c2 = width * 0.30;
+  const c3 = width * 0.24;
+  const metaTop = y;
+  let y1 = drawTextAt(doc, `Ref: ${awbData.reference}`, left, metaTop, {
+    width: c1 - 6,
+    fontSize: 8,
+    maxLines: 3,
+  });
+  drawTextAt(doc, 'Pce/Shpt Weight', left + c1, metaTop, {
+    width: c2 - 4,
+    fontSize: 8,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  drawTextAt(doc, awbData.weightLabel, left + c1, metaTop + 12, {
+    width: c2 - 4,
+    fontSize: 12,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  drawTextAt(doc, 'Piece', left + c1 + c2, metaTop, {
+    width: c3,
+    fontSize: 8,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  drawTextAt(doc, `${pieceIndex} / ${awbData.pieces}`, left + c1 + c2, metaTop + 12, {
+    width: c3,
+    fontSize: 12,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  y = Math.max(y1, metaTop + 28) + gap;
   drawHLine(doc, left, right, y, 0.6);
-  y += 8;
+  y += gap + 2;
 
-  doc.font('Helvetica').fontSize(8).text(BRAND.terms, left, y, { width: width, align: 'left' });
-  y += 18;
-  doc.font('Helvetica').fontSize(8).text(`Contents: ${awbData.contents}`, left, y, { width: width });
-  y += 16;
+  y = drawTextAt(doc, BRAND.terms, left, y, {
+    width,
+    fontSize: 7,
+    color: '#333333',
+    maxLines: 2,
+  });
+  y += 3;
+  y = drawTextAt(doc, `Contents: ${awbData.contents}`, left, y, {
+    width,
+    fontSize: 8,
+    maxLines: 2,
+  });
+  y += gap + 2;
 
-  // Barcodes
+  // Barcodes — fixed block heights so labels never collide
   const waybillValue = sanitizeAwbForBarcode(awbData.awb) || 'PENDING';
   const routingValue = routingBarcodeValue(awbData.route, awbData.awb);
   const pieceId = awbData.pieceIds[pieceIndex - 1] || generatePieceId(awbData.awb, pieceIndex);
-
-  const barcodeWidth = Math.min(320, width - 20);
+  const barcodeWidth = Math.min(300, width - 16);
   const barcodes = [
-    { value: waybillValue, label: `WAYBILL ${awbData.awbDisplay}`, height: 14 },
-    { value: routingValue, label: routingValue, height: 12 },
-    { value: pieceId, label: `(J) ${pieceId}`, height: 12 },
+    { value: waybillValue, label: `WAYBILL ${awbData.awbDisplay}`, height: 12 },
+    { value: routingValue, label: routingValue, height: 10 },
+    { value: pieceId, label: `(J) ${pieceId}`, height: 10 },
   ];
 
   for (const bc of barcodes) {
+    const blockTop = y;
+    const imgH = 36;
     try {
       const png = await makeBarcodePng(bc.value, { height: bc.height, scale: 2 });
       const imgX = left + (width - barcodeWidth) / 2;
-      doc.image(png, imgX, y, { width: barcodeWidth, height: 42 });
-      y += 46;
-      doc
-        .font('Helvetica-Bold')
-        .fontSize(11)
-        .fillColor('#000000')
-        .text(bc.label, left, y, { width: width, align: 'center' });
-      y += 18;
-    } catch (err) {
-      doc
-        .font('Helvetica')
-        .fontSize(9)
-        .text(`[barcode] ${bc.label}`, left, y, { width: width, align: 'center' });
-      y += 16;
+      doc.image(png, imgX, blockTop, { width: barcodeWidth, height: imgH });
+    } catch (_) {
+      drawTextAt(doc, `[barcode] ${bc.label}`, left, blockTop, {
+        width,
+        fontSize: 8,
+        align: 'center',
+        maxLines: 1,
+      });
     }
+    y = blockTop + imgH + 2;
+    y = drawTextAt(doc, bc.label, left, y, {
+      width,
+      fontSize: 10,
+      font: 'Helvetica-Bold',
+      align: 'center',
+      maxLines: 1,
+    });
+    y += 8;
   }
 
-  // Right-side tear-off hint (empty half for fold/print)
-  doc
-    .font('Helvetica')
-    .fontSize(8)
-    .fillColor('#999999')
-    .text('ATTACH TO PACKAGE', PAGE.width / 2 + 40, margin, {
-      width: PAGE.width / 2 - 70,
-      align: 'center',
-    });
+  drawTextAt(doc, 'ATTACH TO PACKAGE', PAGE.width / 2 + 30, margin, {
+    width: PAGE.width / 2 - 60,
+    fontSize: 8,
+    color: '#999999',
+    align: 'center',
+    maxLines: 1,
+  });
 }
 
 /**
  * Final page: Waybill DOC — hand to courier (not attached to package).
  */
 async function drawWaybillDoc(doc, awbData) {
-  const margin = 28;
+  const margin = 24;
   const left = margin;
   const right = PAGE.width - margin;
   const width = right - left;
+  const gap = 6;
   let y = margin;
 
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(14)
-    .fillColor('#000000')
-    .text('*WAYBILL DOC*', left, y);
-  drawProductBadge(doc, right - 220, y - 2, awbData.productCode);
-  drawBrandMark(doc, right - 160, y);
+  // Header
+  const badgeW = 50;
+  const brandW = 120;
+  drawTextAt(doc, '*WAYBILL DOC*', left, y, {
+    width: width - badgeW - brandW - 20,
+    fontSize: 13,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  drawProductBadge(doc, right - brandW - badgeW - 10, y, awbData.productCode);
+  drawTextAt(doc, BRAND.name, right - brandW, y, {
+    width: brandW,
+    fontSize: 12,
+    font: 'Helvetica-Bold',
+    color: '#008000',
+    align: 'right',
+    maxLines: 1,
+  });
+  drawTextAt(doc, BRAND.website, right - brandW, y + 14, {
+    width: brandW,
+    fontSize: 7,
+    color: '#333333',
+    align: 'right',
+    maxLines: 1,
+  });
+  y += 28;
 
-  y += 22;
-  doc
-    .font('Helvetica')
-    .fontSize(9)
-    .fillColor('#333333')
-    .text('Not to be attached to package — Hand to Courier', left, y);
-  y += 12;
-  doc.text(`${awbData.createdAt}  KNEXPRESS /`, left, y);
-  y += 14;
+  y = drawTextAt(doc, 'Not to be attached to package — Hand to Courier', left, y, {
+    width,
+    fontSize: 9,
+    color: '#333333',
+    maxLines: 1,
+  });
+  y = drawTextAt(doc, `${awbData.createdAt}  KNEXPRESS /`, left, y + 2, {
+    width,
+    fontSize: 9,
+    color: '#333333',
+    maxLines: 1,
+  });
+  y += gap;
   drawHLine(doc, left, right, y, 1.2);
-  y += 10;
+  y += gap + 2;
 
-  const mid = left + width / 2;
-  const colW = width / 2 - 12;
+  // Shipper | Receiver columns
+  const colGap = 14;
+  const colW = (width - colGap) / 2;
+  const mid = left + colW + colGap;
+  const sectionTop = y;
 
-  // Shipper
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#000000').text('Shipper :', left, y);
-  let sy = y + 14;
-  doc.font('Helvetica').fontSize(9);
-  [awbData.sender.name, ...awbData.sender.addressLines, awbData.sender.country]
-    .filter(Boolean)
-    .forEach((line) => {
-      doc.text(line, left, sy, { width: colW });
-      sy += 11;
-    });
+  let sy = drawTextAt(doc, 'Shipper :', left, sectionTop, {
+    width: colW,
+    fontSize: 10,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  for (const line of [
+    awbData.sender.name,
+    ...awbData.sender.addressLines,
+    awbData.sender.country,
+  ].filter(Boolean)) {
+    sy = drawTextAt(doc, line, left, sy, { width: colW, fontSize: 9, maxLines: 2 });
+  }
   if (awbData.sender.phone) {
-    doc.font('Helvetica-Bold').fontSize(8).text('Contact:', left, sy);
-    sy += 11;
-    doc.font('Helvetica').fontSize(9).text(awbData.sender.phone, left, sy);
-    sy += 11;
+    sy = drawTextAt(doc, 'Contact:', left, sy + 2, {
+      width: colW,
+      fontSize: 8,
+      font: 'Helvetica-Bold',
+      maxLines: 1,
+    });
+    sy = drawTextAt(doc, awbData.sender.phone, left, sy, {
+      width: colW,
+      fontSize: 9,
+      maxLines: 1,
+    });
   }
 
-  // Receiver (boxed)
-  const boxX = mid;
-  const boxY = y - 2;
-  const boxH = Math.max(110, sy - y + 10);
-  doc.save().lineWidth(1.5).rect(boxX, boxY, colW + 8, boxH).stroke().restore();
-  let ry = y;
-  doc.font('Helvetica-Bold').fontSize(10).text('Receiver :', boxX + 6, ry);
-  ry += 14;
+  // Measure receiver height first, then draw box
+  const receiverLines = [
+    awbData.receiver.name,
+    ...awbData.receiver.addressLines,
+    awbData.receiver.country,
+    awbData.receiver.contactName || awbData.receiver.name,
+    awbData.receiver.phone,
+    awbData.receiver.email,
+  ].filter(Boolean);
   doc.font('Helvetica').fontSize(9);
-  [awbData.receiver.name, ...awbData.receiver.addressLines, awbData.receiver.country]
-    .filter(Boolean)
-    .forEach((line) => {
-      doc.text(line, boxX + 6, ry, { width: colW - 4 });
-      ry += 11;
-    });
-  doc.font('Helvetica-Bold').fontSize(8).text('Contact:', boxX + 6, ry);
-  ry += 11;
+  let estH = 16; // "Receiver :"
+  receiverLines.forEach((line) => {
+    estH += doc.heightOfString(String(line), { width: colW - 12, lineGap: 1 }) + 1;
+  });
+  estH += 20; // contact label spacing
+  const boxH = Math.max(estH, sy - sectionTop + 8, 100);
   doc
-    .font('Helvetica')
-    .fontSize(9)
-    .text(awbData.receiver.contactName || awbData.receiver.name, boxX + 6, ry, {
-      width: colW - 4,
+    .save()
+    .lineWidth(1.2)
+    .rect(mid, sectionTop - 2, colW, boxH)
+    .stroke()
+    .restore();
+
+  let ry = drawTextAt(doc, 'Receiver :', mid + 6, sectionTop, {
+    width: colW - 12,
+    fontSize: 10,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  for (const line of [
+    awbData.receiver.name,
+    ...awbData.receiver.addressLines,
+    awbData.receiver.country,
+  ].filter(Boolean)) {
+    ry = drawTextAt(doc, line, mid + 6, ry, {
+      width: colW - 12,
+      fontSize: 9,
+      maxLines: 2,
     });
-  ry += 11;
+  }
+  ry = drawTextAt(doc, 'Contact:', mid + 6, ry + 2, {
+    width: colW - 12,
+    fontSize: 8,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  ry = drawTextAt(
+    doc,
+    awbData.receiver.contactName || awbData.receiver.name,
+    mid + 6,
+    ry,
+    { width: colW - 12, fontSize: 9, maxLines: 2 }
+  );
   if (awbData.receiver.phone) {
-    doc.text(awbData.receiver.phone, boxX + 6, ry, { width: colW - 4 });
-    ry += 11;
+    ry = drawTextAt(doc, awbData.receiver.phone, mid + 6, ry, {
+      width: colW - 12,
+      fontSize: 9,
+      maxLines: 1,
+    });
   }
   if (awbData.receiver.email) {
-    doc.text(awbData.receiver.email, boxX + 6, ry, { width: colW - 4 });
+    ry = drawTextAt(doc, awbData.receiver.email, mid + 6, ry, {
+      width: colW - 12,
+      fontSize: 8,
+      maxLines: 1,
+    });
   }
 
-  y = Math.max(sy, boxY + boxH) + 12;
+  y = Math.max(sy, sectionTop - 2 + boxH, ry) + gap + 4;
   drawHLine(doc, left, right, y, 1);
-  y += 10;
+  y += gap + 2;
 
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(16)
-    .text(awbData.route.routingLine, left, y, { width: width });
-  y += 24;
+  y = drawTextAt(doc, awbData.route.routingLine, left, y, {
+    width,
+    fontSize: 14,
+    font: 'Helvetica-Bold',
+    maxLines: 2,
+  });
+  y += gap;
   drawHLine(doc, left, right, y, 0.6);
-  y += 10;
+  y += gap + 2;
 
   // Product / payer / features
   const col3 = width / 3;
-  doc.font('Helvetica-Bold').fontSize(9).text('Product Details:', left, y);
-  doc.font('Helvetica-Bold').fontSize(9).text('Payer Details', left + col3, y);
-  doc.font('Helvetica-Bold').fontSize(9).text('Features / Services', left + col3 * 2, y);
-  y += 12;
-  doc.font('Helvetica').fontSize(9);
-  doc.text(`[P] ${awbData.productName} (${awbData.productCode})`, left, y, { width: col3 - 8 });
-  doc.text('Freight: Shipper', left + col3, y);
-  doc.text('Duties & Taxes Unpaid', left + col3 * 2, y);
-  y += 12;
-  doc.text(`Duty / Taxes: Receiver Will Pay`, left + col3, y);
-  y += 16;
-  drawHLine(doc, left, right, y, 0.6);
-  y += 10;
-
-  doc.font('Helvetica-Bold').fontSize(10).text('Shipment Details', left, y);
-  y += 14;
-  doc.font('Helvetica').fontSize(9);
-  doc.text(`Ref: ${awbData.reference}`, left, y);
-  doc.text(`Custom Val: ${awbData.declaredValueLabel}`, left + col3, y);
-  y += 14;
-  doc.text('Cust Decl Shpt Wgt (UOM):', left, y);
-  doc.font('Helvetica-Bold').fontSize(16).text(awbData.weightLabel, left, y + 14);
-  doc.font('Helvetica').fontSize(9).text('Pieces', left + col3, y);
-  doc.font('Helvetica-Bold').fontSize(16).text(String(awbData.pieces), left + col3, y + 14);
-  doc.font('Helvetica').fontSize(8).text(`Contents: ${awbData.contents}`, left + col3 * 2, y, {
-    width: col3 - 4,
+  const trioTop = y;
+  drawTextAt(doc, 'Product Details:', left, trioTop, {
+    width: col3 - 8,
+    fontSize: 9,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
   });
-  y += 40;
+  drawTextAt(doc, 'Payer Details', left + col3, trioTop, {
+    width: col3 - 8,
+    fontSize: 9,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  drawTextAt(doc, 'Features / Services', left + col3 * 2, trioTop, {
+    width: col3 - 8,
+    fontSize: 9,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  let t1 = drawTextAt(
+    doc,
+    `[P] ${awbData.productName} (${awbData.productCode})`,
+    left,
+    trioTop + 12,
+    { width: col3 - 8, fontSize: 9, maxLines: 2 }
+  );
+  let t2 = drawTextAt(doc, 'Freight: Shipper', left + col3, trioTop + 12, {
+    width: col3 - 8,
+    fontSize: 9,
+    maxLines: 1,
+  });
+  t2 = drawTextAt(doc, 'Duty / Taxes: Receiver Will Pay', left + col3, t2, {
+    width: col3 - 8,
+    fontSize: 9,
+    maxLines: 2,
+  });
+  let t3 = drawTextAt(doc, 'Duties & Taxes Unpaid', left + col3 * 2, trioTop + 12, {
+    width: col3 - 8,
+    fontSize: 9,
+    maxLines: 2,
+  });
+  y = Math.max(t1, t2, t3) + gap;
   drawHLine(doc, left, right, y, 0.6);
-  y += 10;
+  y += gap + 2;
 
-  doc.font('Helvetica').fontSize(8).fillColor('#333333').text(BRAND.terms, left, y, { width: width });
-  y += 16;
+  y = drawTextAt(doc, 'Shipment Details', left, y, {
+    width,
+    fontSize: 10,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  y += 4;
+
+  const shipTop = y;
+  let s1 = drawTextAt(doc, `Ref: ${awbData.reference}`, left, shipTop, {
+    width: col3 - 8,
+    fontSize: 9,
+    maxLines: 3,
+  });
+  s1 = drawTextAt(doc, 'Cust Decl Shpt Wgt (UOM):', left, s1 + 4, {
+    width: col3 - 8,
+    fontSize: 8,
+    maxLines: 1,
+  });
+  s1 = drawTextAt(doc, awbData.weightLabel, left, s1, {
+    width: col3 - 8,
+    fontSize: 14,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+
+  let s2 = drawTextAt(doc, `Custom Val: ${awbData.declaredValueLabel}`, left + col3, shipTop, {
+    width: col3 - 8,
+    fontSize: 9,
+    maxLines: 2,
+  });
+  s2 = drawTextAt(doc, 'Pieces', left + col3, s2 + 4, {
+    width: col3 - 8,
+    fontSize: 8,
+    maxLines: 1,
+  });
+  s2 = drawTextAt(doc, String(awbData.pieces), left + col3, s2, {
+    width: col3 - 8,
+    fontSize: 14,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+
+  const s3 = drawTextAt(doc, `Contents: ${awbData.contents}`, left + col3 * 2, shipTop, {
+    width: col3 - 8,
+    fontSize: 8,
+    maxLines: 4,
+  });
+
+  y = Math.max(s1, s2, s3) + gap;
+  drawHLine(doc, left, right, y, 0.6);
+  y += gap + 2;
+
+  y = drawTextAt(doc, BRAND.terms, left, y, {
+    width,
+    fontSize: 7,
+    color: '#333333',
+    maxLines: 2,
+  });
+  y += gap + 4;
 
   // Signature lines
-  const sigW = width / 3 - 10;
-  doc.font('Helvetica').fontSize(8).fillColor('#000000');
-  doc.text('Name (in Capital Letters)', left, y);
-  doc.text('Signature', left + sigW + 10, y);
-  doc.text('Date (DD.MM.YYYY)', left + (sigW + 10) * 2, y);
-  y += 28;
+  const sigW = (width - 20) / 3;
+  drawTextAt(doc, 'Name (in Capital Letters)', left, y, {
+    width: sigW,
+    fontSize: 8,
+    maxLines: 1,
+  });
+  drawTextAt(doc, 'Signature', left + sigW + 10, y, {
+    width: sigW,
+    fontSize: 8,
+    maxLines: 1,
+  });
+  drawTextAt(doc, 'Date (DD.MM.YYYY)', left + (sigW + 10) * 2, y, {
+    width: sigW,
+    fontSize: 8,
+    maxLines: 1,
+  });
+  y += 22;
   drawHLine(doc, left, left + sigW, y, 0.5);
   drawHLine(doc, left + sigW + 10, left + sigW * 2 + 10, y, 0.5);
   drawHLine(doc, left + (sigW + 10) * 2, left + (sigW + 10) * 2 + sigW, y, 0.5);
-  y += 18;
+  y += gap + 8;
 
   // Waybill barcode
   const waybillValue = sanitizeAwbForBarcode(awbData.awb) || 'PENDING';
+  const bw = Math.min(360, width - 40);
   try {
-    const png = await makeBarcodePng(waybillValue, { height: 16, scale: 3 });
-    const bw = 360;
-    doc.image(png, left + (width - bw) / 2, y, { width: bw, height: 48 });
-    y += 52;
+    const png = await makeBarcodePng(waybillValue, { height: 14, scale: 3 });
+    doc.image(png, left + (width - bw) / 2, y, { width: bw, height: 42 });
+    y += 46;
   } catch (_) {
-    y += 10;
+    y += 8;
   }
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(14)
-    .text(`WAYBILL ${awbData.awbDisplay}`, left, y, { width: width, align: 'center' });
-  y += 22;
-
-  doc.font('Helvetica-Bold').fontSize(9).text('License Plates of pieces in shipment', left, y);
-  y += 12;
-  doc.font('Helvetica').fontSize(9);
-  awbData.pieceIds.forEach((pid) => {
-    doc.text(pid, left, y);
-    y += 11;
+  y = drawTextAt(doc, `WAYBILL ${awbData.awbDisplay}`, left, y, {
+    width,
+    fontSize: 13,
+    font: 'Helvetica-Bold',
+    align: 'center',
+    maxLines: 1,
   });
+  y += gap;
 
-  doc
-    .font('Helvetica')
-    .fontSize(8)
-    .fillColor('#666666')
-    .text('- page 1 of 1 -', left, PAGE.height - 24, { width: width, align: 'center' });
+  y = drawTextAt(doc, 'License Plates of pieces in shipment', left, y, {
+    width,
+    fontSize: 9,
+    font: 'Helvetica-Bold',
+    maxLines: 1,
+  });
+  for (const pid of awbData.pieceIds.slice(0, 8)) {
+    y = drawTextAt(doc, pid, left, y, { width, fontSize: 9, maxLines: 1 });
+  }
+
+  drawTextAt(doc, '- page 1 of 1 -', left, PAGE.height - 22, {
+    width,
+    fontSize: 8,
+    color: '#666666',
+    align: 'center',
+    maxLines: 1,
+  });
 }
 
 /**
